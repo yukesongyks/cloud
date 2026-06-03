@@ -1,0 +1,4689 @@
+/**
+ * KiloClawInstance Durable Object
+ *
+ * Thin orchestration shell — delegates real work to domain modules.
+ *
+ * Keyed by userId: env.KILOCLAW_INSTANCE.idFromName(userId)
+ *
+ * See kiloclaw/docs/instance-features.md and ohsobig.md for context.
+ */
+
+import { DurableObject } from 'cloudflare:workers';
+import type { KiloClawEnv } from '../../types';
+import { getInstanceById, getInstanceByIdIncludingDestroyed, getWorkerDb } from '../../db';
+import type { OpenclawFileWriteValidation } from '../gateway-controller-types';
+import type {
+  InstanceConfig,
+  PersistedState,
+  EncryptedEnvelope,
+  GoogleCredentials,
+  GoogleOAuthConnection,
+  MachineSize,
+  CustomSecretMeta,
+  ProviderId,
+  ProviderState,
+  KiloExaSearchMode,
+} from '../../schemas/instance-config';
+import {
+  DEFAULT_INSTANCE_FEATURES,
+  DEFAULT_VECTOR_MEMORY_MODEL,
+  ProviderStateSchema,
+} from '../../schemas/instance-config';
+import type { FlyVolume, FlyVolumeSnapshot } from '../../fly/types';
+import * as fly from '../../fly/client';
+import { sandboxIdFromUserId, sandboxIdFromInstanceId } from '../../auth/sandbox-id';
+import type {
+  KiloclawDestroyReason,
+  KiloclawStartReason,
+  KiloclawStopReason,
+} from '@kilocode/worker-utils';
+import {
+  imageRolloutSubjectFromSandboxId,
+  isInstanceKeyedSandboxId,
+  instanceIdFromSandboxId,
+} from '@kilocode/worker-utils/instance-id';
+import { resolveVersionByTag } from '../../lib/image-version';
+import { lookupCatalogVersion } from '../../lib/catalog-registration';
+import { selectImageVersionForInstance } from '../../lib/version-rollout';
+import { lookupKiloclawEarlyAccess } from '../../lib/user-flags';
+import { ImageVariantSchema } from '../../schemas/image-version';
+import type { ImageVariant } from '../../schemas/image-version';
+import {
+  LIVE_CHECK_THROTTLE_MS,
+  OPENCLAW_BUILTIN_DEFAULT_MODEL,
+  RESTARTING_TIMEOUT_MS,
+  STARTING_TIMEOUT_MS,
+  WORKER_CONTROLLER_CAPABILITIES_VERSION,
+} from '../../config';
+import {
+  SECRET_CATALOG,
+  FIELD_KEY_TO_ENV_VAR,
+  ENV_VAR_TO_FIELD_KEY,
+  ALL_SECRET_FIELD_KEYS,
+  MAX_CUSTOM_SECRETS,
+  type SecretFieldKey,
+} from '@kilocode/kiloclaw-secret-catalog';
+import {
+  canUpgradeTo,
+  DEFAULT_INSTANCE_TIER,
+  getTier,
+  resolveInstanceTypeLabel,
+  tryInstanceTypeLabel,
+  DEFAULT_VOLUME_SIZE_GB,
+  type InstanceTierKey,
+  type InstanceType,
+} from '@kilocode/kiloclaw-instance-tiers';
+import * as regionHelpers from '../regions';
+import {
+  buildRuntimeSpec,
+  effectiveMachineSize,
+  parseMachineSizeFromFlyGuest,
+} from '../machine-config';
+import type { GatewayProcessStatus } from '../gateway-controller-types';
+
+// Domain modules
+import type { InstanceMutableState, InstanceStatus, DestroyResult } from './types';
+import { getAppKey, getFlyConfig } from './types';
+import {
+  applyProviderState,
+  createMutableState,
+  getFlyProviderState,
+  getProviderRegion,
+  getRuntimeId,
+  getStorageId,
+  loadState,
+  storageUpdate,
+  syncProviderStateForStorage,
+} from './state';
+import { nextAlarmTime, doLog, doError, doWarn, toLoggable, createReconcileContext } from './log';
+import { attemptMetadataRecovery } from './reconcile';
+import { buildUserEnvVars, resolveImageTag, resolveRuntimeImageRef } from './config';
+import * as gateway from './gateway';
+import { buildChannelConfigPatch } from './channel-config';
+import * as pairing from './pairing';
+import * as kiloCliRun from './kilo-cli-run';
+import * as doctorRun from './doctor-run';
+import {
+  reconcileWithFly,
+  syncStatusFromLiveCheck,
+  tryDeleteMachine,
+  tryDeleteVolume,
+  finalizeDestroyIfComplete,
+  reconcileMachineMount,
+  markRestartSuccessful,
+  emitDestroyPendingTelemetry,
+  maybeEmitDestroyStuckTelemetry,
+  type FinalizeDestroyRetention,
+} from './reconcile';
+import {
+  restoreFromPostgres,
+  markDestroyedInPostgresHelper,
+  readMorningBriefingConfigFromPostgresHelper,
+  syncAdminSizeOverrideToPostgresHelper,
+  syncInstanceTypeToPostgresHelper,
+  syncMorningBriefingConfigToPostgresHelper,
+  syncTrackedImageTagToPostgresHelper,
+} from './postgres';
+import {
+  dispatchReadyPush,
+  LIFECYCLE_NOTIFICATION_RESET,
+  maybeDispatchStartFailurePush,
+} from './lifecycle-push';
+import { runScheduledActionApply } from './scheduled-action-apply';
+import { legacyDoKeysForIdentity } from '../../lib/instance-routing';
+import {
+  beginUnexpectedStopRecovery,
+  cleanupPendingRecoveryVolumeIfNeeded,
+  completeUnexpectedStopRecovery,
+  cleanupRecoveryPreviousVolume,
+  cleanupRetainedRecoveryVolumeIfDue,
+  failUnexpectedStopRecovery,
+  runUnexpectedStopRecoveryInBackground,
+  type RecoveryRuntime,
+} from './recovery';
+import { writeEvent, safeInstanceIdFromSandboxId } from '../../utils/analytics';
+import type { KiloClawEventData, KiloClawEventName } from '../../utils/analytics';
+import { getProviderAdapter, resolveDefaultProvider } from '../../providers';
+import type {
+  ProviderCapabilities,
+  ProviderResult,
+  ProviderRoutingTarget,
+} from '../../providers/types';
+
+// Re-export extracted helpers so existing consumers don't break.
+export {
+  parseRegions,
+  shuffleRegions,
+  deprioritizeRegion,
+  isMetaRegion,
+  prepareRegions,
+  resolveRegions,
+} from '../regions';
+export { selectRecoveryCandidate } from '../machine-recovery';
+export { METADATA_KEY_USER_ID } from '../machine-config';
+
+/** Channel env var names — used to exclude channel secrets from secretCount. */
+const CHANNEL_ENV_VARS = new Set(
+  SECRET_CATALOG.filter(e => e.category === 'channel').flatMap(e => e.fields.map(f => f.envVar))
+);
+const BRAVE_SEARCH_FIELD_KEY = 'braveSearchApiKey';
+
+/**
+ * Resolve a coherent instanceType for the given DO state.
+ *
+ * Self-heals two pathological persisted shapes:
+ * - `instanceType === 'custom'` with `machineSize === null`: incoherent — we
+ *   can't actually tell whether it's custom without hardware to compare. Drop
+ *   the stale label and re-run inference.
+ * - `instanceType` is a known catalog key but `machineSize === null`: trust
+ *   the persisted label (catalog tier is its own evidence).
+ *
+ * For null persisted state, falls back to live inference from machineSize +
+ * volumeSizeGb, which returns null when there's nothing to infer from.
+ */
+function shallowEqualStringArrays(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function resolveInstanceTypeFromState(
+  state: Pick<InstanceMutableState, 'instanceType' | 'machineSize' | 'volumeSizeGb'>
+): InstanceType | null {
+  if (state.instanceType === 'custom' && state.machineSize === null) {
+    return tryInstanceTypeLabel(state.machineSize, state.volumeSizeGb);
+  }
+  return state.instanceType ?? tryInstanceTypeLabel(state.machineSize, state.volumeSizeGb);
+}
+
+type PendingRegistryCleanup = {
+  userId: string;
+  orgId: string | null;
+  sandboxId: string;
+  releaseProvisionReservation: boolean;
+};
+
+const PENDING_REGISTRY_CLEANUP_KEY = 'pendingRegistryCleanup';
+const SKIP_PROVISION_RESERVATION_RELEASE_KEY = 'skipProvisionReservationRelease';
+const REGISTRY_CLEANUP_RETRY_MS = 60_000;
+
+export class KiloClawInstance extends DurableObject<KiloClawEnv> {
+  private s: InstanceMutableState = createMutableState();
+  private startInProgress = false;
+
+  // Kept as `loadState` for backward compat with tests that cast to access private methods.
+  private async loadState(): Promise<void> {
+    await loadState(this.ctx, this.s);
+  }
+
+  private async persist(patch: Partial<PersistedState>): Promise<void> {
+    await this.ctx.storage.put(storageUpdate(syncProviderStateForStorage(this.s, patch)));
+  }
+
+  /**
+   * Dispatch a fire-and-forget live check against Fly when status is running
+   * and we're past the throttle window. Used by both `getStatus` (user-facing)
+   * and `getDebugState` (admin-facing) so admins see live data — including
+   * tier backfill for legacy instances — without waiting for the next alarm.
+   */
+  private maybeDispatchLiveCheck(): void {
+    if (
+      this.s.status === 'running' &&
+      this.s.provider === 'fly' &&
+      this.s.flyMachineId &&
+      (this.s.lastLiveCheckAt === null ||
+        Date.now() - this.s.lastLiveCheckAt >= LIVE_CHECK_THROTTLE_MS)
+    ) {
+      this.s.lastLiveCheckAt = Date.now();
+      this.ctx.waitUntil(syncStatusFromLiveCheck(this.ctx, this.s, this.env));
+    }
+  }
+
+  /**
+   * Resolve the image version for a pin/rollout decision and write the four
+   * image fields (openclawVersion, imageVariant, trackedImageTag,
+   * trackedImageDigest) on `this.s`. Does NOT persist — callers are
+   * responsible for writing these fields to storage via `persist` or their
+   * own storage.put.
+   *
+   * When `pinnedImageTag` is a tag: resolves against KV, then the Postgres
+   * catalog, then falls back to storing the tag verbatim with null metadata.
+   *
+   * When `pinnedImageTag` is null: runs the rollout selector (honours
+   * per-user kiloclaw_early_access). If the selector returns nothing and
+   * `isNew` is true, clears the fields; otherwise preserves the existing
+   * tracked image so a restart keeps running what it's running.
+   */
+  private async resolveImageStateForPin(
+    pinnedImageTag: string | null,
+    userId: string,
+    rolloutSubject: string,
+    opts: { isNew: boolean; ignoreCurrentImageTag?: boolean }
+  ): Promise<void> {
+    if (pinnedImageTag) {
+      let pinned = await resolveVersionByTag(this.env.KV_CLAW_CACHE, pinnedImageTag);
+
+      if (!pinned && !this.env.HYPERDRIVE?.connectionString) {
+        doError(this.s, 'HYPERDRIVE not configured — cannot look up pinned tag in Postgres', {
+          pinnedImageTag,
+        });
+      }
+      if (!pinned && this.env.HYPERDRIVE?.connectionString) {
+        try {
+          const catalogEntry = await lookupCatalogVersion(
+            this.env.HYPERDRIVE.connectionString,
+            pinnedImageTag
+          );
+          if (catalogEntry) {
+            const variantParse = ImageVariantSchema.safeParse(catalogEntry.variant);
+            if (!variantParse.success) {
+              doError(this.s, 'Invalid variant from Postgres catalog, skipping', {
+                variant: catalogEntry.variant,
+                pinnedImageTag,
+                validationErrors: variantParse.error.flatten(),
+              });
+            } else {
+              pinned = {
+                openclawVersion: catalogEntry.openclawVersion,
+                variant: variantParse.data,
+                imageTag: catalogEntry.imageTag,
+                imageDigest: catalogEntry.imageDigest,
+                publishedAt: catalogEntry.publishedAt,
+                // Pinned instances bypass rollout gating entirely; defaults
+                // are placeholders. The :latest / candidate state of the
+                // pinned tag is irrelevant to selection.
+                rolloutPercent: 0,
+                isLatest: false,
+              };
+            }
+          }
+        } catch (err) {
+          doWarn(this.s, 'Failed to look up pinned tag in Postgres', {
+            error: toLoggable(err),
+          });
+        }
+      }
+
+      if (pinned) {
+        this.s.openclawVersion = pinned.openclawVersion;
+        this.s.imageVariant = pinned.variant;
+        this.s.trackedImageTag = pinned.imageTag;
+        this.s.trackedImageDigest = pinned.imageDigest;
+      } else {
+        doWarn(this.s, 'Pinned tag not found in KV or Postgres, using tag directly', {
+          pinnedImageTag,
+        });
+        this.s.openclawVersion = null;
+        this.s.imageVariant = null;
+        this.s.trackedImageTag = pinnedImageTag;
+        this.s.trackedImageDigest = null;
+      }
+      return;
+    }
+
+    const variant: ImageVariant = 'default';
+    // Per-user early-access opt-in: when set, the user is offered the
+    // current candidate (if any) for every instance they own — personal or
+    // org. The flag lives on kilocode_users, not on the instance.
+    let autoEnroll = false;
+    if (this.env.HYPERDRIVE?.connectionString) {
+      try {
+        autoEnroll = await lookupKiloclawEarlyAccess(this.env.HYPERDRIVE.connectionString, userId);
+      } catch (err) {
+        doWarn(this.s, 'Failed to look up kiloclaw_early_access; treating as false', {
+          error: toLoggable(err),
+        });
+      }
+    }
+    // When clearing an explicit pin (`ignoreCurrentImageTag`), we must not
+    // pass the current tracked tag to the selector. The selector's sticky-
+    // on-candidate behavior (see lib/version-rollout.ts) would otherwise
+    // preserve the previously-pinned tag for a user who isn't in the
+    // candidate's rollout cohort, defeating the point of removing the pin.
+    const selectorCurrentImageTag = opts.ignoreCurrentImageTag ? null : this.s.trackedImageTag;
+    const selected = await selectImageVersionForInstance({
+      kv: this.env.KV_CLAW_CACHE,
+      variant,
+      rolloutSubject,
+      currentImageTag: selectorCurrentImageTag,
+      autoEnroll,
+    });
+    if (selected) {
+      this.s.openclawVersion = selected.openclawVersion;
+      this.s.imageVariant = selected.variant;
+      this.s.trackedImageTag = selected.imageTag;
+      this.s.trackedImageDigest = selected.imageDigest;
+    } else if (opts.isNew) {
+      this.s.openclawVersion = null;
+      this.s.imageVariant = null;
+      this.s.trackedImageTag = null;
+      this.s.trackedImageDigest = null;
+    }
+    // Existing-instance redeploys with no eligible upgrade keep their
+    // current trackedImageTag — already true in this branch since we only
+    // overwrite when `selected` is non-null.
+  }
+
+  private async scheduleAlarm(): Promise<void> {
+    if (!this.s.status) return;
+    await this.ctx.storage.setAlarm(nextAlarmTime(this.s.status));
+  }
+
+  private recoveryRuntime(): RecoveryRuntime {
+    return {
+      env: this.env,
+      ctx: this.ctx,
+      state: this.s,
+      loadState: () => this.loadState(),
+      persist: patch => this.persist(patch),
+      scheduleAlarm: () => this.scheduleAlarm(),
+      emitEvent: data => this.emitEvent(data),
+    };
+  }
+
+  /**
+   * Exposed as a private method so tests that cast to access internals
+   * can still call `instance.buildUserEnvVars()`.
+   */
+  private buildUserEnvVars() {
+    return buildUserEnvVars(this.env, this.ctx, this.s);
+  }
+
+  private provider() {
+    return getProviderAdapter(this.env, this.s);
+  }
+
+  private applyProviderResult(result: ProviderResult): void {
+    applyProviderState(this.s, result.providerState);
+    if (result.corePatch?.machineSize !== undefined) {
+      this.s.machineSize = result.corePatch.machineSize;
+    }
+    if (result.corePatch?.instanceType !== undefined) {
+      this.s.instanceType = result.corePatch.instanceType;
+    }
+    if (result.corePatch?.restartUpdateSent !== undefined) {
+      this.s.restartUpdateSent = result.corePatch.restartUpdateSent;
+    }
+  }
+
+  private async persistProviderResult(result: ProviderResult): Promise<void> {
+    this.applyProviderResult(result);
+    await this.persist({
+      provider: result.providerState.provider,
+      providerState: result.providerState,
+      ...(result.corePatch ?? {}),
+    });
+  }
+
+  private async persistProviderResultWithPatch(
+    result: ProviderResult,
+    patch: Partial<PersistedState>
+  ): Promise<void> {
+    this.applyProviderResult(result);
+    await this.persist({
+      provider: result.providerState.provider,
+      providerState: result.providerState,
+      ...(result.corePatch ?? {}),
+      ...patch,
+    });
+  }
+
+  private providerErrorStatus(err: unknown): number | null {
+    if (typeof err !== 'object' || err === null || !('status' in err)) return null;
+    const status = err.status;
+    return typeof status === 'number' ? status : null;
+  }
+
+  private async retryNonFlyDestroy(): Promise<void> {
+    if (this.s.provider === 'fly') {
+      throw new Error('retryNonFlyDestroy should not be used for Fly providers');
+    }
+
+    if (this.s.pendingDestroyMachineId) {
+      try {
+        const result = await this.provider().destroyRuntime({
+          env: this.env,
+          state: this.s,
+        });
+        this.s.pendingDestroyMachineId = null;
+        await this.persistProviderResultWithPatch(result, {
+          pendingDestroyMachineId: null,
+        });
+        if (!this.s.pendingDestroyVolumeId) {
+          this.s.lastDestroyErrorOp = null;
+          this.s.lastDestroyErrorStatus = null;
+          this.s.lastDestroyErrorMessage = null;
+          this.s.lastDestroyErrorAt = null;
+          await this.persist({
+            lastDestroyErrorOp: null,
+            lastDestroyErrorStatus: null,
+            lastDestroyErrorMessage: null,
+            lastDestroyErrorAt: null,
+          });
+        }
+      } catch (err) {
+        this.s.lastDestroyErrorOp = 'machine';
+        this.s.lastDestroyErrorStatus = this.providerErrorStatus(err);
+        this.s.lastDestroyErrorMessage = err instanceof Error ? err.message : String(err);
+        this.s.lastDestroyErrorAt = Date.now();
+        await this.persist({
+          lastDestroyErrorOp: 'machine',
+          lastDestroyErrorStatus: this.s.lastDestroyErrorStatus,
+          lastDestroyErrorMessage: this.s.lastDestroyErrorMessage,
+          lastDestroyErrorAt: this.s.lastDestroyErrorAt,
+        });
+        doWarn(this.s, 'Non-Fly runtime destroy failed, alarm will retry', {
+          provider: this.s.provider,
+          runtimeId: this.s.pendingDestroyMachineId,
+          error: toLoggable(err),
+        });
+      }
+    }
+
+    if (this.s.pendingDestroyVolumeId) {
+      try {
+        const result = await this.provider().destroyStorage({
+          env: this.env,
+          state: this.s,
+        });
+        this.s.pendingDestroyVolumeId = null;
+        await this.persistProviderResultWithPatch(result, {
+          pendingDestroyVolumeId: null,
+        });
+        if (!this.s.pendingDestroyMachineId) {
+          this.s.lastDestroyErrorOp = null;
+          this.s.lastDestroyErrorStatus = null;
+          this.s.lastDestroyErrorMessage = null;
+          this.s.lastDestroyErrorAt = null;
+          await this.persist({
+            lastDestroyErrorOp: null,
+            lastDestroyErrorStatus: null,
+            lastDestroyErrorMessage: null,
+            lastDestroyErrorAt: null,
+          });
+        }
+      } catch (err) {
+        this.s.lastDestroyErrorOp = 'volume';
+        this.s.lastDestroyErrorStatus = this.providerErrorStatus(err);
+        this.s.lastDestroyErrorMessage = err instanceof Error ? err.message : String(err);
+        this.s.lastDestroyErrorAt = Date.now();
+        await this.persist({
+          lastDestroyErrorOp: 'volume',
+          lastDestroyErrorStatus: this.s.lastDestroyErrorStatus,
+          lastDestroyErrorMessage: this.s.lastDestroyErrorMessage,
+          lastDestroyErrorAt: this.s.lastDestroyErrorAt,
+        });
+        doWarn(this.s, 'Non-Fly storage destroy failed, alarm will retry', {
+          provider: this.s.provider,
+          storageId: this.s.pendingDestroyVolumeId,
+          error: toLoggable(err),
+        });
+      }
+    }
+  }
+
+  private async clearPendingStartReason(): Promise<void> {
+    if (this.s.pendingStartReason === null) {
+      return;
+    }
+
+    this.s.pendingStartReason = null;
+    await this.persist({ pendingStartReason: null });
+  }
+
+  private async markStartFailedFromProvider(message: string): Promise<void> {
+    const now = Date.now();
+    this.s.status = 'stopped';
+    this.s.startingAt = null;
+    this.s.pendingStartReason = null;
+    this.s.lastStoppedAt = now;
+    this.s.lastStartErrorMessage = message;
+    this.s.lastStartErrorAt = now;
+    await this.persist({
+      status: 'stopped',
+      startingAt: null,
+      pendingStartReason: null,
+      lastStoppedAt: now,
+      lastStartErrorMessage: message,
+      lastStartErrorAt: now,
+    });
+    await maybeDispatchStartFailurePush(
+      this.env,
+      this.s,
+      this.ctx,
+      'provider_start_failed',
+      message
+    );
+  }
+
+  private async markRestartFailedFromProvider(message: string): Promise<void> {
+    const now = Date.now();
+    this.s.status = 'stopped';
+    this.s.startingAt = null;
+    this.s.restartingAt = null;
+    this.s.restartUpdateSent = false;
+    this.s.lastStoppedAt = now;
+    this.s.lastRestartErrorMessage = message;
+    this.s.lastRestartErrorAt = now;
+    await this.persist({
+      status: 'stopped',
+      startingAt: null,
+      restartingAt: null,
+      restartUpdateSent: false,
+      lastStoppedAt: now,
+      lastRestartErrorMessage: message,
+      lastRestartErrorAt: now,
+    });
+  }
+
+  private async markNonFlyRunningFromProvider(reason: 'start' | 'runtime'): Promise<void> {
+    const startingAt = this.s.startingAt;
+    const startReason = reason === 'start' ? this.s.pendingStartReason : null;
+    this.s.status = 'running';
+    this.s.startingAt = null;
+    this.s.restartingAt = null;
+    this.s.restartUpdateSent = false;
+    this.s.pendingStartReason = reason === 'start' ? null : this.s.pendingStartReason;
+    if (this.s.lastStartedAt === null) {
+      this.s.lastStartedAt = Date.now();
+    }
+    this.s.healthCheckFailCount = 0;
+    this.s.lastStartErrorMessage = null;
+    this.s.lastStartErrorAt = null;
+    this.s.lastRestartErrorMessage = null;
+    this.s.lastRestartErrorAt = null;
+    await this.persist({
+      status: 'running',
+      startingAt: null,
+      restartingAt: null,
+      restartUpdateSent: false,
+      ...(reason === 'start' ? { pendingStartReason: null } : {}),
+      lastStartedAt: this.s.lastStartedAt,
+      healthCheckFailCount: 0,
+      lastStartErrorMessage: null,
+      lastStartErrorAt: null,
+      lastRestartErrorMessage: null,
+      lastRestartErrorAt: null,
+    });
+
+    if (reason === 'start') {
+      this.emitEvent({
+        event: 'instance.started',
+        status: 'running',
+        label: startReason ?? undefined,
+        durationMs: startingAt ? Date.now() - startingAt : undefined,
+      });
+    }
+  }
+
+  private async reconcileNonFlyRuntimeFromAlarm(): Promise<void> {
+    if (this.s.provider === 'fly') {
+      throw new Error('reconcileNonFlyRuntimeFromAlarm should not be used for Fly providers');
+    }
+
+    if (!['starting', 'restarting', 'running'].includes(this.s.status ?? '')) {
+      return;
+    }
+
+    const result = await this.provider().inspectRuntime({
+      env: this.env,
+      state: this.s,
+    });
+    await this.persistProviderResult(result);
+    const runtimeState = result.observation?.runtimeState ?? 'missing';
+
+    if (runtimeState === 'running') {
+      if (this.s.status === 'restarting') {
+        await markRestartSuccessful(
+          this.ctx,
+          this.s,
+          createReconcileContext(this.s, this.env, 'alarm_non_fly')
+        );
+      } else if (this.s.status === 'starting') {
+        await this.markNonFlyRunningFromProvider('start');
+      }
+      return;
+    }
+
+    if (this.s.status === 'starting') {
+      const timedOut =
+        this.s.startingAt !== null && Date.now() - this.s.startingAt > STARTING_TIMEOUT_MS;
+      if (timedOut || runtimeState === 'failed') {
+        const message = `Provider ${this.s.provider} runtime ${runtimeState} during start`;
+        await this.markStartFailedFromProvider(message);
+        this.emitProvisioningFailed('provider_runtime_not_running', message);
+        return;
+      }
+      return;
+    }
+
+    if (this.s.status === 'restarting') {
+      const timedOut =
+        this.s.restartingAt !== null && Date.now() - this.s.restartingAt > RESTARTING_TIMEOUT_MS;
+      if (timedOut || runtimeState === 'failed' || runtimeState === 'missing') {
+        await this.markRestartFailedFromProvider(
+          `Provider ${this.s.provider} runtime ${runtimeState} during restart`
+        );
+        return;
+      }
+      return;
+    }
+
+    if (this.s.status === 'running' && runtimeState !== 'starting') {
+      const now = Date.now();
+      this.s.status = 'stopped';
+      this.s.lastStoppedAt = now;
+      await this.persist({
+        status: 'stopped',
+        lastStoppedAt: now,
+      });
+      this.emitEvent({
+        event: 'instance.stopped',
+        status: 'stopped',
+        label: `provider_runtime_${runtimeState}`,
+      });
+    }
+  }
+
+  async getRoutingTarget(): Promise<ProviderRoutingTarget | null> {
+    await this.loadState();
+
+    if (
+      this.s.status === 'destroying' ||
+      this.s.status === 'restoring' ||
+      this.s.status === 'recovering'
+    ) {
+      return null;
+    }
+
+    try {
+      return await this.provider().getRoutingTarget({
+        env: this.env,
+        state: this.s,
+      });
+    } catch (err) {
+      doWarn(this.s, 'getRoutingTarget failed, returning null', {
+        provider: this.s.provider,
+        error: toLoggable(err),
+      });
+      return null;
+    }
+  }
+
+  async getProviderMetadata(): Promise<{
+    provider: ProviderId;
+    capabilities: ProviderCapabilities;
+  }> {
+    await this.loadState();
+
+    return {
+      provider: this.s.provider,
+      capabilities: this.provider().capabilities,
+    };
+  }
+
+  /**
+   * Emit an analytics event with common DO dimensions baked in.
+   * Follows gastown's Omit<> pattern — callers provide only the
+   * event-specific fields; userId, delivery, and machine context
+   * are always filled from this.s.
+   */
+  private emitEvent(
+    data: Omit<
+      KiloClawEventData,
+      | 'userId'
+      | 'sandboxId'
+      | 'delivery'
+      | 'flyAppName'
+      | 'flyMachineId'
+      | 'openclawVersion'
+      | 'imageTag'
+      | 'flyRegion'
+      | 'orgId'
+      | 'instanceId'
+    > & { event: KiloClawEventName }
+  ): void {
+    doLog(this.s, data.event, {
+      ...(data.status ? { status: data.status } : undefined),
+      ...(data.label ? { label: data.label } : undefined),
+      ...(data.error ? { error: data.error } : undefined),
+      ...(data.durationMs !== undefined ? { durationMs: data.durationMs } : undefined),
+      ...(data.value !== undefined ? { value: data.value } : undefined),
+    });
+    writeEvent(this.env, {
+      ...data,
+      delivery: 'do',
+      userId: this.s.userId ?? undefined,
+      sandboxId: this.s.sandboxId ?? undefined,
+      flyAppName: this.s.flyAppName ?? undefined,
+      flyMachineId: this.s.flyMachineId ?? undefined,
+      openclawVersion: this.s.openclawVersion ?? undefined,
+      imageTag: this.s.trackedImageTag ?? undefined,
+      flyRegion: this.s.flyRegion ?? undefined,
+      orgId: this.s.orgId ?? undefined,
+      instanceId: safeInstanceIdFromSandboxId(this.s.sandboxId ?? undefined),
+      status: data.status ?? this.s.status ?? undefined,
+    });
+  }
+
+  private emitProvisioningFailed(label: string, error?: string): void {
+    this.emitEvent({
+      event: 'instance.provisioning_failed',
+      status: 'stopped',
+      label,
+      error,
+    });
+  }
+
+  private emitStartCapacityRecovery(error: string, label: string): void {
+    this.emitEvent({
+      event: 'instance.start_capacity_recovery',
+      status: this.s.status ?? undefined,
+      label,
+      error,
+    });
+  }
+
+  private capacityRecoveryLabel(err: unknown): string {
+    if (!(err instanceof fly.FlyApiError)) {
+      return 'fly_capacity_recovery';
+    }
+
+    const searchText = `${err.message}\n${err.body}`.toLowerCase();
+
+    if (searchText.includes('insufficient memory')) {
+      return `fly_${err.status}_insufficient_memory`;
+    }
+    if (searchText.includes('no capacity')) {
+      return `fly_${err.status}_no_capacity`;
+    }
+    if (searchText.includes('over the allowed quota')) {
+      return `fly_${err.status}_quota_exceeded`;
+    }
+    if (searchText.includes('insufficient resources')) {
+      return `fly_${err.status}_insufficient_resources`;
+    }
+
+    return `fly_${err.status}_capacity_recovery`;
+  }
+
+  // ========================================================================
+  // Lifecycle methods (called by platform API routes via RPC)
+  // ========================================================================
+
+  async provision(
+    userId: string,
+    config: InstanceConfig,
+    opts?: {
+      orgId?: string | null;
+      instanceId?: string;
+      provider?: ProviderId;
+      freshProvision?: boolean;
+    }
+  ): Promise<{ sandboxId: string }> {
+    const provisionStart = performance.now();
+    await this.loadState();
+
+    if (this.s.status === 'destroying') {
+      throw new Error('Cannot provision: instance is being destroyed');
+    }
+    if (this.s.status === 'recovering') {
+      throw new Error('Cannot provision: instance is recovering from an unexpected stop');
+    }
+    if (this.s.status === 'restoring') {
+      throw new Error('Cannot provision: instance is restoring from snapshot');
+    }
+
+    // For instance-keyed DOs (instanceId provided), derive sandboxId from instanceId.
+    // For legacy userId-keyed DOs, derive from userId.
+    const sandboxId = opts?.instanceId
+      ? sandboxIdFromInstanceId(opts.instanceId)
+      : sandboxIdFromUserId(userId);
+    const isNew = !this.s.status;
+    if (opts?.instanceId && !opts.freshProvision && isNew) {
+      throw Object.assign(new Error('Instance not provisioned'), { status: 404 });
+    }
+    if (!isNew && opts?.provider && opts.provider !== this.s.provider) {
+      throw Object.assign(
+        new Error(`Cannot change provider from ${this.s.provider} to ${opts.provider}`),
+        { status: 409 }
+      );
+    }
+    const providerId =
+      opts?.provider ?? (isNew ? resolveDefaultProvider(this.env) : this.s.provider);
+    const orgId = opts?.orgId ?? null;
+    const inferredInstanceType = resolveInstanceTypeFromState(this.s);
+    const instanceType =
+      config.instanceType ?? inferredInstanceType ?? (isNew ? DEFAULT_INSTANCE_TIER : null);
+    const tier = instanceType && instanceType !== 'custom' ? getTier(instanceType) : null;
+    const nextMachineSize = tier?.machineSize ?? this.s.machineSize ?? null;
+    const nextVolumeSizeGb = tier?.volumeSizeGb ?? this.s.volumeSizeGb ?? null;
+    const provider = getProviderAdapter(this.env, { provider: providerId });
+    const provisioningState = {
+      ...this.s,
+      userId,
+      sandboxId,
+      provider: providerId,
+      orgId,
+      instanceType,
+      machineSize: nextMachineSize,
+      volumeSizeGb: nextVolumeSizeGb,
+    } satisfies InstanceMutableState;
+
+    const provisioning = await provider.ensureProvisioningResources({
+      env: this.env,
+      state: provisioningState,
+      orgId,
+      machineSize: nextMachineSize,
+      region: config.region,
+    });
+    this.s.userId = userId;
+    this.s.sandboxId = sandboxId;
+    this.s.provider = providerId;
+    this.s.orgId = orgId;
+    await this.persistProviderResult(provisioning);
+
+    // Resolve the image version for this provision.
+    console.debug('[DO] provision: pinnedImageTag from config:', config.pinnedImageTag ?? 'none');
+    await this.resolveImageStateForPin(
+      config.pinnedImageTag ?? null,
+      userId,
+      opts?.instanceId ?? userId,
+      { isNew }
+    );
+
+    const previousUserTimezone = this.s.userTimezone ?? null;
+    const previousUserLocation = this.s.userLocation ?? null;
+    const userTimezone =
+      config.userTimezone === undefined ? previousUserTimezone : config.userTimezone;
+    const userLocation =
+      config.userLocation === undefined ? previousUserLocation : config.userLocation;
+    const shouldWriteUserProfile =
+      !isNew &&
+      this.s.status === 'running' &&
+      (userTimezone !== previousUserTimezone || userLocation !== previousUserLocation);
+
+    const configFields = {
+      userId,
+      sandboxId,
+      orgId: opts?.orgId ?? null,
+      provider: this.s.provider,
+      status: (this.s.status ?? 'provisioned') satisfies InstanceStatus,
+      envVars: config.envVars ?? null,
+      encryptedSecrets: config.encryptedSecrets ?? null,
+      kilocodeApiKey: config.kilocodeApiKey ?? null,
+      kilocodeApiKeyExpiresAt: config.kilocodeApiKeyExpiresAt ?? null,
+      kilocodeDefaultModel: config.kilocodeDefaultModel ?? null,
+      userTimezone,
+      userLocation,
+      kiloExaSearchMode: config.webSearch?.exaMode ?? this.s.kiloExaSearchMode ?? null,
+      channels: config.channels ?? null,
+      machineSize: nextMachineSize,
+      instanceType,
+      volumeSizeGb: nextVolumeSizeGb,
+    } satisfies Partial<PersistedState>;
+
+    const versionFields = {
+      openclawVersion: this.s.openclawVersion,
+      imageVariant: this.s.imageVariant,
+      trackedImageTag: this.s.trackedImageTag,
+      trackedImageDigest: this.s.trackedImageDigest,
+    };
+
+    if (isNew) {
+      this.s.instanceFeatures = [...DEFAULT_INSTANCE_FEATURES];
+    }
+
+    const update = isNew
+      ? syncProviderStateForStorage(
+          this.s,
+          storageUpdate({
+            ...configFields,
+            ...versionFields,
+            instanceFeatures: this.s.instanceFeatures,
+            provisionedAt: Date.now(),
+            lastStartedAt: null,
+            lastStoppedAt: null,
+            flyAppName: this.s.flyAppName,
+            flyMachineId: this.s.flyMachineId,
+            flyVolumeId: this.s.flyVolumeId,
+            flyRegion: this.s.flyRegion,
+            providerState: this.s.providerState,
+            healthCheckFailCount: 0,
+            pendingDestroyMachineId: null,
+            pendingDestroyVolumeId: null,
+            pendingPostgresMarkOnFinalize: false,
+            ...LIFECYCLE_NOTIFICATION_RESET,
+          })
+        )
+      : syncProviderStateForStorage(
+          this.s,
+          storageUpdate({
+            ...configFields,
+            ...versionFields,
+            instanceFeatures: this.s.instanceFeatures,
+          })
+        );
+
+    await this.ctx.storage.put(update);
+
+    this.s.userId = userId;
+    this.s.sandboxId = sandboxId;
+    this.s.orgId = opts?.orgId ?? null;
+    this.s.status = this.s.status ?? 'provisioned';
+    this.s.envVars = config.envVars ?? null;
+    this.s.encryptedSecrets = config.encryptedSecrets ?? null;
+    this.s.kilocodeApiKey = config.kilocodeApiKey ?? null;
+    this.s.kilocodeApiKeyExpiresAt = config.kilocodeApiKeyExpiresAt ?? null;
+    this.s.kilocodeDefaultModel = config.kilocodeDefaultModel ?? null;
+    this.s.userTimezone = userTimezone;
+    this.s.userLocation = userLocation;
+    this.s.kiloExaSearchMode = config.webSearch?.exaMode ?? this.s.kiloExaSearchMode ?? null;
+    this.s.channels = config.channels ?? null;
+    this.s.machineSize = nextMachineSize;
+    this.s.instanceType = instanceType;
+    this.s.volumeSizeGb = nextVolumeSizeGb;
+    if (isNew) {
+      this.s.provisionedAt = Date.now();
+      this.s.lastStartedAt = null;
+      this.s.lastStoppedAt = null;
+      this.s.healthCheckFailCount = 0;
+      this.s.pendingDestroyMachineId = null;
+      this.s.pendingDestroyVolumeId = null;
+      this.s.pendingPostgresMarkOnFinalize = false;
+      Object.assign(this.s, LIFECYCLE_NOTIFICATION_RESET);
+    }
+    this.s.loaded = true;
+
+    if (shouldWriteUserProfile) {
+      await gateway.writeUserProfile(this.s, this.env, {
+        userTimezone,
+        userLocation,
+      });
+      // Best-effort propagation to the morning-briefing plugin's
+      // config.json so the next brief picks up the new value without
+      // waiting for a container restart. `writeUserProfile` above
+      // already persisted the location in USER.md, and the plugin's
+      // KILOCLAW_USER_LOCATION env-var path picks it up on next deploy.
+      // Failures here (plugin restarting, write-queue contention, old
+      // controller image missing the route, gateway proxy hiccup) are
+      // logged but do NOT fail the user's save. Failing the whole
+      // tRPC mutation on a transient plugin-side issue means the user
+      // sees a 500 in the UI even though the location was accepted by
+      // the DO and persisted to USER.md.
+      if (userLocation !== previousUserLocation) {
+        try {
+          await gateway.updateMorningBriefingUserLocation(this.s, this.env, {
+            userLocation,
+          });
+        } catch (err) {
+          doWarn(this.s, 'updateMorningBriefingUserLocation failed', {
+            error: toLoggable(err),
+          });
+        }
+      }
+    }
+
+    if (isNew) {
+      await this.scheduleAlarm();
+    }
+
+    if (isNew) {
+      await this.startAsync(userId, { reason: 'initial_provision' });
+    }
+
+    this.emitEvent({
+      event: 'instance.provisioned',
+      status: 'provisioned',
+      durationMs: performance.now() - provisionStart,
+    });
+
+    return { sandboxId };
+  }
+
+  async updateKiloCodeConfig(patch: {
+    kilocodeApiKey?: string | null;
+    kilocodeApiKeyExpiresAt?: string | null;
+    kilocodeDefaultModel?: string | null;
+    vectorMemoryEnabled?: boolean;
+    vectorMemoryModel?: string | null;
+    dreamingEnabled?: boolean;
+  }): Promise<{
+    kilocodeApiKey: string | null;
+    kilocodeApiKeyExpiresAt: string | null;
+    kilocodeDefaultModel: string | null;
+    vectorMemoryEnabled: boolean;
+    vectorMemoryModel: string | null;
+    dreamingEnabled: boolean;
+  }> {
+    await this.loadState();
+
+    const pending: Partial<PersistedState> = {};
+
+    if (patch.kilocodeApiKey !== undefined) {
+      this.s.kilocodeApiKey = patch.kilocodeApiKey;
+      pending.kilocodeApiKey = this.s.kilocodeApiKey;
+    }
+    if (patch.kilocodeApiKeyExpiresAt !== undefined) {
+      this.s.kilocodeApiKeyExpiresAt = patch.kilocodeApiKeyExpiresAt;
+      pending.kilocodeApiKeyExpiresAt = this.s.kilocodeApiKeyExpiresAt;
+    }
+    if (patch.kilocodeDefaultModel !== undefined) {
+      this.s.kilocodeDefaultModel = patch.kilocodeDefaultModel;
+      pending.kilocodeDefaultModel = this.s.kilocodeDefaultModel;
+    }
+    if (patch.vectorMemoryEnabled !== undefined) {
+      this.s.vectorMemoryEnabled = patch.vectorMemoryEnabled;
+      pending.vectorMemoryEnabled = this.s.vectorMemoryEnabled;
+    }
+    if (patch.vectorMemoryModel !== undefined) {
+      this.s.vectorMemoryModel = patch.vectorMemoryModel;
+      pending.vectorMemoryModel = this.s.vectorMemoryModel;
+    }
+    if (patch.dreamingEnabled !== undefined) {
+      this.s.dreamingEnabled = patch.dreamingEnabled;
+      pending.dreamingEnabled = this.s.dreamingEnabled;
+    }
+
+    if (Object.keys(pending).length > 0) {
+      await this.ctx.storage.put(pending);
+    }
+
+    if (patch.kilocodeDefaultModel !== undefined) {
+      const model = this.s.kilocodeDefaultModel ?? OPENCLAW_BUILTIN_DEFAULT_MODEL;
+      await gateway.patchConfigOnMachine(this.s, this.env, {
+        agents: { defaults: { model: { primary: model } } },
+      });
+    }
+
+    // Live-patch vector memory config on the running machine when toggled or model changed.
+    // Must include the full `remote` block (baseUrl, apiKey, headers) so OpenClaw routes
+    // embedding requests through the Kilo Gateway instead of the default OpenAI endpoint.
+    if (patch.vectorMemoryEnabled !== undefined || patch.vectorMemoryModel !== undefined) {
+      if (this.s.vectorMemoryEnabled) {
+        const model = this.s.vectorMemoryModel ?? DEFAULT_VECTOR_MEMORY_MODEL;
+        const baseUrl = this.env.KILOCODE_API_BASE_URL || 'https://api.kilo.ai/api/gateway/';
+        // Feature attribution for embedding calls — matches FEATURE_HEADER /
+        // FEATURE_VALUES in apps/web/src/lib/feature-detection.ts so that
+        // microdollar_usage_metadata.feature_id records 'kiloclaw-embedding'.
+        const headers: Record<string, string> = {
+          'x-kilocode-feature': 'kiloclaw-embedding',
+        };
+        if (this.s.orgId) {
+          headers['X-KiloCode-OrganizationId'] = this.s.orgId;
+        }
+        await gateway.patchConfigOnMachine(this.s, this.env, {
+          agents: {
+            defaults: {
+              memorySearch: {
+                enabled: true,
+                provider: 'openai',
+                model,
+                remote: {
+                  baseUrl,
+                  apiKey: this.s.kilocodeApiKey ?? '',
+                  headers,
+                },
+              },
+            },
+          },
+        });
+      } else {
+        // Send explicit nulls so deepMerge overwrites (rather than preserves)
+        // the stale remote block — the boot-time writer deletes these keys.
+        await gateway.patchConfigOnMachine(this.s, this.env, {
+          agents: {
+            defaults: {
+              memorySearch: {
+                enabled: false,
+                provider: null,
+                model: null,
+                remote: null,
+              },
+            },
+          },
+        });
+      }
+    }
+
+    // Live-patch dreaming config on the running machine when toggled.
+    if (patch.dreamingEnabled !== undefined) {
+      await gateway.patchConfigOnMachine(this.s, this.env, {
+        plugins: {
+          entries: {
+            'memory-core': {
+              config: {
+                dreaming: { enabled: this.s.dreamingEnabled },
+              },
+            },
+          },
+        },
+      });
+    }
+
+    return {
+      kilocodeApiKey: this.s.kilocodeApiKey,
+      kilocodeApiKeyExpiresAt: this.s.kilocodeApiKeyExpiresAt,
+      kilocodeDefaultModel: this.s.kilocodeDefaultModel,
+      vectorMemoryEnabled: this.s.vectorMemoryEnabled,
+      vectorMemoryModel: this.s.vectorMemoryModel,
+      dreamingEnabled: this.s.dreamingEnabled,
+    };
+  }
+
+  private shouldEnableGoogleWorkspaceTools(): boolean {
+    return this.s.googleCredentials !== null || this.s.googleOAuthConnection?.status === 'active';
+  }
+
+  private async syncGoogleWorkspaceConfig(reason: string): Promise<void> {
+    const enabled = this.shouldEnableGoogleWorkspaceTools();
+    const now = Date.now();
+
+    this.s.googleWorkspaceToolsEnabled = enabled;
+
+    const running = this.s.status === 'running' && !!getRuntimeId(this.s);
+    if (!running) {
+      this.s.googleWorkspaceConfigSyncPending = true;
+      this.s.googleWorkspaceConfigSyncError = null;
+      await this.persist({
+        googleWorkspaceToolsEnabled: enabled,
+        googleWorkspaceConfigSyncPending: true,
+        googleWorkspaceConfigSyncError: null,
+      });
+      return;
+    }
+
+    try {
+      const result = await gateway.syncGoogleWorkspaceToolsSectionOnMachine(
+        this.s,
+        this.env,
+        enabled
+      );
+      if (result === null) {
+        this.s.googleWorkspaceConfigSyncPending = true;
+        this.s.googleWorkspaceConfigSyncError = 'controller_route_unavailable';
+      } else {
+        this.s.googleWorkspaceConfigSyncPending = false;
+        this.s.googleWorkspaceConfigSyncError = null;
+        this.s.googleWorkspaceConfigSyncedAt = now;
+      }
+    } catch (error) {
+      this.s.googleWorkspaceConfigSyncPending = true;
+      this.s.googleWorkspaceConfigSyncError =
+        error instanceof Error ? error.message : String(error);
+      doWarn(this.s, 'google workspace config sync failed', {
+        reason,
+        enabled,
+        error: toLoggable(error),
+      });
+    }
+
+    await this.persist({
+      googleWorkspaceToolsEnabled: enabled,
+      googleWorkspaceConfigSyncPending: this.s.googleWorkspaceConfigSyncPending,
+      googleWorkspaceConfigSyncError: this.s.googleWorkspaceConfigSyncError,
+      googleWorkspaceConfigSyncedAt: this.s.googleWorkspaceConfigSyncedAt,
+    });
+  }
+
+  /**
+   * Flush DO-side config that was patched while the gateway wasn't reachable
+   * (status !== 'running') to the live gateway now.
+   *
+   * Called:
+   * - From _startInner after status transitions to 'running' (covers the
+   *   common onboarding path where a client patches during 'starting').
+   * - From the alarm retry block when flags stayed set because the inline
+   *   gateway call failed, or because the starting→running transition was
+   *   driven by reconcileStarting instead of _startInner.
+   *
+   * No-op when nothing is pending. On per-field failure the flag stays true
+   * so the next alarm retries.
+   */
+  private async flushPendingConfigToGateway(reason: string): Promise<void> {
+    if (this.s.status !== 'running' || !getRuntimeId(this.s)) return;
+
+    const pending: Partial<PersistedState> = {};
+
+    if (this.s.botIdentityApplyPending) {
+      try {
+        await gateway.writeBotIdentity(this.s, this.env, {
+          botName: this.s.botName,
+          botNature: this.s.botNature,
+          botVibe: this.s.botVibe,
+          botEmoji: this.s.botEmoji,
+        });
+        this.s.botIdentityApplyPending = false;
+        pending.botIdentityApplyPending = false;
+        doLog(this.s, 'flushPendingConfigToGateway: bot identity applied', { reason });
+      } catch (err) {
+        doWarn(this.s, 'flushPendingConfigToGateway: bot identity failed; will retry', {
+          reason,
+          error: toLoggable(err),
+        });
+      }
+    }
+
+    if (this.s.execPresetApplyPending) {
+      try {
+        await gateway.patchOpenclawConfig(this.s, this.env, {
+          tools: {
+            exec: {
+              security: this.s.execSecurity,
+              ask: this.s.execAsk,
+            },
+          },
+        });
+        this.s.execPresetApplyPending = false;
+        pending.execPresetApplyPending = false;
+        doLog(this.s, 'flushPendingConfigToGateway: exec preset applied', { reason });
+      } catch (err) {
+        doWarn(this.s, 'flushPendingConfigToGateway: exec preset failed; will retry', {
+          reason,
+          error: toLoggable(err),
+        });
+      }
+    }
+
+    if (this.s.channelsApplyPending) {
+      try {
+        const patch = buildChannelConfigPatch(this.env, this.s.channels);
+        if (patch) {
+          await gateway.patchOpenclawConfig(this.s, this.env, patch);
+        }
+        this.s.channelsApplyPending = false;
+        pending.channelsApplyPending = false;
+        doLog(this.s, 'flushPendingConfigToGateway: channels applied', { reason });
+      } catch (err) {
+        doWarn(this.s, 'flushPendingConfigToGateway: channels failed; will retry', {
+          reason,
+          error: toLoggable(err),
+        });
+      }
+    }
+
+    if (Object.keys(pending).length > 0) {
+      await this.ctx.storage.put(pending);
+    }
+  }
+
+  async updateExecPreset(patch: {
+    security?: string;
+    ask?: string;
+  }): Promise<{ execSecurity: string | null; execAsk: string | null }> {
+    await this.loadState();
+
+    const pending: Partial<PersistedState> = {};
+
+    if (patch.security !== undefined) {
+      this.s.execSecurity = patch.security;
+      pending.execSecurity = patch.security;
+    }
+    if (patch.ask !== undefined) {
+      this.s.execAsk = patch.ask;
+      pending.execAsk = patch.ask;
+    }
+
+    if (Object.keys(pending).length === 0) {
+      return {
+        execSecurity: this.s.execSecurity,
+        execAsk: this.s.execAsk,
+      };
+    }
+
+    this.s.execPresetApplyPending = true;
+    pending.execPresetApplyPending = true;
+    await this.ctx.storage.put(storageUpdate(pending));
+
+    if (this.s.status === 'running') {
+      try {
+        await gateway.patchOpenclawConfig(this.s, this.env, {
+          tools: {
+            exec: {
+              security: this.s.execSecurity,
+              ask: this.s.execAsk,
+            },
+          },
+        });
+        this.s.execPresetApplyPending = false;
+        await this.ctx.storage.put(storageUpdate({ execPresetApplyPending: false }));
+      } catch (err) {
+        doWarn(this.s, 'updateExecPreset: gateway patch failed; deferring to alarm', {
+          error: toLoggable(err),
+        });
+      }
+    }
+
+    return {
+      execSecurity: this.s.execSecurity,
+      execAsk: this.s.execAsk,
+    };
+  }
+
+  async updateWebSearchConfig(patch: {
+    exaMode?: KiloExaSearchMode | null;
+  }): Promise<{ exaMode: KiloExaSearchMode | null }> {
+    await this.loadState();
+
+    const pending: Partial<PersistedState> = {};
+
+    if (patch.exaMode !== undefined) {
+      this.s.kiloExaSearchMode = patch.exaMode;
+      pending.kiloExaSearchMode = this.s.kiloExaSearchMode;
+    }
+
+    if (Object.keys(pending).length > 0) {
+      await this.ctx.storage.put(storageUpdate(pending));
+    }
+
+    return {
+      exaMode: this.s.kiloExaSearchMode,
+    };
+  }
+
+  async updateBotIdentity(patch: {
+    botName?: string | null;
+    botNature?: string | null;
+    botVibe?: string | null;
+    botEmoji?: string | null;
+  }): Promise<{
+    botName: string | null;
+    botNature: string | null;
+    botVibe: string | null;
+    botEmoji: string | null;
+  }> {
+    await this.loadState();
+
+    const pending: Partial<PersistedState> = {};
+
+    if (patch.botName !== undefined) {
+      this.s.botName = patch.botName;
+      pending.botName = patch.botName;
+    }
+    if (patch.botNature !== undefined) {
+      this.s.botNature = patch.botNature;
+      pending.botNature = patch.botNature;
+    }
+    if (patch.botVibe !== undefined) {
+      this.s.botVibe = patch.botVibe;
+      pending.botVibe = patch.botVibe;
+    }
+    if (patch.botEmoji !== undefined) {
+      this.s.botEmoji = patch.botEmoji;
+      pending.botEmoji = patch.botEmoji;
+    }
+
+    if (Object.keys(pending).length === 0) {
+      return {
+        botName: this.s.botName,
+        botNature: this.s.botNature,
+        botVibe: this.s.botVibe,
+        botEmoji: this.s.botEmoji,
+      };
+    }
+
+    this.s.botIdentityApplyPending = true;
+    pending.botIdentityApplyPending = true;
+    await this.ctx.storage.put(storageUpdate(pending));
+
+    if (this.s.status === 'running') {
+      try {
+        await gateway.writeBotIdentity(this.s, this.env, {
+          botName: this.s.botName,
+          botNature: this.s.botNature,
+          botVibe: this.s.botVibe,
+          botEmoji: this.s.botEmoji,
+        });
+        this.s.botIdentityApplyPending = false;
+        await this.ctx.storage.put(storageUpdate({ botIdentityApplyPending: false }));
+      } catch (err) {
+        // Gateway reachable only after flyMachineId + controller up; on
+        // transient failure, keep the alarm retry path queued.
+        doWarn(this.s, 'updateBotIdentity: gateway write failed; deferring to alarm', {
+          error: toLoggable(err),
+        });
+      }
+    }
+
+    return {
+      botName: this.s.botName,
+      botNature: this.s.botNature,
+      botVibe: this.s.botVibe,
+      botEmoji: this.s.botEmoji,
+    };
+  }
+
+  async updateChannels(patch: {
+    telegramBotToken?: EncryptedEnvelope | null;
+    discordBotToken?: EncryptedEnvelope | null;
+    slackBotToken?: EncryptedEnvelope | null;
+    slackAppToken?: EncryptedEnvelope | null;
+  }): Promise<{
+    telegram: boolean;
+    discord: boolean;
+    slackBot: boolean;
+    slackApp: boolean;
+  }> {
+    const secretsPatch: Record<string, EncryptedEnvelope | null> = {};
+    let includesRemoval = false;
+    let includesAddition = false;
+    for (const [key, value] of Object.entries(patch)) {
+      if (value !== undefined) {
+        secretsPatch[key] = value;
+        if (value === null) {
+          includesRemoval = true;
+        } else {
+          includesAddition = true;
+        }
+      }
+    }
+
+    const { configured } = await this.updateSecrets(secretsPatch);
+
+    const pending: Partial<PersistedState> = {};
+    if (Object.keys(secretsPatch).length > 0) {
+      if (includesAddition && this.s.status === 'running' && getRuntimeId(this.s)) {
+        try {
+          const configPatch = buildChannelConfigPatch(this.env, this.s.channels);
+          if (configPatch) {
+            await gateway.patchOpenclawConfig(this.s, this.env, configPatch);
+          }
+          this.s.channelsApplyPending = false;
+          pending.channelsApplyPending = false;
+        } catch (err) {
+          doWarn(this.s, 'updateChannels: gateway patch failed; deferring to alarm', {
+            error: toLoggable(err),
+          });
+          this.s.channelsApplyPending = true;
+          pending.channelsApplyPending = true;
+        }
+      } else if (includesAddition) {
+        this.s.channelsApplyPending = true;
+        pending.channelsApplyPending = true;
+      } else if (includesRemoval && (!this.s.channelsApplyPending || !this.s.channels)) {
+        // Removals are not live-applied, but do not erase a pending additive replay
+        // while other channel config remains queued for the gateway.
+        this.s.channelsApplyPending = false;
+        pending.channelsApplyPending = false;
+      }
+    }
+
+    if (Object.keys(pending).length > 0) {
+      await this.ctx.storage.put(pending);
+    }
+
+    return {
+      telegram: configured.includes('telegramBotToken'),
+      discord: configured.includes('discordBotToken'),
+      slackBot: configured.includes('slackBotToken'),
+      slackApp: configured.includes('slackAppToken'),
+    };
+  }
+
+  async updateSecrets(
+    patch: Record<string, EncryptedEnvelope | null>,
+    meta?: Record<string, CustomSecretMeta>
+  ): Promise<{ configured: SecretFieldKey[] }> {
+    await this.loadState();
+
+    // Separate catalog secrets (keyed by field key) from custom secrets
+    // (keyed directly by env var name).
+    const currentSecrets: Record<string, EncryptedEnvelope | null> = {
+      ...(this.s.channels ?? {}),
+    };
+    const customSecrets: Record<string, EncryptedEnvelope> = {};
+    if (this.s.encryptedSecrets) {
+      for (const [key, value] of Object.entries(this.s.encryptedSecrets)) {
+        const fieldKey = ENV_VAR_TO_FIELD_KEY.get(key);
+        if (fieldKey) {
+          currentSecrets[fieldKey] = value;
+        } else {
+          customSecrets[key] = value;
+        }
+      }
+    }
+
+    // Apply the patch — catalog field keys go to currentSecrets, custom
+    // env var names go directly to customSecrets.
+    for (const [key, value] of Object.entries(patch)) {
+      const isCatalogKey = ALL_SECRET_FIELD_KEYS.has(key);
+      if (value === null) {
+        console.log('[DO] Secret removed', { key, operation: 'remove' });
+        if (isCatalogKey) {
+          delete currentSecrets[key];
+        } else {
+          delete customSecrets[key];
+        }
+      } else {
+        console.log('[DO] Secret updated', { key, operation: 'set' });
+        if (isCatalogKey) {
+          currentSecrets[key] = value;
+        } else {
+          customSecrets[key] = value;
+        }
+      }
+    }
+
+    // Enforce allFieldsRequired for catalog entries (e.g., Slack needs both tokens)
+    for (const entry of SECRET_CATALOG) {
+      if (!entry.allFieldsRequired) continue;
+      const fieldValues = entry.fields.map(f => currentSecrets[f.key]);
+      const hasAny = fieldValues.some(v => v != null);
+      const hasAll = fieldValues.every(v => v != null);
+      if (hasAny && !hasAll) {
+        const err = new Error(
+          `Invalid secret patch: ${entry.label} requires all fields to be set together`
+        );
+        (err as Error & { status: number }).status = 400;
+        throw err;
+      }
+    }
+
+    // Enforce custom secret count limit
+    const customCount = Object.keys(customSecrets).length;
+    if (customCount > MAX_CUSTOM_SECRETS) {
+      const err = new Error(
+        `Custom secret limit exceeded: ${customCount} secrets (max ${MAX_CUSTOM_SECRETS})`
+      );
+      (err as Error & { status: number }).status = 400;
+      throw err;
+    }
+
+    // Backward compat: write channel secrets to legacy channels field
+    const channelKeys = new Set(
+      SECRET_CATALOG.filter(e => e.category === 'channel').flatMap(e => e.fields.map(f => f.key))
+    );
+    const channelsSubset: Record<string, EncryptedEnvelope> = {};
+    for (const [key, value] of Object.entries(currentSecrets)) {
+      if (channelKeys.has(key) && value) {
+        channelsSubset[key] = value;
+      }
+    }
+
+    const hasChannels = Object.keys(channelsSubset).length > 0;
+    this.s.channels = hasChannels ? (channelsSubset as PersistedState['channels']) : null;
+
+    // Build cleaned catalog secrets (non-null only)
+    const cleanedSecrets: Record<string, EncryptedEnvelope> = {};
+    for (const [key, value] of Object.entries(currentSecrets)) {
+      if (value) {
+        cleanedSecrets[key] = value;
+      }
+    }
+
+    const configured = Object.keys(cleanedSecrets).filter((k): k is SecretFieldKey =>
+      ALL_SECRET_FIELD_KEYS.has(k)
+    );
+
+    // Merge catalog secrets (remapped to env var names) with custom secrets
+    const remappedSecrets: Record<string, EncryptedEnvelope> = { ...customSecrets };
+    for (const [key, value] of Object.entries(cleanedSecrets)) {
+      const envName = FIELD_KEY_TO_ENV_VAR.get(key) ?? key;
+      remappedSecrets[envName] = value;
+    }
+    const hasSecrets = Object.keys(remappedSecrets).length > 0;
+    this.s.encryptedSecrets = hasSecrets ? remappedSecrets : null;
+
+    // Update custom secret metadata (config paths, etc.)
+    // Always clean up metadata for deleted secrets, even without a meta param.
+    const currentMeta = { ...(this.s.customSecretMeta ?? {}) };
+    for (const [key, value] of Object.entries(patch)) {
+      if (ALL_SECRET_FIELD_KEYS.has(key)) continue;
+      if (value === null) {
+        delete currentMeta[key];
+      }
+    }
+    // Set/update metadata for any keys provided in meta
+    if (meta) {
+      for (const [key, metaValue] of Object.entries(meta)) {
+        if (ALL_SECRET_FIELD_KEYS.has(key)) continue;
+        // Reject duplicate config paths — no two secrets may target the same path
+        if (metaValue.configPath) {
+          for (const [existingKey, existingMeta] of Object.entries(currentMeta)) {
+            if (existingKey !== key && existingMeta.configPath === metaValue.configPath) {
+              const err = new Error(
+                `Config path "${metaValue.configPath}" is already used by secret "${existingKey}"`
+              );
+              (err as Error & { status: number }).status = 400;
+              throw err;
+            }
+          }
+        }
+        currentMeta[key] = metaValue;
+      }
+    }
+    const hasMeta = Object.keys(currentMeta).length > 0;
+    this.s.customSecretMeta = hasMeta ? currentMeta : null;
+
+    if (patch[BRAVE_SEARCH_FIELD_KEY] && this.s.kiloExaSearchMode !== 'disabled') {
+      this.s.kiloExaSearchMode = 'disabled';
+    }
+
+    await this.ctx.storage.put({
+      channels: this.s.channels,
+      encryptedSecrets: this.s.encryptedSecrets,
+      customSecretMeta: this.s.customSecretMeta,
+      kiloExaSearchMode: this.s.kiloExaSearchMode,
+    });
+
+    return { configured };
+  }
+
+  /**
+   * Store encrypted Google credentials (client_secret.json + OAuth tokens).
+   * Does NOT restart the machine; the caller should prompt the user to restart.
+   */
+  async updateGoogleCredentials(
+    credentials: GoogleCredentials
+  ): Promise<{ googleConnected: boolean }> {
+    await this.loadState();
+
+    this.s.googleCredentials = credentials;
+    this.s.gmailPushOidcEmail = credentials.gmailPushOidcEmail ?? null;
+    this.s.gmailNotificationsEnabled = true;
+
+    await this.ctx.storage.put({
+      googleCredentials: this.s.googleCredentials,
+      gmailPushOidcEmail: this.s.gmailPushOidcEmail,
+      gmailNotificationsEnabled: true,
+    });
+
+    await this.syncGoogleWorkspaceConfig('legacy_google_connected');
+
+    return { googleConnected: true };
+  }
+
+  /**
+   * Clear stored Google credentials.
+   * Does NOT restart the machine; the caller should prompt the user to restart.
+   * Also disables Gmail notifications to prevent stale state.
+   */
+  async clearGoogleCredentials(): Promise<{ googleConnected: boolean }> {
+    await this.loadState();
+
+    this.s.googleCredentials = null;
+    this.s.gmailNotificationsEnabled = false;
+    this.s.gmailLastHistoryId = null;
+    this.s.gmailPushOidcEmail = null;
+    await this.ctx.storage.put({
+      googleCredentials: null,
+      gmailNotificationsEnabled: false,
+      gmailLastHistoryId: null,
+      gmailPushOidcEmail: null,
+    });
+
+    await this.syncGoogleWorkspaceConfig('legacy_google_disconnected');
+
+    return { googleConnected: false };
+  }
+
+  async updateGoogleOAuthConnection(connection: {
+    status: GoogleOAuthConnection['status'];
+    accountEmail: string | null;
+    accountSubject: string | null;
+    scopes: string[];
+    capabilities: string[];
+    lastError?: string | null;
+  }): Promise<{
+    googleOAuthConnected: boolean;
+    googleOAuthStatus: GoogleOAuthConnection['status'];
+  }> {
+    await this.loadState();
+
+    const now = Date.now();
+    const previous = this.s.googleOAuthConnection;
+    const isActive = connection.status === 'active';
+
+    this.s.googleOAuthConnection = {
+      accountEmail: connection.accountEmail,
+      accountSubject: connection.accountSubject,
+      scopes: [...new Set(connection.scopes)].sort(),
+      capabilities: [...new Set(connection.capabilities)].sort(),
+      status: connection.status,
+      lastError: connection.lastError ?? null,
+      connectedAt: isActive ? (previous?.connectedAt ?? now) : (previous?.connectedAt ?? null),
+      updatedAt: now,
+    };
+
+    await this.persist({
+      googleOAuthConnection: this.s.googleOAuthConnection,
+    });
+
+    await this.syncGoogleWorkspaceConfig('oauth_google_connected');
+
+    return {
+      googleOAuthConnected: isActive,
+      googleOAuthStatus: connection.status,
+    };
+  }
+
+  async clearGoogleOAuthConnection(): Promise<{
+    googleOAuthConnected: boolean;
+    googleOAuthStatus: GoogleOAuthConnection['status'];
+  }> {
+    await this.loadState();
+
+    this.s.googleOAuthConnection = null;
+    await this.persist({ googleOAuthConnection: null });
+
+    await this.syncGoogleWorkspaceConfig('oauth_google_disconnected');
+
+    return {
+      googleOAuthConnected: false,
+      googleOAuthStatus: 'disconnected',
+    };
+  }
+
+  /**
+   * Update the last-seen Gmail history ID.
+   * Only writes if the new value is numerically greater than the stored one,
+   * preventing out-of-order updates from overwriting newer state.
+   */
+  async updateGmailHistoryId(historyId: string): Promise<void> {
+    await this.loadState();
+
+    const current = this.s.gmailLastHistoryId;
+    try {
+      const newNum = BigInt(historyId);
+      if (current !== null) {
+        const currentNum = BigInt(current);
+        if (newNum <= currentNum) {
+          return;
+        }
+      }
+    } catch {
+      return; // invalid input (BigInt throws on non-numeric strings)
+    }
+
+    this.s.gmailLastHistoryId = historyId;
+    await this.persist({ gmailLastHistoryId: historyId });
+  }
+
+  /**
+   * Return the stored OIDC service account email for Gmail push validation.
+   * Lightweight — no side effects, no Fly checks.
+   */
+  async getGmailOidcEmail(): Promise<{ gmailPushOidcEmail: string | null }> {
+    await this.loadState();
+    return { gmailPushOidcEmail: this.s.gmailPushOidcEmail };
+  }
+
+  /**
+   * Enable or disable Gmail push notifications.
+   * Persists the flag — takes effect immediately at the queue consumer level, no restart needed.
+   */
+  async updateGmailNotifications(
+    enabled: boolean
+  ): Promise<{ gmailNotificationsEnabled: boolean }> {
+    await this.loadState();
+
+    if (!this.s.userId || !this.s.sandboxId) {
+      throw new Error('Instance is not provisioned');
+    }
+
+    if (enabled && !this.s.googleCredentials) {
+      throw new Error('Cannot enable Gmail notifications without a connected Google account');
+    }
+
+    this.s.gmailNotificationsEnabled = enabled;
+    await this.persist({ gmailNotificationsEnabled: enabled });
+
+    return { gmailNotificationsEnabled: enabled };
+  }
+
+  // ── Pairing ─────────────────────────────────────────────────────────
+
+  async listPairingRequests(forceRefresh = false) {
+    await this.loadState();
+    return pairing.listPairingRequests(this.s, this.env, forceRefresh);
+  }
+
+  async approvePairingRequest(channel: string, code: string) {
+    await this.loadState();
+    return pairing.approvePairingRequest(this.s, this.env, channel, code);
+  }
+
+  async listDevicePairingRequests(forceRefresh = false) {
+    await this.loadState();
+    return pairing.listDevicePairingRequests(this.s, this.env, forceRefresh);
+  }
+
+  async approveDevicePairingRequest(requestId: string) {
+    await this.loadState();
+    return pairing.approveDevicePairingRequest(this.s, this.env, requestId);
+  }
+
+  async runDoctor() {
+    await this.loadState();
+    return pairing.runDoctor(this.s, this.env);
+  }
+
+  async startDoctorViaController(fix: boolean) {
+    await this.loadState();
+    return doctorRun.startDoctorViaController(this.s, this.env, fix);
+  }
+
+  async getDoctorViaControllerStatus() {
+    await this.loadState();
+    return doctorRun.getDoctorViaControllerStatus(this.s, this.env);
+  }
+
+  async cancelDoctorViaController() {
+    await this.loadState();
+    return doctorRun.cancelDoctorViaController(this.s, this.env);
+  }
+
+  // ── Kilo CLI Run ────────────────────────────────────────────────────
+
+  async startKiloCliRun(prompt: string) {
+    await this.loadState();
+    return kiloCliRun.startKiloCliRun(this.s, this.env, prompt);
+  }
+
+  async getKiloCliRunStatus() {
+    await this.loadState();
+    return kiloCliRun.getKiloCliRunStatus(this.s, this.env);
+  }
+
+  async cancelKiloCliRun() {
+    await this.loadState();
+    return kiloCliRun.cancelKiloCliRun(this.s, this.env);
+  }
+
+  // ── Lifecycle ───────────────────────────────────────────────────────
+
+  async forceRetryRecovery(): Promise<{ ok: true }> {
+    await this.loadState();
+
+    if (this.s.status === 'destroying') {
+      throw Object.assign(new Error('Cannot retry recovery: instance is being destroyed'), {
+        status: 409,
+      });
+    }
+    if (!this.s.status) {
+      throw Object.assign(new Error('Cannot retry recovery: instance has no status'), {
+        status: 404,
+      });
+    }
+
+    doWarn(this.s, 'forceRetryRecovery: admin-initiated cooldown reset', {
+      previousLastRecoveryAt: this.s.lastMetadataRecoveryAt,
+      status: this.s.status,
+    });
+
+    this.s.lastMetadataRecoveryAt = null;
+    await this.persist({ lastMetadataRecoveryAt: null });
+    await this.ctx.storage.setAlarm(Date.now());
+
+    return { ok: true };
+  }
+
+  /**
+   * Apply or clear an admin version pin by writing the resolved image
+   * fields into DO state. Does not restart the machine — the next
+   * provision/restart/redeploy picks up the new trackedImageTag via
+   * resolveImageTag(state, env).
+   *
+   * Pass `imageTag` = tag string to pin, or null to clear the pin (resets
+   * to the current rollout target via selectImageVersionForInstance).
+   *
+   * Returns the resolved image metadata so the caller can surface what
+   * was actually applied.
+   */
+  async applyPinnedVersion(imageTag: string | null): Promise<{
+    openclawVersion: string | null;
+    imageTag: string | null;
+    imageDigest: string | null;
+    variant: string | null;
+  }> {
+    await this.loadState();
+
+    if (!this.s.status) {
+      throw Object.assign(new Error('Cannot apply pin: instance has no status'), { status: 404 });
+    }
+    if (this.s.status === 'destroying') {
+      throw Object.assign(new Error('Cannot apply pin: instance is being destroyed'), {
+        status: 409,
+      });
+    }
+    if (!this.s.userId) {
+      throw Object.assign(new Error('Cannot apply pin: instance has no userId'), { status: 404 });
+    }
+    if (!this.s.sandboxId) {
+      throw Object.assign(new Error('Cannot apply pin: instance has no sandboxId'), {
+        status: 404,
+      });
+    }
+
+    const rolloutSubject = imageRolloutSubjectFromSandboxId(this.s.sandboxId, this.s.userId);
+    await this.resolveImageStateForPin(imageTag, this.s.userId, rolloutSubject, {
+      isNew: false,
+      // When clearing a pin (imageTag === null), force a fresh rollout
+      // decision instead of preserving the currently-tracked tag. Without
+      // this, an instance that was pinned to the current candidate would
+      // stay on that candidate even when the user isn't in the rollout
+      // cohort — effectively leaving the pin in place.
+      ignoreCurrentImageTag: imageTag === null,
+    });
+
+    await this.persist({
+      openclawVersion: this.s.openclawVersion,
+      imageVariant: this.s.imageVariant,
+      trackedImageTag: this.s.trackedImageTag,
+      trackedImageDigest: this.s.trackedImageDigest,
+    });
+
+    doLog(this.s, 'applyPinnedVersion: DO state updated', {
+      requestedImageTag: imageTag,
+      resolvedImageTag: this.s.trackedImageTag,
+      openclawVersion: this.s.openclawVersion,
+    });
+
+    return {
+      openclawVersion: this.s.openclawVersion,
+      imageTag: this.s.trackedImageTag,
+      imageDigest: this.s.trackedImageDigest,
+      variant: this.s.imageVariant,
+    };
+  }
+
+  async start(
+    userId?: string,
+    options?: { skipCooldown?: boolean; reason?: KiloclawStartReason }
+  ): Promise<{
+    started: boolean;
+    previousStatus: string | null;
+    currentStatus: string | null;
+    startedAt: number | null;
+  }> {
+    // Guard against concurrent start() calls — two overlapping invocations
+    // (e.g. startAsync via waitUntil + a direct RPC start) can both see
+    // flyMachineId as null and each create a Fly machine, orphaning one.
+    if (this.startInProgress) {
+      doWarn(this.s, 'start: already in progress, skipping duplicate call');
+      return {
+        started: false,
+        previousStatus: this.s.status,
+        currentStatus: this.s.status,
+        startedAt: this.s.lastStartedAt,
+      };
+    }
+    this.startInProgress = true;
+
+    try {
+      return await this._startInner(userId, options);
+    } finally {
+      this.startInProgress = false;
+    }
+  }
+
+  private async _startInner(
+    userId?: string,
+    options?: { skipCooldown?: boolean; reason?: KiloclawStartReason }
+  ): Promise<{
+    started: boolean;
+    previousStatus: string | null;
+    currentStatus: string | null;
+    startedAt: number | null;
+  }> {
+    await this.loadState();
+    const previousStatus = this.s.status;
+    const startReason = options?.reason ?? this.s.pendingStartReason;
+
+    if (this.s.status === 'destroying') {
+      throw new Error('Cannot start: instance is being destroyed');
+    }
+    if (this.s.status === 'recovering') {
+      throw new Error('Cannot start: instance is recovering from an unexpected stop');
+    }
+    if (this.s.status === 'restoring') {
+      throw new Error('Cannot start: instance is restoring from snapshot');
+    }
+    // NOTE: status may be 'starting' here when called from startAsync() via
+    // waitUntil. That is intentional — 'starting' is the expected in-flight
+    // state and must not be treated as an error or early-return condition.
+    // Do not add a guard that rejects non-stopped/provisioned statuses without
+    // also explicitly allowing 'starting'.
+
+    if (!this.s.userId || !this.s.sandboxId) {
+      const restoreUserId = userId ?? this.s.userId;
+      if (restoreUserId) {
+        await restoreFromPostgres(this.env, this.ctx, this.s, restoreUserId, {
+          sandboxId: this.s.sandboxId,
+        });
+      }
+    }
+
+    if (!this.s.userId || !this.s.sandboxId) {
+      throw Object.assign(new Error('Instance not provisioned'), { status: 404 });
+    }
+
+    const isFlyProvider = this.s.provider === 'fly';
+    if (isFlyProvider) {
+      const flyConfig = getFlyConfig(this.env, this.s);
+
+      // If the DO has identity but lost its machine ID, try to recover it
+      // from Fly metadata before creating a duplicate machine.
+      // Skip recovery when the machine was intentionally destroyed for a volume swap
+      // (snapshot restore or reassociation). Both paths set previousVolumeId and clear
+      // flyMachineId in the same persist call, leaving status === 'stopped'. This triple
+      // condition is only true immediately after an intentional destroy — once start()
+      // creates a new machine, flyMachineId is no longer null and this won't match.
+      const machineIntentionallyDestroyed =
+        !this.s.flyMachineId && this.s.previousVolumeId !== null && this.s.status === 'stopped';
+      if (!this.s.flyMachineId && !machineIntentionallyDestroyed) {
+        const recovered = await attemptMetadataRecovery(
+          flyConfig,
+          this.ctx,
+          this.s,
+          createReconcileContext(this.s, this.env, 'start_recovery'),
+          options?.skipCooldown
+        );
+        if (!recovered && !this.s.flyMachineId) {
+          throw new Error(
+            'Metadata recovery failed; aborting start to avoid creating a duplicate machine'
+          );
+        }
+      }
+
+      await this.persistProviderResult(
+        await this.provider().ensureStorage({
+          env: this.env,
+          state: this.s,
+          reason: 'start',
+        })
+      );
+
+      // Verify volume region matches cached flyRegion
+      let flyState = getFlyProviderState(this.s);
+      if (flyState.volumeId) {
+        try {
+          const volume = await fly.getVolume(flyConfig, flyState.volumeId);
+          if (!volume.region) {
+            doWarn(this.s, 'Volume region missing during drift check; keeping cached flyRegion', {
+              volumeId: flyState.volumeId,
+              cachedRegion: flyState.region,
+            });
+          } else if (volume.region !== flyState.region) {
+            doWarn(this.s, 'flyRegion drift detected', {
+              cachedRegion: flyState.region,
+              actualRegion: volume.region,
+            });
+            flyState = {
+              ...flyState,
+              region: volume.region,
+            };
+            await this.persistProviderResult({ providerState: flyState });
+          }
+        } catch (err) {
+          if (!fly.isFlyNotFound(err)) throw err;
+
+          doWarn(this.s, 'Volume not found during region check, clearing');
+          await this.persistProviderResult({
+            providerState: {
+              ...flyState,
+              volumeId: null,
+              region: null,
+            },
+          });
+          await this.persistProviderResult(
+            await this.provider().ensureStorage({
+              env: this.env,
+              state: this.s,
+              reason: 'start',
+            })
+          );
+        }
+      }
+
+      // If running, verify machine is actually alive
+      if (this.s.status === 'running' && this.s.flyMachineId) {
+        try {
+          const machine = await fly.getMachine(flyConfig, this.s.flyMachineId);
+          if (machine.state === 'started') {
+            await reconcileMachineMount(
+              flyConfig,
+              this.ctx,
+              this.s,
+              machine,
+              createReconcileContext(this.s, this.env, 'start')
+            );
+            console.log('[DO] Machine already running, mount verified');
+            await this.clearPendingStartReason();
+            await this.scheduleAlarm();
+            return {
+              started: false,
+              previousStatus,
+              currentStatus: this.s.status,
+              startedAt: this.s.lastStartedAt,
+            };
+          }
+          console.log(
+            '[DO] Status is running but machine state is:',
+            machine.state,
+            '-- restarting'
+          );
+        } catch (err) {
+          console.log('[DO] Failed to get machine state, will recreate:', err);
+        }
+      }
+    } else {
+      await this.persistProviderResult(
+        await this.provider().ensureStorage({
+          env: this.env,
+          state: this.s,
+          reason: 'start',
+        })
+      );
+    }
+
+    const { envVars, bootstrapEnv, minSecretsVersion } = await buildUserEnvVars(
+      this.env,
+      this.ctx,
+      this.s
+    );
+    const imageTag = resolveImageTag(this.s, this.env);
+    console.log(
+      '[DO] startGateway: deploying with imageTag:',
+      imageTag,
+      'trackedImageTag:',
+      this.s.trackedImageTag,
+      'openclawVersion:',
+      this.s.openclawVersion
+    );
+    const identity = {
+      userId: this.s.userId,
+      sandboxId: this.s.sandboxId,
+      orgId: this.s.orgId,
+      openclawVersion: this.s.openclawVersion,
+      imageVariant: this.s.imageVariant,
+      devCreator: this.env.WORKER_ENV === 'development' ? (this.env.DEV_CREATOR ?? null) : null,
+    };
+    const runtimeSpec = buildRuntimeSpec(
+      resolveRuntimeImageRef(this.s, this.env),
+      envVars,
+      bootstrapEnv,
+      effectiveMachineSize(this.s),
+      identity,
+      this.s.provider
+    );
+
+    const startRuntime = () =>
+      this.provider().startRuntime({
+        env: this.env,
+        state: this.s,
+        runtimeSpec,
+        minSecretsVersion,
+        preferredRegion: this.env.FLY_REGION,
+        onProviderResult: result => this.persistProviderResult(result),
+        onCapacityRecovery: async err => {
+          const code = err instanceof fly.FlyApiError ? err.status : 0;
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          this.emitStartCapacityRecovery(errorMessage, this.capacityRecoveryLabel(err));
+          doError(this.s, 'Insufficient resources, replacing stranded volume', {
+            statusCode: code,
+            region: this.s.flyRegion ?? 'unknown',
+          });
+
+          if (code === 403 && this.s.flyRegion) {
+            await regionHelpers.evictCapacityRegionFromKV(
+              this.env.KV_CLAW_CACHE,
+              this.env,
+              this.s.flyRegion
+            );
+          }
+        },
+      });
+
+    let startResult: ProviderResult;
+    try {
+      startResult = await startRuntime();
+    } catch (err) {
+      if (!isFlyProvider || this.s.flyMachineId || !fly.isFlyMissingVolume(err)) {
+        throw err;
+      }
+
+      const flyState = getFlyProviderState(this.s);
+      doWarn(this.s, 'Volume not found during machine creation, clearing', {
+        volumeId: flyState.volumeId,
+      });
+      await this.persistProviderResult({
+        providerState: {
+          ...flyState,
+          volumeId: null,
+          region: null,
+        },
+      });
+      await this.persistProviderResult(
+        await this.provider().ensureStorage({
+          env: this.env,
+          state: this.s,
+          reason: 'start_missing_volume_recovery',
+        })
+      );
+      startResult = await startRuntime();
+    }
+    await this.persistProviderResult(startResult);
+
+    if (getRuntimeId(this.s)) {
+      const healthy = await gateway.waitForHealthy(this.s, this.env);
+      if (!healthy) {
+        console.warn('[DO] start: gateway health probe timed out, proceeding with running status');
+      }
+    }
+
+    // Re-check status directly from storage: if the instance was destroyed while
+    // start() was running in the background (via startAsync/waitUntil), bail out
+    // so teardown wins. We bypass loadState() because it no-ops when already loaded.
+    const currentStatus = await this.ctx.storage.get('status');
+    if (!currentStatus || currentStatus === 'destroying') {
+      doWarn(this.s, 'start: instance was destroyed while starting, aborting');
+      if (currentStatus === 'destroying') {
+        await this.clearPendingStartReason();
+      } else {
+        this.s.pendingStartReason = null;
+      }
+      return {
+        started: false,
+        previousStatus,
+        currentStatus: typeof currentStatus === 'string' ? currentStatus : this.s.status,
+        startedAt: this.s.lastStartedAt,
+      };
+    }
+
+    const startingAt = this.s.startingAt;
+    this.s.status = 'running';
+    this.s.startingAt = null;
+    this.s.pendingStartReason = null;
+    this.s.lastStartedAt = Date.now();
+    this.s.healthCheckFailCount = 0;
+    this.s.lastStartErrorMessage = null;
+    this.s.lastStartErrorAt = null;
+    this.s.controllerCapabilitiesVersion = WORKER_CONTROLLER_CAPABILITIES_VERSION;
+    await this.persist({
+      status: 'running',
+      startingAt: null,
+      pendingStartReason: null,
+      lastStartedAt: this.s.lastStartedAt,
+      healthCheckFailCount: 0,
+      flyMachineId: this.s.flyMachineId,
+      lastStartErrorMessage: null,
+      lastStartErrorAt: null,
+      controllerCapabilitiesVersion: WORKER_CONTROLLER_CAPABILITIES_VERSION,
+    });
+
+    await this.syncGoogleWorkspaceConfig('instance_started');
+    await this.flushPendingConfigToGateway('instance_started');
+
+    this.emitEvent({
+      event: 'instance.started',
+      status: 'running',
+      label: startReason ?? undefined,
+      durationMs: startingAt ? Date.now() - startingAt : undefined,
+    });
+
+    await this.scheduleAlarm();
+    return {
+      started: true,
+      previousStatus,
+      currentStatus: this.s.status,
+      startedAt: this.s.lastStartedAt,
+    };
+  }
+
+  /**
+   * Non-blocking start: immediately persists status='starting', schedules a fast
+   * alarm, then fires start() in the background via waitUntil.
+   * Used by provision() so the RPC call returns quickly instead of waiting for
+   * the full runtime startup sequence.
+   */
+  async startAsync(userId?: string, options?: { reason?: KiloclawStartReason }): Promise<void> {
+    await this.loadState();
+
+    if (this.s.status === 'destroying') {
+      throw new Error('Cannot start: instance is being destroyed');
+    }
+    if (this.s.status === 'recovering') {
+      throw new Error('Cannot start: instance is recovering from an unexpected stop');
+    }
+    if (this.s.status === 'restarting') {
+      throw new Error('Cannot start: instance is restarting');
+    }
+
+    // Duplicate-provision guard: if another recent startAsync call is still
+    // in flight we must not schedule a second background start(). The
+    // startInProgress flag in start() only protects against *concurrent*
+    // re-entry — two startAsyncs that fire their waitUntils back-to-back
+    // can still run start() sequentially after the first finishes,
+    // producing a redundant provider.startRuntime (e.g. a second Northflank
+    // deployment PATCH). reconcileStarting takes over when startingAt goes
+    // stale past STARTING_TIMEOUT_MS, so a stale starting state falls
+    // through to a fresh attempt.
+    if (this.s.status === 'starting' && this.s.startingAt !== null) {
+      const startAge = Date.now() - this.s.startingAt;
+      if (startAge < STARTING_TIMEOUT_MS) {
+        doWarn(this.s, 'startAsync: already starting within fresh window, skipping duplicate', {
+          startingAt: this.s.startingAt,
+          ageMs: startAge,
+        });
+        return;
+      }
+    }
+
+    // Mark as starting so the UI can show a polling state immediately.
+    // Record startingAt so reconcileStarting() can time out after STARTING_TIMEOUT_MS.
+    this.s.status = 'starting';
+    this.s.startingAt = Date.now();
+    this.s.pendingStartReason = options?.reason ?? null;
+    // Re-arm the failure push flag so this start attempt can trigger its own
+    // notification even if a previous attempt already sent one.
+    this.s.startFailurePushSentForAttempt = false;
+    await this.persist({
+      status: 'starting',
+      startingAt: this.s.startingAt,
+      pendingStartReason: this.s.pendingStartReason,
+      startFailurePushSentForAttempt: false,
+    });
+    await this.scheduleAlarm();
+
+    // Run the actual start in the background; the reconcile alarm will
+    // pick up the result and transition to 'running' (or fall back on error).
+    this.ctx.waitUntil(
+      this.start(userId, { reason: options?.reason }).catch(async err => {
+        doError(this.s, 'startAsync: background start failed', {
+          error: toLoggable(err),
+        });
+        // Read from storage rather than this.s — waitUntil runs after the
+        // originating request context completes and other handlers may have
+        // mutated in-memory state in the interim.
+        const storedEntries = await this.ctx.storage.get([
+          'providerState',
+          'flyMachineId',
+          'status',
+        ]);
+        const rawProviderState = storedEntries.get('providerState');
+        const parsedProviderState = ProviderStateSchema.safeParse(rawProviderState);
+        const storedProviderState: ProviderState | null = parsedProviderState.success
+          ? parsedProviderState.data
+          : null;
+        const storedFlyMachineId = storedEntries.get('flyMachineId');
+        const storedFlyMachineIdValue =
+          typeof storedFlyMachineId === 'string' ? storedFlyMachineId : null;
+        const currentStatus = storedEntries.get('status');
+        const storedRuntimeId = getRuntimeId({
+          providerState: storedProviderState,
+          flyMachineId: storedFlyMachineIdValue,
+        });
+        const storedProviderId =
+          storedProviderState?.provider ?? (storedFlyMachineIdValue ? 'fly' : null);
+        let providerStillOwnsRunningRuntime = false;
+        if (currentStatus !== 'destroying' && storedProviderId === 'fly') {
+          providerStillOwnsRunningRuntime = Boolean(storedRuntimeId || storedFlyMachineIdValue);
+        } else if (storedProviderState && currentStatus !== 'destroying') {
+          try {
+            const inspected = await getProviderAdapter(this.env, {
+              provider: storedProviderState.provider,
+            }).inspectRuntime({
+              env: this.env,
+              state: {
+                ...this.s,
+                provider: storedProviderState.provider,
+                providerState: storedProviderState,
+                flyMachineId: storedFlyMachineIdValue,
+              },
+            });
+            providerStillOwnsRunningRuntime =
+              inspected.observation?.runtimeState === 'running' ||
+              inspected.observation?.runtimeState === 'starting';
+          } catch (inspectErr) {
+            doWarn(this.s, 'startAsync: failed to inspect runtime after start failure', {
+              error: toLoggable(inspectErr),
+            });
+          }
+        }
+
+        if (!providerStillOwnsRunningRuntime && currentStatus !== 'destroying') {
+          // start() threw before persisting a machine ID. Reconcile cannot
+          // distinguish this from "still in progress", so write the terminal
+          // state explicitly to avoid the 5-min stuck window.
+          // Skip if destroy() has taken ownership — writing 'stopped' would
+          // clobber the 'destroying' state and strand cleanup.
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          await this.markStartFailedFromProvider(errorMessage);
+          this.emitProvisioningFailed('no_machine_created', errorMessage);
+        }
+        // If storedMachineId exists the machine was created — reconcileStarting
+        // will pick up its Fly state via getMachine + syncStatusWithFly. Writing
+        // 'stopped' here would race with a machine that is still booting.
+      })
+    );
+  }
+
+  async stop(options?: { reason?: KiloclawStopReason }): Promise<{
+    stopped: boolean;
+    previousStatus: string | null;
+    currentStatus: string | null;
+    stoppedAt: number | null;
+  }> {
+    await this.loadState();
+
+    if (!this.s.userId || !this.s.sandboxId) {
+      throw Object.assign(new Error('Instance not provisioned'), { status: 404 });
+    }
+    const previousStatus = this.s.status;
+    if (
+      this.s.status === 'stopped' ||
+      this.s.status === 'provisioned' ||
+      this.s.status === 'starting' ||
+      this.s.status === 'restarting' ||
+      this.s.status === 'recovering' ||
+      this.s.status === 'destroying' ||
+      this.s.status === 'restoring'
+    ) {
+      console.log('[DO] Instance not running (status:', this.s.status, '), no-op');
+      return {
+        stopped: false,
+        previousStatus,
+        currentStatus: this.s.status,
+        stoppedAt: this.s.lastStoppedAt,
+      };
+    }
+
+    const machineUptimeMs = this.s.lastStartedAt ? Date.now() - this.s.lastStartedAt : 0;
+
+    if (getRuntimeId(this.s)) {
+      try {
+        await this.persistProviderResult(
+          await this.provider().stopRuntime({
+            env: this.env,
+            state: this.s,
+          })
+        );
+      } catch (err) {
+        // Non-Fly adapters own provider-specific "already gone" handling; this
+        // guard is for Fly APIs that can surface a machine 404 during stop.
+        if (!fly.isFlyNotFound(err)) {
+          throw err;
+        }
+        console.log('[DO] Machine already gone (404), marking stopped');
+      }
+    }
+
+    this.s.status = 'stopped';
+    this.s.lastStoppedAt = Date.now();
+    await this.persist({
+      status: 'stopped',
+      lastStoppedAt: this.s.lastStoppedAt,
+    });
+
+    this.emitEvent({
+      event: 'instance.stopped',
+      status: 'stopped',
+      label: options?.reason,
+      value: machineUptimeMs,
+    });
+
+    await this.scheduleAlarm();
+
+    return {
+      stopped: true,
+      previousStatus,
+      currentStatus: this.s.status,
+      stoppedAt: this.s.lastStoppedAt,
+    };
+  }
+
+  private registryCleanupRetention(
+    userId: string,
+    orgId: string | null,
+    sandboxId: string,
+    releaseProvisionReservation: boolean
+  ): FinalizeDestroyRetention {
+    const pendingCleanup = {
+      userId,
+      orgId,
+      sandboxId,
+      releaseProvisionReservation,
+    } satisfies PendingRegistryCleanup;
+    return {
+      entries: { [PENDING_REGISTRY_CLEANUP_KEY]: pendingCleanup },
+      retryAlarmAt: Date.now() + REGISTRY_CLEANUP_RETRY_MS,
+    };
+  }
+
+  private async cleanupRegistryAfterFinalizedDestroy(
+    userId: string,
+    orgId: string | null,
+    sandboxId: string,
+    releaseProvisionReservation: boolean
+  ): Promise<void> {
+    try {
+      const registryInstanceId = isInstanceKeyedSandboxId(sandboxId)
+        ? instanceIdFromSandboxId(sandboxId)
+        : null;
+      let releaseAllowed = releaseProvisionReservation;
+      if (!releaseAllowed && registryInstanceId) {
+        const connectionString = this.env.HYPERDRIVE?.connectionString;
+        if (!connectionString) throw new Error('HYPERDRIVE is not configured');
+        const db = getWorkerDb(connectionString);
+        const active = await getInstanceById(db, registryInstanceId);
+        if (!active) {
+          const destroyed = await getInstanceByIdIncludingDestroyed(db, registryInstanceId, {
+            includeDestroyed: true,
+          });
+          releaseAllowed = destroyed !== null;
+        }
+      }
+      const registryKeys = registryInstanceId
+        ? orgId
+          ? [`org:${orgId}`]
+          : [`user:${userId}`]
+        : orgId
+          ? [`user:${userId}`, `org:${orgId}`]
+          : [`user:${userId}`];
+
+      for (const registryKey of registryKeys) {
+        const registryStub = this.env.KILOCLAW_REGISTRY.get(
+          this.env.KILOCLAW_REGISTRY.idFromName(registryKey)
+        );
+        if (registryInstanceId) {
+          if (releaseAllowed) {
+            await registryStub.finalizeDestroyedInstance(
+              registryKey,
+              userId,
+              registryInstanceId,
+              registryInstanceId,
+              'instance_destroyed'
+            );
+          } else {
+            await registryStub.destroyInstance(registryKey, registryInstanceId);
+          }
+          console.log('[DO] Registry entry destroyed on finalization:', {
+            registryKey,
+            instanceId: registryInstanceId,
+          });
+        } else {
+          const legacyDoKeys = legacyDoKeysForIdentity(userId, sandboxId);
+          const entries = await registryStub.listInstances(registryKey);
+          const legacyEntry = entries.find(e => legacyDoKeys.includes(e.doKey));
+          if (legacyEntry) {
+            await registryStub.destroyInstance(registryKey, legacyEntry.instanceId);
+            console.log('[DO] Registry entry destroyed on finalization (legacy):', {
+              registryKey,
+              instanceId: legacyEntry.instanceId,
+              doKeysTried: legacyDoKeys,
+              matchedDoKey: legacyEntry.doKey,
+            });
+          } else {
+            console.log(
+              '[DO] Registry cleanup: no active entry found (already cleaned or never existed):',
+              {
+                registryKey,
+                doKeysTried: legacyDoKeys,
+                activeEntryCount: entries.length,
+              }
+            );
+          }
+        }
+      }
+      if (!releaseAllowed) {
+        await this.ctx.storage.setAlarm(Date.now() + REGISTRY_CLEANUP_RETRY_MS);
+        return;
+      }
+      await this.ctx.storage.delete(PENDING_REGISTRY_CLEANUP_KEY);
+      await this.ctx.storage.deleteAlarm();
+    } catch (registryErr) {
+      console.error('[DO] Registry cleanup on finalization failed; will retry:', registryErr);
+      await this.ctx.storage.setAlarm(Date.now() + REGISTRY_CLEANUP_RETRY_MS);
+    }
+  }
+
+  async allowProvisionReservationReleaseOnFinalize(): Promise<void> {
+    await this.ctx.storage.delete(SKIP_PROVISION_RESERVATION_RELEASE_KEY);
+    const pendingCleanup = await this.ctx.storage.get<PendingRegistryCleanup>(
+      PENDING_REGISTRY_CLEANUP_KEY
+    );
+    if (pendingCleanup) {
+      const permittedCleanup = {
+        ...pendingCleanup,
+        releaseProvisionReservation: true,
+      } satisfies PendingRegistryCleanup;
+      await this.ctx.storage.put({ [PENDING_REGISTRY_CLEANUP_KEY]: permittedCleanup });
+      await this.cleanupRegistryAfterFinalizedDestroy(
+        permittedCleanup.userId,
+        permittedCleanup.orgId,
+        permittedCleanup.sandboxId,
+        true
+      );
+    }
+  }
+
+  async destroy(options?: { reason?: KiloclawDestroyReason }): Promise<DestroyResult> {
+    await this.loadState();
+
+    if (!this.s.userId || !this.s.sandboxId) {
+      throw Object.assign(new Error('Instance not provisioned'), { status: 404 });
+    }
+    if (this.s.status === 'restoring') {
+      throw new Error('Cannot destroy: instance is restoring from snapshot');
+    }
+    if (this.s.status === 'recovering') {
+      throw new Error('Cannot destroy: instance is recovering from an unexpected stop');
+    }
+
+    const machineUptimeMs = this.s.lastStartedAt ? Date.now() - this.s.lastStartedAt : 0;
+    const releaseProvisionReservation = options?.reason !== 'bootstrap_cleanup_failure';
+    if (releaseProvisionReservation) {
+      await this.ctx.storage.delete(SKIP_PROVISION_RESERVATION_RELEASE_KEY);
+    } else {
+      await this.ctx.storage.put(SKIP_PROVISION_RESERVATION_RELEASE_KEY, true);
+    }
+    const runtimeId = getRuntimeId(this.s);
+    const storageId = getStorageId(this.s);
+    const destroyStartedAt = this.s.destroyStartedAt ?? Date.now();
+
+    this.s.pendingDestroyMachineId = runtimeId;
+    this.s.pendingDestroyVolumeId = storageId;
+    // Counter tracks "consecutive failures on the current pendingDestroyVolumeId".
+    // Reset on every fresh destroy() invocation so a previous failing cycle's
+    // count never bleeds into a new destroy attempt's cap window.
+    this.s.destroyVolumeAttempts = 0;
+    this.s.destroyStartedAt = destroyStartedAt;
+    this.s.lastDestroyPendingEventAt = null;
+    this.s.status = 'destroying';
+
+    await this.persist({
+      status: 'destroying',
+      pendingDestroyMachineId: this.s.pendingDestroyMachineId,
+      pendingDestroyVolumeId: this.s.pendingDestroyVolumeId,
+      destroyVolumeAttempts: 0,
+      destroyStartedAt,
+      lastDestroyPendingEventAt: null,
+    });
+
+    this.emitEvent({
+      event: 'instance.destroy_started',
+      status: 'destroying',
+      label: options?.reason,
+      value: machineUptimeMs,
+    });
+
+    // Best-effort: clean up kilo-chat data (conversations, messages, memberships)
+    // for this sandbox. Failure is non-fatal — orphaned data is unreachable.
+    if (this.env.KILO_CHAT && this.s.sandboxId) {
+      try {
+        const result = await this.env.KILO_CHAT.destroySandboxData(this.s.sandboxId);
+        if (!result.ok) {
+          doWarn(this.s, 'kilo-chat sandbox cleanup partially failed (non-fatal)', {
+            failedConversations: result.failedConversations,
+          });
+        }
+      } catch (err) {
+        doWarn(this.s, 'kilo-chat sandbox cleanup failed (non-fatal)', {
+          error: toLoggable(err),
+        });
+      }
+    }
+
+    const destroyRctx = createReconcileContext(this.s, this.env, 'destroy');
+    if (this.s.provider === 'fly') {
+      const flyConfig = getFlyConfig(this.env, this.s);
+      await tryDeleteMachine(flyConfig, this.ctx, this.s, destroyRctx);
+      await tryDeleteVolume(flyConfig, this.ctx, this.s, destroyRctx);
+    } else {
+      await this.retryNonFlyDestroy();
+    }
+
+    // Capture identity before finalization wipes state
+    const preDestroyUserId = this.s.userId;
+    const preDestroyOrgId = this.s.orgId;
+    const preDestroySandboxId = this.s.sandboxId;
+
+    const finalized = await finalizeDestroyIfComplete(
+      this.ctx,
+      this.s,
+      destroyRctx,
+      (userId, sandboxId) =>
+        markDestroyedInPostgresHelper(this.env, this.ctx, this.s, userId, sandboxId),
+      this.registryCleanupRetention(
+        preDestroyUserId,
+        preDestroyOrgId,
+        preDestroySandboxId,
+        releaseProvisionReservation
+      )
+    );
+
+    if (finalized.finalized && preDestroyUserId && preDestroySandboxId) {
+      await this.cleanupRegistryAfterFinalizedDestroy(
+        preDestroyUserId,
+        preDestroyOrgId,
+        preDestroySandboxId,
+        releaseProvisionReservation
+      );
+    }
+
+    if (!finalized.finalized) {
+      emitDestroyPendingTelemetry(this.s, destroyRctx);
+      await this.scheduleAlarm();
+    }
+
+    return finalized;
+  }
+
+  // ========================================================================
+  // Read methods
+  // ========================================================================
+
+  async getStatus(): Promise<{
+    userId: string | null;
+    sandboxId: string | null;
+    orgId: string | null;
+    provider: ProviderId;
+    runtimeId: string | null;
+    storageId: string | null;
+    region: string | null;
+    status: InstanceStatus | null;
+    provisionedAt: number | null;
+    lastStartedAt: number | null;
+    lastStoppedAt: number | null;
+    envVarCount: number;
+    secretCount: number;
+    channelCount: number;
+    flyAppName: string | null;
+    flyMachineId: string | null;
+    flyVolumeId: string | null;
+    flyRegion: string | null;
+    machineSize: MachineSize | null;
+    instanceType: InstanceType | null;
+    volumeSizeGb: number | null;
+    openclawVersion: string | null;
+    imageVariant: string | null;
+    trackedImageTag: string | null;
+    trackedImageDigest: string | null;
+    googleConnected: boolean;
+    googleOAuthConnected: boolean;
+    googleOAuthStatus: GoogleOAuthConnection['status'];
+    googleOAuthAccountEmail: string | null;
+    googleOAuthCapabilities: string[];
+    googleWorkspaceToolsEnabled: boolean;
+    googleWorkspaceConfigSyncPending: boolean;
+    googleWorkspaceConfigSyncError: string | null;
+    googleWorkspaceConfigReady: boolean;
+    googleWorkspaceConfigSyncedAt: number | null;
+    gmailNotificationsEnabled: boolean;
+    execSecurity: string | null;
+    execAsk: string | null;
+    botName: string | null;
+    botNature: string | null;
+    botVibe: string | null;
+    botEmoji: string | null;
+    userLocation: string | null;
+    userTimezone: string | null;
+    controllerCapabilitiesVersion: number | null;
+  }> {
+    await this.loadState();
+    this.maybeDispatchLiveCheck();
+
+    return {
+      userId: this.s.userId,
+      sandboxId: this.s.sandboxId,
+      orgId: this.s.orgId,
+      provider: this.s.provider,
+      runtimeId: getRuntimeId(this.s),
+      storageId: getStorageId(this.s),
+      region: getProviderRegion(this.s),
+      status: this.s.status,
+      provisionedAt: this.s.provisionedAt,
+      lastStartedAt: this.s.lastStartedAt,
+      lastStoppedAt: this.s.lastStoppedAt,
+      envVarCount: this.s.envVars ? Object.keys(this.s.envVars).length : 0,
+      secretCount: this.s.encryptedSecrets
+        ? Object.keys(this.s.encryptedSecrets).filter(k => !CHANNEL_ENV_VARS.has(k)).length
+        : 0,
+      channelCount: this.s.channels ? Object.values(this.s.channels).filter(Boolean).length : 0,
+      flyAppName: this.s.flyAppName,
+      flyMachineId: this.s.flyMachineId,
+      flyVolumeId: this.s.flyVolumeId,
+      flyRegion: this.s.flyRegion,
+      machineSize: this.s.machineSize,
+      instanceType: resolveInstanceTypeFromState(this.s),
+      volumeSizeGb: this.s.volumeSizeGb,
+      openclawVersion: this.s.openclawVersion,
+      imageVariant: this.s.imageVariant,
+      trackedImageTag: this.s.trackedImageTag,
+      trackedImageDigest: this.s.trackedImageDigest,
+      googleConnected: this.s.googleCredentials !== null,
+      googleOAuthConnected: this.s.googleOAuthConnection?.status === 'active',
+      googleOAuthStatus: this.s.googleOAuthConnection?.status ?? 'disconnected',
+      googleOAuthAccountEmail: this.s.googleOAuthConnection?.accountEmail ?? null,
+      googleOAuthCapabilities: this.s.googleOAuthConnection?.capabilities ?? [],
+      googleWorkspaceToolsEnabled: this.s.googleWorkspaceToolsEnabled,
+      googleWorkspaceConfigSyncPending: this.s.googleWorkspaceConfigSyncPending,
+      googleWorkspaceConfigSyncError: this.s.googleWorkspaceConfigSyncError,
+      googleWorkspaceConfigReady: !this.s.googleWorkspaceConfigSyncPending,
+      googleWorkspaceConfigSyncedAt: this.s.googleWorkspaceConfigSyncedAt,
+      gmailNotificationsEnabled: this.s.gmailNotificationsEnabled,
+      execSecurity: this.s.execSecurity,
+      execAsk: this.s.execAsk,
+      botName: this.s.botName,
+      botNature: this.s.botNature,
+      botVibe: this.s.botVibe,
+      botEmoji: this.s.botEmoji,
+      userLocation: this.s.userLocation ?? null,
+      userTimezone: this.s.userTimezone ?? null,
+      controllerCapabilitiesVersion: this.s.controllerCapabilitiesVersion,
+    };
+  }
+
+  async getDebugState(): Promise<{
+    userId: string | null;
+    sandboxId: string | null;
+    orgId: string | null;
+    provider: ProviderId;
+    runtimeId: string | null;
+    storageId: string | null;
+    region: string | null;
+    status: InstanceStatus | null;
+    provisionedAt: number | null;
+    lastStartedAt: number | null;
+    lastStoppedAt: number | null;
+    envVarCount: number;
+    secretCount: number;
+    channelCount: number;
+    flyAppName: string | null;
+    flyMachineId: string | null;
+    flyVolumeId: string | null;
+    flyRegion: string | null;
+    machineSize: MachineSize | null;
+    instanceType: InstanceType | null;
+    volumeSizeGb: number | null;
+    openclawVersion: string | null;
+    imageVariant: string | null;
+    trackedImageTag: string | null;
+    trackedImageDigest: string | null;
+    adminMachineSizeOverride: MachineSize | null;
+    adminMachineSizeOverrideMetadata: InstanceMutableState['adminMachineSizeOverrideMetadata'];
+    googleConnected: boolean;
+    googleOAuthConnected: boolean;
+    googleOAuthStatus: GoogleOAuthConnection['status'];
+    googleOAuthAccountEmail: string | null;
+    googleOAuthCapabilities: string[];
+    googleWorkspaceToolsEnabled: boolean;
+    googleWorkspaceConfigSyncPending: boolean;
+    googleWorkspaceConfigSyncError: string | null;
+    googleWorkspaceConfigReady: boolean;
+    googleWorkspaceConfigSyncedAt: number | null;
+    gmailNotificationsEnabled: boolean;
+    pendingDestroyMachineId: string | null;
+    pendingDestroyVolumeId: string | null;
+    destroyStartedAt: number | null;
+    lastDestroyPendingEventAt: number | null;
+    pendingPostgresMarkOnFinalize: boolean;
+    lastMetadataRecoveryAt: number | null;
+    lastLiveCheckAt: number | null;
+    alarmScheduledAt: number | null;
+    lastDestroyErrorOp: 'machine' | 'volume' | 'recover' | null;
+    lastDestroyErrorStatus: number | null;
+    lastDestroyErrorMessage: string | null;
+    lastDestroyErrorAt: number | null;
+    lastStartErrorMessage: string | null;
+    lastStartErrorAt: number | null;
+    lastRestartErrorMessage: string | null;
+    lastRestartErrorAt: number | null;
+    recoveryStartedAt: number | null;
+    pendingRecoveryVolumeId: string | null;
+    recoveryPreviousVolumeId: string | null;
+    recoveryPreviousVolumeCleanupAfter: number | null;
+    lastRecoveryErrorMessage: string | null;
+    lastRecoveryErrorAt: number | null;
+    previousVolumeId: string | null;
+    restoreStartedAt: string | null;
+    pendingRestoreVolumeId: string | null;
+    instanceReadyEmailSent: boolean;
+    startFailurePushSentForAttempt: boolean;
+    // --- env key diagnostics ---
+    envKeyAppDOKey: string | null;
+    envKeyAppDOFlyAppName: string | null;
+    envKeyAppDOKeySet: boolean | null;
+  }> {
+    await this.loadState();
+    this.maybeDispatchLiveCheck();
+    const alarmScheduledAt = await this.ctx.storage.getAlarm();
+
+    // Fetch env key diagnostics from the App DO (best-effort, don't fail the whole response).
+    let envKeyDiag: {
+      flyAppName: string | null;
+      envKeySet: boolean;
+    } | null = null;
+    let envKeyAppDOKey: string | null = null;
+    try {
+      if (this.s.userId || this.s.sandboxId) {
+        envKeyAppDOKey = getAppKey({ userId: this.s.userId, sandboxId: this.s.sandboxId });
+        const appStub = this.env.KILOCLAW_APP.get(this.env.KILOCLAW_APP.idFromName(envKeyAppDOKey));
+        envKeyDiag = await appStub.getDiagnostics();
+      }
+    } catch {
+      // Swallow — diagnostics are best-effort.
+    }
+
+    return {
+      userId: this.s.userId,
+      sandboxId: this.s.sandboxId,
+      orgId: this.s.orgId,
+      provider: this.s.provider,
+      runtimeId: getRuntimeId(this.s),
+      storageId: getStorageId(this.s),
+      region: getProviderRegion(this.s),
+      status: this.s.status,
+      provisionedAt: this.s.provisionedAt,
+      lastStartedAt: this.s.lastStartedAt,
+      lastStoppedAt: this.s.lastStoppedAt,
+      envVarCount: this.s.envVars ? Object.keys(this.s.envVars).length : 0,
+      secretCount: this.s.encryptedSecrets
+        ? Object.keys(this.s.encryptedSecrets).filter(k => !CHANNEL_ENV_VARS.has(k)).length
+        : 0,
+      channelCount: this.s.channels ? Object.values(this.s.channels).filter(Boolean).length : 0,
+      flyAppName: this.s.flyAppName,
+      flyMachineId: this.s.flyMachineId,
+      flyVolumeId: this.s.flyVolumeId,
+      flyRegion: this.s.flyRegion,
+      machineSize: this.s.machineSize,
+      instanceType: resolveInstanceTypeFromState(this.s),
+      volumeSizeGb: this.s.volumeSizeGb,
+      adminMachineSizeOverride: this.s.adminMachineSizeOverride,
+      adminMachineSizeOverrideMetadata: this.s.adminMachineSizeOverrideMetadata,
+      openclawVersion: this.s.openclawVersion,
+      imageVariant: this.s.imageVariant,
+      trackedImageTag: this.s.trackedImageTag,
+      trackedImageDigest: this.s.trackedImageDigest,
+      googleConnected: this.s.googleCredentials !== null,
+      googleOAuthConnected: this.s.googleOAuthConnection?.status === 'active',
+      googleOAuthStatus: this.s.googleOAuthConnection?.status ?? 'disconnected',
+      googleOAuthAccountEmail: this.s.googleOAuthConnection?.accountEmail ?? null,
+      googleOAuthCapabilities: this.s.googleOAuthConnection?.capabilities ?? [],
+      googleWorkspaceToolsEnabled: this.s.googleWorkspaceToolsEnabled,
+      googleWorkspaceConfigSyncPending: this.s.googleWorkspaceConfigSyncPending,
+      googleWorkspaceConfigSyncError: this.s.googleWorkspaceConfigSyncError,
+      googleWorkspaceConfigReady: !this.s.googleWorkspaceConfigSyncPending,
+      googleWorkspaceConfigSyncedAt: this.s.googleWorkspaceConfigSyncedAt,
+      gmailNotificationsEnabled: this.s.gmailNotificationsEnabled,
+      pendingDestroyMachineId: this.s.pendingDestroyMachineId,
+      pendingDestroyVolumeId: this.s.pendingDestroyVolumeId,
+      destroyStartedAt: this.s.destroyStartedAt,
+      lastDestroyPendingEventAt: this.s.lastDestroyPendingEventAt,
+      pendingPostgresMarkOnFinalize: this.s.pendingPostgresMarkOnFinalize,
+      lastMetadataRecoveryAt: this.s.lastMetadataRecoveryAt,
+      lastLiveCheckAt: this.s.lastLiveCheckAt,
+      alarmScheduledAt,
+      lastDestroyErrorOp: this.s.lastDestroyErrorOp,
+      lastDestroyErrorStatus: this.s.lastDestroyErrorStatus,
+      lastDestroyErrorMessage: this.s.lastDestroyErrorMessage,
+      lastDestroyErrorAt: this.s.lastDestroyErrorAt,
+      lastStartErrorMessage: this.s.lastStartErrorMessage,
+      lastStartErrorAt: this.s.lastStartErrorAt,
+      lastRestartErrorMessage: this.s.lastRestartErrorMessage,
+      lastRestartErrorAt: this.s.lastRestartErrorAt,
+      recoveryStartedAt: this.s.recoveryStartedAt,
+      pendingRecoveryVolumeId: this.s.pendingRecoveryVolumeId,
+      recoveryPreviousVolumeId: this.s.recoveryPreviousVolumeId,
+      recoveryPreviousVolumeCleanupAfter: this.s.recoveryPreviousVolumeCleanupAfter,
+      lastRecoveryErrorMessage: this.s.lastRecoveryErrorMessage,
+      lastRecoveryErrorAt: this.s.lastRecoveryErrorAt,
+      previousVolumeId: this.s.previousVolumeId,
+      restoreStartedAt: this.s.restoreStartedAt,
+      pendingRestoreVolumeId: this.s.pendingRestoreVolumeId,
+      instanceReadyEmailSent: this.s.instanceReadyEmailSent,
+      startFailurePushSentForAttempt: this.s.startFailurePushSentForAttempt,
+      envKeyAppDOKey,
+      envKeyAppDOFlyAppName: envKeyDiag?.flyAppName ?? null,
+      envKeyAppDOKeySet: envKeyDiag?.envKeySet ?? null,
+    };
+  }
+
+  async getConfig(): Promise<
+    InstanceConfig & {
+      vectorMemoryEnabled: boolean;
+      vectorMemoryModel: string | null;
+      dreamingEnabled: boolean;
+    }
+  > {
+    await this.loadState();
+    return {
+      envVars: this.s.envVars ?? undefined,
+      encryptedSecrets: this.s.encryptedSecrets ?? undefined,
+      kilocodeApiKey: this.s.kilocodeApiKey ?? undefined,
+      kilocodeApiKeyExpiresAt: this.s.kilocodeApiKeyExpiresAt ?? undefined,
+      kilocodeDefaultModel: this.s.kilocodeDefaultModel ?? undefined,
+      userTimezone: this.s.userTimezone ?? undefined,
+      webSearch: this.s.kiloExaSearchMode
+        ? {
+            exaMode: this.s.kiloExaSearchMode,
+          }
+        : undefined,
+      channels: this.s.channels ?? undefined,
+      machineSize: this.s.machineSize ?? undefined,
+      instanceType:
+        this.s.instanceType === 'custom' ? undefined : (this.s.instanceType ?? undefined),
+      customSecretMeta: this.s.customSecretMeta ?? undefined,
+      vectorMemoryEnabled: this.s.vectorMemoryEnabled,
+      vectorMemoryModel: this.s.vectorMemoryModel,
+      dreamingEnabled: this.s.dreamingEnabled,
+    };
+  }
+
+  /**
+   * Atomically check-and-set the instance ready flag. Returns shouldNotify: true
+   * on the first call per provision lifecycle, false on all subsequent calls.
+   * Used by the controller checkin handler to trigger the one-time "instance
+   * ready" email and mobile push.
+   */
+  async tryMarkInstanceReady(): Promise<{ shouldNotify: boolean; userId: string | null }> {
+    await this.loadState();
+    if (this.s.instanceReadyEmailSent) {
+      return { shouldNotify: false, userId: this.s.userId };
+    }
+
+    this.s.instanceReadyEmailSent = true;
+    await this.persist({ instanceReadyEmailSent: true });
+
+    // If the instance was provisioned more than 6 hours ago, don't notify.
+    if (this.s.provisionedAt && this.s.provisionedAt < Date.now() - 1000 * 60 * 60 * 6) {
+      return { shouldNotify: false, userId: this.s.userId };
+    }
+
+    // Mobile push fires fire-and-forget so the checkin response isn't blocked
+    // on the notifications RPC. Email dispatch happens via the controller route.
+    this.ctx.waitUntil(dispatchReadyPush(this.env, this.s));
+
+    return { shouldNotify: true, userId: this.s.userId };
+  }
+
+  async listVolumeSnapshots(): Promise<FlyVolumeSnapshot[]> {
+    await this.loadState();
+    if (!this.s.flyVolumeId) return [];
+    const flyConfig = getFlyConfig(this.env, this.s);
+    return fly.listVolumeSnapshots(flyConfig, this.s.flyVolumeId);
+  }
+
+  async cleanupRecoveryPreviousVolume(): Promise<{ ok: true; deletedVolumeId: string | null }> {
+    await this.loadState();
+    return cleanupRecoveryPreviousVolume(this.recoveryRuntime());
+  }
+
+  // ── Volume reassociation (admin) ───────────────────────────────────
+
+  async listCandidateVolumes(): Promise<{
+    currentVolumeId: string | null;
+    volumes: (FlyVolume & { isCurrent: boolean })[];
+  }> {
+    await this.loadState();
+    const flyConfig = getFlyConfig(this.env, this.s);
+    const allVolumes = await fly.listVolumes(flyConfig);
+    // Filter out destroyed/destroying volumes
+    const usable = allVolumes.filter(v => v.state !== 'destroyed' && v.state !== 'destroying');
+    return {
+      currentVolumeId: this.s.flyVolumeId,
+      volumes: usable.map(v => ({ ...v, isCurrent: v.id === this.s.flyVolumeId })),
+    };
+  }
+
+  async reassociateVolume(
+    newVolumeId: string,
+    reason: string
+  ): Promise<{
+    previousVolumeId: string | null;
+    newVolumeId: string;
+    newRegion: string;
+  }> {
+    await this.loadState();
+
+    if (!this.s.userId) {
+      throw new Error('Instance is not provisioned');
+    }
+
+    if (this.s.status === 'restoring') {
+      throw new Error('Cannot reassociate: instance is restoring from snapshot');
+    }
+    if (this.s.status === 'recovering') {
+      throw new Error('Cannot reassociate: instance is recovering from an unexpected stop');
+    }
+    if (this.s.status !== 'stopped') {
+      throw new Error('Instance must be stopped before reassociating volume');
+    }
+
+    if (this.s.flyVolumeId === newVolumeId) {
+      throw new Error('New volume ID is the same as the current volume');
+    }
+
+    // Validate that the volume exists in this app
+    const flyConfig = getFlyConfig(this.env, this.s);
+    let volume: FlyVolume;
+    try {
+      volume = await fly.getVolume(flyConfig, newVolumeId);
+    } catch {
+      throw new Error(`Volume ${newVolumeId} not found in this Fly app`);
+    }
+
+    if (volume.state === 'destroyed' || volume.state === 'destroying') {
+      throw new Error(`Volume ${newVolumeId} is in state "${volume.state}" and cannot be used`);
+    }
+
+    const previousVolumeId = this.s.flyVolumeId;
+
+    console.log(
+      `[admin-volume-reassociate] userId=${this.s.userId} ` +
+        `previous=${previousVolumeId} new=${newVolumeId} region=${volume.region} ` +
+        `reason="${reason}"`
+    );
+
+    // Destroy the existing machine so Fly releases the old volume's attached_machine_id.
+    // start() will create a fresh machine with the new volume mount.
+    if (this.s.flyMachineId) {
+      try {
+        await fly.destroyMachine(flyConfig, this.s.flyMachineId, true);
+        console.log(`[DO] Machine destroyed for reassociation: ${this.s.flyMachineId}`);
+      } catch (err) {
+        if (!fly.isFlyNotFound(err)) throw err;
+        console.log('[DO] Machine already gone during reassociation destroy');
+      }
+      this.s.flyMachineId = null;
+    }
+
+    // Persist the new volume ID, region, previousVolumeId, and cleared machine ID
+    this.s.flyVolumeId = newVolumeId;
+    this.s.flyRegion = volume.region;
+    this.s.previousVolumeId = previousVolumeId;
+    await this.persist({
+      flyVolumeId: newVolumeId,
+      flyRegion: volume.region,
+      flyMachineId: null,
+      previousVolumeId,
+    });
+
+    return {
+      previousVolumeId,
+      newVolumeId,
+      newRegion: volume.region,
+    };
+  }
+
+  // ── Machine resize (admin) ─────────────────────────────────────────
+
+  async resizeMachine(input: {
+    targetTierKey: InstanceTierKey;
+    actorId: string;
+    actorEmail: string;
+  }): Promise<{
+    previousTier: InstanceType | null;
+    newTier: InstanceTierKey;
+    previousVolumeSizeGb: number | null;
+    newVolumeSizeGb: number;
+    machineSize: MachineSize;
+    clearedOverride: {
+      size: MachineSize;
+      metadata: NonNullable<InstanceMutableState['adminMachineSizeOverrideMetadata']>;
+    } | null;
+  }> {
+    const { targetTierKey, actorId, actorEmail } = input;
+    await this.loadState();
+    this.assertAdminSizeChangeAllowed({
+      cannotPrefix: 'resize',
+      beforePhrase: 'resizing machine tier',
+      notSupportedSubject: 'Instance tier resize',
+      // Fly tier resize calls fly.extendVolume on storage growth, which
+      // requires the machine to be stopped. Northflank uses deployment
+      // rollout semantics and does not require a stopped instance.
+      requireStopped: this.s.provider !== 'northflank',
+      allowNorthflank: true,
+    });
+
+    const targetTier = getTier(targetTierKey);
+    if (targetTier.status !== 'offered') {
+      throw new Error(`Instance tier ${targetTierKey} is not an offerable resize target`);
+    }
+
+    const previousTier = resolveInstanceTypeFromState(this.s);
+    const previousVolumeSizeGb = this.s.volumeSizeGb;
+
+    if (
+      !canUpgradeTo({
+        currentType: previousTier,
+        currentSize: this.s.machineSize,
+        currentVolumeSizeGb: previousVolumeSizeGb,
+        targetTier: targetTier.key,
+      })
+    ) {
+      throw new Error(
+        `Cannot resize from ${previousTier ?? 'custom'} to ${targetTierKey}: downgrades and sidegrades are not allowed`
+      );
+    }
+
+    if (
+      this.s.provider === 'fly' &&
+      targetTier.volumeSizeGb > (previousVolumeSizeGb ?? DEFAULT_VOLUME_SIZE_GB)
+    ) {
+      if (!this.s.flyVolumeId) {
+        throw new Error('Cannot resize: no Fly volume is associated with this instance');
+      }
+      await fly.extendVolume(
+        getFlyConfig(this.env, this.s),
+        this.s.flyVolumeId,
+        targetTier.volumeSizeGb
+      );
+      this.s.volumeSizeGb = targetTier.volumeSizeGb;
+      await this.persist({ volumeSizeGb: targetTier.volumeSizeGb });
+    }
+
+    if (this.s.provider === 'northflank') {
+      const result = await this.provider().resizeRuntime?.({
+        env: this.env,
+        state: this.s,
+        targetTier: targetTier.key,
+      });
+      if (!result) {
+        throw new Error('Provider northflank does not support tier resize');
+      }
+      await this.persistProviderResult(result);
+    }
+
+    // Capture and clear any active admin override before applying the tier
+    // change. The customer is now paying for the new tier; carrying a
+    // pre-existing override would either silently downgrade them (override
+    // smaller than new tier) or upgrade them for free (override larger).
+    const clearedOverrideSize = this.s.adminMachineSizeOverride;
+    const clearedOverrideMetadata = this.s.adminMachineSizeOverrideMetadata;
+    const clearedOverride =
+      clearedOverrideSize !== null && clearedOverrideMetadata !== null
+        ? { size: clearedOverrideSize, metadata: clearedOverrideMetadata }
+        : null;
+
+    this.s.instanceType = targetTier.key;
+    this.s.machineSize = targetTier.machineSize;
+    this.s.volumeSizeGb = targetTier.volumeSizeGb;
+    this.s.adminMachineSizeOverride = null;
+    this.s.adminMachineSizeOverrideMetadata = null;
+    await this.persist({
+      instanceType: targetTier.key,
+      machineSize: targetTier.machineSize,
+      volumeSizeGb: targetTier.volumeSizeGb,
+      adminMachineSizeOverride: null,
+      adminMachineSizeOverrideMetadata: null,
+    });
+
+    if (this.s.userId && this.s.sandboxId) {
+      const userId = this.s.userId;
+      const sandboxId = this.s.sandboxId;
+      this.ctx.waitUntil(syncInstanceTypeToPostgresHelper(this.env, this.s, userId, sandboxId));
+      // Sync override clear to Postgres if EITHER field was populated, not just
+      // when both are. A skewed legacy state (one column populated, one null)
+      // would otherwise leave Postgres stale because we just nulled DO state.
+      // The sync helper is idempotent via `IS DISTINCT FROM`.
+      if (clearedOverrideSize !== null || clearedOverrideMetadata !== null) {
+        this.ctx.waitUntil(
+          syncAdminSizeOverrideToPostgresHelper(this.env, this.s, userId, sandboxId)
+        );
+      }
+    }
+
+    console.log(
+      `[admin-machine-resize] userId=${this.s.userId} actor=${actorEmail} (${actorId}) ` +
+        `previousTier=${previousTier ?? 'unknown'} newTier=${targetTier.key} ` +
+        `previousVolume=${previousVolumeSizeGb ?? 'unknown'} newVolume=${targetTier.volumeSizeGb}` +
+        (clearedOverride
+          ? ` clearedOverride=${clearedOverride.size.cpus}/${clearedOverride.size.memory_mb}MB`
+          : '')
+    );
+
+    return {
+      previousTier,
+      newTier: targetTier.key,
+      previousVolumeSizeGb,
+      newVolumeSizeGb: targetTier.volumeSizeGb,
+      machineSize: targetTier.machineSize,
+      clearedOverride,
+    };
+  }
+
+  /**
+   * Shared guard for admin operations that mutate hardware-related state
+   * (`resizeMachine`, `setAdminMachineSizeOverride`, `clearAdminMachineSizeOverride`).
+   *
+   * Always rejects: not-provisioned, destroying / restoring / recovering /
+   * starting / restarting transitional states, and Northflank instances
+   * (none of these paths are wired up for Northflank's async pod-rollout
+   * model yet).
+   *
+   * Optionally rejects when the instance is running (`requireStopped: true`).
+   * Tier resize requires stopped because it extends the Fly volume in place,
+   * which Fly's API only allows on stopped machines. Override set/clear are
+   * pure DO state writes — the Fly `updateMachine(guest=...)` call doesn't
+   * happen until the machine's next stop/start cycle, where Fly's own state
+   * machine enforces the constraint. So override paths pass
+   * `requireStopped: false` and let the customer or admin decide when to
+   * trigger the cycle that picks up the new override.
+   *
+   * Takes message fragments so each call site reads naturally:
+   * - `cannotPrefix` slots into "Cannot {prefix}: ..."
+   * - `beforePhrase` slots into "Instance must be stopped before {phrase}"
+   *   (only used when `requireStopped: true`)
+   * - `notSupportedSubject` slots into "{subject} is not yet supported on Northflank instances"
+   */
+  private assertAdminSizeChangeAllowed(args: {
+    cannotPrefix: string;
+    beforePhrase?: string;
+    notSupportedSubject: string;
+    requireStopped: boolean;
+    allowNorthflank?: boolean;
+  }): void {
+    if (!this.s.userId) {
+      throw new Error('Instance is not provisioned');
+    }
+    if (this.s.status === 'destroying') {
+      throw new Error(`Cannot ${args.cannotPrefix}: instance is being destroyed`);
+    }
+    if (this.s.status === 'restoring') {
+      throw new Error(`Cannot ${args.cannotPrefix}: instance is restoring from snapshot`);
+    }
+    if (this.s.status === 'recovering') {
+      throw new Error(
+        `Cannot ${args.cannotPrefix}: instance is recovering from an unexpected stop`
+      );
+    }
+    if (this.s.status === 'starting' || this.s.status === 'restarting') {
+      throw new Error(`Cannot ${args.cannotPrefix}: instance is busy (${this.s.status})`);
+    }
+    if (args.requireStopped && this.s.status !== 'stopped' && getRuntimeId(this.s)) {
+      throw Object.assign(
+        new Error(`Instance must be stopped before ${args.beforePhrase ?? args.cannotPrefix}`),
+        { status: 409 }
+      );
+    }
+    if (this.s.provider === 'northflank' && args.allowNorthflank !== true) {
+      throw new Error(`${args.notSupportedSubject} is not yet supported on Northflank instances`);
+    }
+  }
+
+  // ── Admin temporary CPU/RAM override ──────────────────────────────
+
+  /**
+   * Set a temporary admin override for the machine's CPU/RAM. Wins over
+   * the tier-derived `machineSize` for runtime spec construction without
+   * touching `instanceType` or `volumeSizeGb` (so billing stays on the
+   * customer's tier). Fly + docker-local only.
+   *
+   * Can be set on a running instance — the override is a pure DO state
+   * write and takes effect on the next stop/start cycle (manual restart,
+   * customer-initiated stop/start, or any other path that flows through
+   * `startExistingMachine`). The current container keeps running on the
+   * tier hardware until that cycle.
+   *
+   * Override is sticky until cleared explicitly or until a tier resize
+   * auto-clears it. See `~/fd-plans/kiloclaw/admin-machine-size-override.md`.
+   */
+  async setAdminMachineSizeOverride(input: {
+    size: MachineSize;
+    reason: string;
+    actorId: string;
+    actorEmail: string;
+  }): Promise<{
+    previousOverride: MachineSize | null;
+    newOverride: MachineSize;
+  }> {
+    await this.loadState();
+    this.assertAdminSizeChangeAllowed({
+      cannotPrefix: 'set admin size override',
+      notSupportedSubject: 'Admin size override',
+      // Override is a pure DO state write; it takes effect on the next
+      // stop/start cycle when `startExistingMachine` calls
+      // `fly.updateMachine(guest=...)`. Setting on a running machine is
+      // safe — current container keeps running, override applies on next
+      // restart.
+      requireStopped: false,
+    });
+    if (this.s.machineSize === null) {
+      throw new Error(
+        'Cannot set admin size override: machineSize has not been observed yet ' +
+          '(legacy instance — wait for backfill or run a tier resize first)'
+      );
+    }
+
+    const previousOverride = this.s.adminMachineSizeOverride;
+    const metadata = {
+      reason: input.reason,
+      actorId: input.actorId,
+      actorEmail: input.actorEmail,
+      setAt: Date.now(),
+    };
+
+    this.s.adminMachineSizeOverride = input.size;
+    this.s.adminMachineSizeOverrideMetadata = metadata;
+    await this.persist({
+      adminMachineSizeOverride: input.size,
+      adminMachineSizeOverrideMetadata: metadata,
+    });
+
+    if (this.s.userId && this.s.sandboxId) {
+      const userId = this.s.userId;
+      const sandboxId = this.s.sandboxId;
+      this.ctx.waitUntil(
+        syncAdminSizeOverrideToPostgresHelper(this.env, this.s, userId, sandboxId)
+      );
+    }
+
+    console.log(
+      `[admin-size-override] set userId=${this.s.userId} actor=${input.actorEmail} ` +
+        `previous=${
+          previousOverride ? `${previousOverride.cpus}/${previousOverride.memory_mb}MB` : 'none'
+        } ` +
+        `new=${input.size.cpus}/${input.size.memory_mb}MB cpu_kind=${input.size.cpu_kind ?? 'shared'} ` +
+        `reason="${input.reason.replace(/"/g, '\\"')}"`
+    );
+
+    return { previousOverride, newOverride: input.size };
+  }
+
+  async clearAdminMachineSizeOverride(input: {
+    reason: string;
+    actorId: string;
+    actorEmail: string;
+  }): Promise<{ previousOverride: MachineSize | null }> {
+    await this.loadState();
+
+    // Short-circuit BEFORE the guard. Clearing nothing is a true no-op from
+    // the DO's perspective, and admins triaging incidents shouldn't get an
+    // error for it when the instance happens to be in a transitional state
+    // (destroying / starting / recovering / Northflank). The set path still
+    // runs the guard — it mutates hardware-shaping state and needs the
+    // protection.
+    //
+    // Even when the DO has no override, still fire the Postgres sync. The
+    // `admin_size_override` column is a denormalized read cache for the
+    // admin "Has size override" filter and badge; if a prior clear's
+    // best-effort sync failed or the DO was restored without an override
+    // while Postgres still holds a stale payload, the list page would show
+    // a phantom override forever. An admin firing "Clear Size Override"
+    // expects that affordance to repair the cache. The sync is idempotent
+    // via `IS DISTINCT FROM` — when Postgres already matches DO state
+    // (both null), this is a SQL no-op.
+    const previousOverride = this.s.adminMachineSizeOverride;
+    if (previousOverride === null && this.s.adminMachineSizeOverrideMetadata === null) {
+      if (this.s.userId && this.s.sandboxId) {
+        const userId = this.s.userId;
+        const sandboxId = this.s.sandboxId;
+        this.ctx.waitUntil(
+          syncAdminSizeOverrideToPostgresHelper(this.env, this.s, userId, sandboxId)
+        );
+      }
+      console.log(
+        `[admin-size-override] clear (no-op) userId=${this.s.userId} actor=${input.actorEmail} ` +
+          `reason="${input.reason.replace(/"/g, '\\"')}"`
+      );
+      return { previousOverride: null };
+    }
+
+    this.assertAdminSizeChangeAllowed({
+      cannotPrefix: 'clear admin size override',
+      notSupportedSubject: 'Admin size override',
+      // Same as set: clear is a DO state write; revert to tier hardware
+      // happens on next restart when `startExistingMachine` calls Fly.
+      requireStopped: false,
+    });
+
+    this.s.adminMachineSizeOverride = null;
+    this.s.adminMachineSizeOverrideMetadata = null;
+    await this.persist({
+      adminMachineSizeOverride: null,
+      adminMachineSizeOverrideMetadata: null,
+    });
+
+    if (this.s.userId && this.s.sandboxId) {
+      const userId = this.s.userId;
+      const sandboxId = this.s.sandboxId;
+      this.ctx.waitUntil(
+        syncAdminSizeOverrideToPostgresHelper(this.env, this.s, userId, sandboxId)
+      );
+    }
+
+    const previousLabel = previousOverride
+      ? `${previousOverride.cpus}/${previousOverride.memory_mb}MB`
+      : 'metadata-only (skewed state)';
+    console.log(
+      `[admin-size-override] clear userId=${this.s.userId} actor=${input.actorEmail} ` +
+        `previous=${previousLabel} reason="${input.reason.replace(/"/g, '\\"')}"`
+    );
+
+    return { previousOverride };
+  }
+
+  /**
+   * Record a Fly volume extend that's already happened on the Fly side.
+   *
+   * Used by the admin `/extend-volume` route, which performs the Fly API
+   * call directly (not through the DO) and then needs the DO to catch up
+   * its persisted `volumeSizeGb` so the resize-policy check stays honest.
+   *
+   * Sets `instanceType = 'custom'` because an arbitrary extend is by
+   * definition off the catalog ladder — even if the new shape happens to
+   * match a tier's volume size, the catalog match would be coincidental.
+   * A subsequent admin resize to a named tier replaces 'custom' via the
+   * normal path.
+   *
+   * Caller is responsible for ensuring the Fly volume actually got extended
+   * to `newSizeGb` before calling this. The DO does not double-check Fly.
+   */
+  async recordVolumeExtend(newSizeGb: number): Promise<{
+    previousVolumeSizeGb: number | null;
+    newVolumeSizeGb: number;
+    instanceType: InstanceType | null;
+  }> {
+    await this.loadState();
+    if (!this.s.userId) {
+      throw new Error('Instance is not provisioned');
+    }
+    if (!Number.isInteger(newSizeGb) || newSizeGb < 1 || newSizeGb > 500) {
+      throw new Error(`Invalid volume size: ${newSizeGb}`);
+    }
+    const previousVolumeSizeGb = this.s.volumeSizeGb;
+    this.s.volumeSizeGb = newSizeGb;
+    this.s.instanceType = 'custom';
+    await this.persist({ volumeSizeGb: newSizeGb, instanceType: 'custom' });
+    if (this.s.sandboxId) {
+      this.ctx.waitUntil(
+        syncInstanceTypeToPostgresHelper(this.env, this.s, this.s.userId, this.s.sandboxId)
+      );
+    }
+    console.log(
+      `[admin-volume-extend] userId=${this.s.userId} previousSize=${previousVolumeSizeGb ?? 'unknown'} newSize=${newSizeGb}`
+    );
+    return {
+      previousVolumeSizeGb,
+      newVolumeSizeGb: newSizeGb,
+      instanceType: this.s.instanceType,
+    };
+  }
+
+  // ── Snapshot restore (admin) ───────────────────────────────────────
+
+  /**
+   * Enqueue a snapshot restore job. Sets status to 'restoring' immediately
+   * and sends a message to the CF Queue for async orchestration.
+   */
+  async enqueueSnapshotRestore(
+    snapshotId: string
+  ): Promise<{ acknowledged: boolean; previousVolumeId: string }> {
+    await this.loadState();
+
+    if (!this.s.userId || !this.s.flyVolumeId || !this.s.flyRegion || !this.s.sandboxId) {
+      throw new Error('Cannot restore: instance is not provisioned');
+    }
+    if (this.s.status === 'destroying') {
+      throw new Error('Cannot restore: instance is being destroyed');
+    }
+    if (this.s.status === 'recovering') {
+      throw new Error('Cannot restore: instance is recovering from an unexpected stop');
+    }
+    if (this.s.status === 'restoring') {
+      throw new Error('Cannot restore: instance is already restoring');
+    }
+    if (this.s.status === 'starting' || this.s.status === 'restarting') {
+      throw new Error('Cannot restore: instance is busy (' + this.s.status + ')');
+    }
+
+    const previousVolumeId = this.s.flyVolumeId;
+    const previousStatus = this.s.status ?? 'stopped';
+
+    // Transition to restoring immediately — blocks all lifecycle methods.
+    // Set restoreStartedAt now so the alarm's stuck-restore detection has a timestamp
+    // to measure against even if the queue worker never picks up the message.
+    const now = new Date().toISOString();
+    this.s.status = 'restoring';
+    this.s.restoreStartedAt = now;
+    this.s.preRestoreStatus = previousStatus;
+    await this.persist({
+      status: 'restoring',
+      restoreStartedAt: now,
+      preRestoreStatus: previousStatus,
+    });
+    await this.scheduleAlarm();
+
+    // Enqueue the restore job for async processing.
+    // If the send fails, restore the previous status so the instance isn't stuck
+    // in 'restoring' while the machine may still be running.
+    if (!this.env.SNAPSHOT_RESTORE_QUEUE) {
+      this.s.status = previousStatus;
+      this.s.restoreStartedAt = null;
+      this.s.preRestoreStatus = null;
+      await this.persist({
+        status: previousStatus,
+        restoreStartedAt: null,
+        preRestoreStatus: null,
+      });
+      throw new Error('Cannot restore: SNAPSHOT_RESTORE_QUEUE binding not configured');
+    }
+    try {
+      await this.env.SNAPSHOT_RESTORE_QUEUE.send({
+        userId: this.s.userId,
+        snapshotId,
+        previousVolumeId,
+        region: this.s.flyRegion,
+        instanceId:
+          this.s.sandboxId && isInstanceKeyedSandboxId(this.s.sandboxId)
+            ? instanceIdFromSandboxId(this.s.sandboxId)
+            : undefined,
+      });
+    } catch (err) {
+      this.s.status = previousStatus;
+      this.s.restoreStartedAt = null;
+      this.s.preRestoreStatus = null;
+      await this.persist({
+        status: previousStatus,
+        restoreStartedAt: null,
+        preRestoreStatus: null,
+      });
+      throw err;
+    }
+
+    this.emitEvent({
+      event: 'instance.restore_enqueued',
+      status: 'restoring',
+      label: 'admin_snapshot_restore',
+    });
+
+    return { acknowledged: true, previousVolumeId };
+  }
+
+  /**
+   * Called by the queue worker to destroy the machine before starting with a new volume.
+   * Fly requires machine destruction to release the old volume's attached_machine_id.
+   * Clears flyMachineId so start() will create a fresh machine.
+   */
+  async destroyMachineForRestore(): Promise<void> {
+    await this.loadState();
+    if (this.s.status !== 'restoring') {
+      throw new Error('Cannot destroy machine: instance is not in restoring state');
+    }
+    if (this.s.flyMachineId) {
+      const flyConfig = getFlyConfig(this.env, this.s);
+      try {
+        await fly.destroyMachine(flyConfig, this.s.flyMachineId, true);
+        console.log(`[DO] Machine destroyed for restore: ${this.s.flyMachineId}`);
+      } catch (err) {
+        if (!fly.isFlyNotFound(err)) throw err;
+        console.log('[DO] Machine already gone during restore destroy');
+      }
+      this.s.flyMachineId = null;
+      // Machine is gone — update preRestoreStatus so failSnapshotRestore() doesn't
+      // restore to 'running' when the machine no longer exists.
+      this.s.preRestoreStatus = 'stopped';
+      await this.persist({ flyMachineId: null, preRestoreStatus: 'stopped' });
+    }
+  }
+
+  /**
+   * Called by the queue worker after creating a new volume, before swapping.
+   * Persists the volume ID so retries can reuse it instead of creating another.
+   */
+  async setPendingRestoreVolumeId(volumeId: string): Promise<void> {
+    await this.loadState();
+    if (this.s.status !== 'restoring') return;
+    this.s.pendingRestoreVolumeId = volumeId;
+    await this.persist({ pendingRestoreVolumeId: volumeId });
+  }
+
+  /**
+   * Called by the queue worker after the new volume is created and ready.
+   * Swaps the volume reference and stores the previous volume ID for admin revert.
+   */
+  async completeSnapshotRestore(newVolumeId: string, newRegion: string): Promise<void> {
+    await this.loadState();
+    if (this.s.status !== 'restoring') {
+      throw new Error('Cannot complete restore: instance is not in restoring state');
+    }
+
+    const previousVolumeId = this.s.flyVolumeId;
+    const durationMs = this.s.restoreStartedAt
+      ? Date.now() - new Date(this.s.restoreStartedAt).getTime()
+      : undefined;
+    this.s.previousVolumeId = previousVolumeId;
+    this.s.flyVolumeId = newVolumeId;
+    this.s.flyRegion = newRegion;
+    this.s.status = 'stopped';
+    this.s.restoreStartedAt = null;
+    this.s.preRestoreStatus = null;
+    this.s.pendingRestoreVolumeId = null;
+    await this.persist({
+      previousVolumeId,
+      flyVolumeId: newVolumeId,
+      flyRegion: newRegion,
+      status: 'stopped',
+      restoreStartedAt: null,
+      preRestoreStatus: null,
+      pendingRestoreVolumeId: null,
+    });
+
+    this.emitEvent({
+      event: 'instance.restore_completed',
+      status: 'stopped',
+      durationMs,
+    });
+  }
+
+  /**
+   * Called by the queue worker if the restore fails after all retries,
+   * or by the alarm if the restore is stuck for >30 min.
+   * Restores the pre-restore status so the instance reflects its actual state
+   * (e.g., still 'running' if the queue worker never stopped the machine).
+   */
+  async failSnapshotRestore(): Promise<void> {
+    await this.loadState();
+    if (this.s.status !== 'restoring') return;
+
+    const restoredStatus = this.s.preRestoreStatus ?? 'stopped';
+    if (this.s.pendingRestoreVolumeId) {
+      console.warn(
+        `[DO] Orphaned restore volume: ${this.s.pendingRestoreVolumeId} (manual cleanup may be needed)`
+      );
+    }
+    this.s.status = restoredStatus;
+    this.s.restoreStartedAt = null;
+    this.s.preRestoreStatus = null;
+    this.s.pendingRestoreVolumeId = null;
+    await this.persist({
+      status: restoredStatus,
+      restoreStartedAt: null,
+      preRestoreStatus: null,
+      pendingRestoreVolumeId: null,
+    });
+    await this.scheduleAlarm();
+
+    console.log(`[DO] Snapshot restore failed, status restored to ${restoredStatus}`);
+  }
+
+  // ── Gateway controller ─────────────────────────────────────────────
+
+  async getGatewayProcessStatus(): Promise<GatewayProcessStatus> {
+    await this.loadState();
+    return gateway.getGatewayProcessStatus(this.s, this.env);
+  }
+
+  async startGatewayProcess(): Promise<{ ok: boolean }> {
+    await this.loadState();
+    return gateway.startGatewayProcess(this.s, this.env);
+  }
+
+  async stopGatewayProcess(): Promise<{ ok: boolean }> {
+    await this.loadState();
+    return gateway.stopGatewayProcess(this.s, this.env);
+  }
+
+  async restartGatewayProcess(): Promise<{ ok: boolean }> {
+    await this.loadState();
+    return gateway.restartGatewayProcess(this.s, this.env);
+  }
+
+  async restoreConfig(version: string): Promise<{ ok: boolean; signaled: boolean }> {
+    await this.loadState();
+    return gateway.restoreConfig(this.s, this.env, version);
+  }
+
+  async getControllerVersion(): Promise<{
+    version: string;
+    commit: string;
+    openclawVersion?: string | null;
+    openclawCommit?: string | null;
+    apiVersion?: number;
+    capabilities?: string[];
+  } | null> {
+    await this.loadState();
+    return gateway.getControllerVersion(this.s, this.env);
+  }
+
+  async getGatewayReady(): Promise<Record<string, unknown> | null> {
+    await this.loadState();
+    return gateway.getGatewayReady(this.s, this.env);
+  }
+
+  async patchConfigOnMachine(patch: Record<string, unknown>): Promise<void> {
+    await this.loadState();
+    return gateway.patchConfigOnMachine(this.s, this.env, patch);
+  }
+
+  async patchOpenclawConfig(patch: Record<string, unknown>): Promise<{ ok: boolean }> {
+    await this.loadState();
+    return gateway.patchOpenclawConfig(this.s, this.env, patch);
+  }
+
+  /** Returns null if the controller is too old to have the /_kilo/config/read endpoint. */
+  async getOpenclawConfig(): Promise<{ config: Record<string, unknown>; etag?: string } | null> {
+    await this.loadState();
+    return gateway.getOpenclawConfig(this.s, this.env);
+  }
+
+  /** Returns null if the controller is too old to have the /_kilo/config/replace endpoint. */
+  async replaceConfigOnMachine(
+    config: Record<string, unknown>,
+    etag?: string
+  ): Promise<{ ok: boolean } | null> {
+    await this.loadState();
+    return gateway.replaceConfigOnMachine(this.s, this.env, config, etag);
+  }
+
+  async getFileTree() {
+    await this.loadState();
+    return gateway.getFileTree(this.s, this.env);
+  }
+
+  async readFile(filePath: string) {
+    await this.loadState();
+    return gateway.readFile(this.s, this.env, filePath);
+  }
+
+  async writeFile(filePath: string, content: string, etag?: string) {
+    await this.loadState();
+    return gateway.writeFile(this.s, this.env, filePath, content, etag);
+  }
+
+  async writeOpenclawConfigFile(
+    content: string,
+    etag: string | undefined,
+    mode: OpenclawFileWriteValidation
+  ) {
+    await this.loadState();
+    return gateway.writeOpenclawConfigFile(this.s, this.env, content, etag, mode);
+  }
+
+  async importOpenclawWorkspace(files: Array<{ path: string; content: string }>) {
+    await this.loadState();
+    return gateway.importOpenclawWorkspace(this.s, this.env, files);
+  }
+
+  async getMorningBriefingStatus() {
+    await this.loadState();
+    // Plugin remains the source of truth for runtime state (reconcileState,
+    // lastGeneratedAt, observedEnabled). Postgres mirrors desired-state
+    // (enabled / cron / timezone / interest_topics). Read both, surface
+    // interest_topics from Postgres (the plugin response has no such field
+    // in PR-4a), and keep the plugin's own enabled/cron/timezone for the
+    // response — those agree under steady state, and the plugin is what
+    // actually drives the cron.
+    const [pg, pluginStatus] = await Promise.all([
+      readMorningBriefingConfigFromPostgresHelper(this.env, this.s),
+      gateway.getMorningBriefingStatus(this.s, this.env),
+    ]);
+
+    // Plugin not reachable (gateway warming, route missing, etc.) → return
+    // null to preserve the existing controller_route_unavailable behavior
+    // the route handler relies on. We could synthesize a response from
+    // Postgres here, but doing so would mask the warming state from
+    // callers that branch on it.
+    if (!pluginStatus) return null;
+
+    // Lazy backfill: plugin reports a configured briefing for an instance
+    // that has no Postgres row yet (legacy instance pre-dating PR-4a, or
+    // a post-PR instance whose previous best-effort waitUntil mirror
+    // write failed). Schedule the write via `waitUntil` so it doesn't
+    // add latency to the status response. Best-effort: matches the
+    // enable/disable paths.
+    //
+    // Forward `interestTopics` from the plugin response when present.
+    // Without this, an instance with valid topics in config.json but a
+    // missing Postgres row (e.g. transient Hyperdrive failure on the
+    // interests path) would have its topics silently reset to `[]` by
+    // the backfill row's column default. Falling back to "omit" when
+    // older controllers don't include the field keeps existing
+    // interests untouched via the upsert helper's patch semantics.
+    //
+    // `pg.instanceId` was just resolved by the parallel Postgres read;
+    // pass it through so the helper skips the redundant
+    // `getInstanceBySandboxId` lookup.
+    if (
+      pg &&
+      pg.row === null &&
+      typeof pluginStatus.enabled === 'boolean' &&
+      typeof pluginStatus.cron === 'string'
+    ) {
+      this.ctx.waitUntil(
+        syncMorningBriefingConfigToPostgresHelper(
+          this.env,
+          this.s,
+          {
+            enabled: pluginStatus.enabled,
+            cron: pluginStatus.cron,
+            timezone: pluginStatus.timezone,
+            ...(Array.isArray(pluginStatus.interestTopics) && {
+              interestTopics: pluginStatus.interestTopics,
+            }),
+          },
+          pg.instanceId
+        )
+      );
+    }
+
+    // Plugin is the source of truth for interestTopics — the Postgres
+    // row is a denormalized read cache. When the plugin reports topics
+    // and Postgres disagrees (e.g. a previous best-effort `waitUntil`
+    // mirror write failed after the plugin accepted a change), the
+    // plugin response wins on this read AND we schedule a repair so
+    // subsequent admin queries against Postgres see the fresh value.
+    // Without the repair, an existing-but-stale row would survive the
+    // lazy backfill check above (which only fires when `row === null`)
+    // and serve stale topics forever.
+    const pluginTopics = Array.isArray(pluginStatus.interestTopics)
+      ? pluginStatus.interestTopics
+      : null;
+    if (pg && pluginTopics !== null) {
+      const pgTopics = pg.row?.interest_topics ?? null;
+      const pgStale = pgTopics === null || !shallowEqualStringArrays(pgTopics, pluginTopics);
+      if (pgStale) {
+        this.ctx.waitUntil(
+          syncMorningBriefingConfigToPostgresHelper(
+            this.env,
+            this.s,
+            { interestTopics: pluginTopics },
+            pg.instanceId
+          )
+        );
+      }
+    }
+
+    // Merge: plugin wins for `interestTopics` when present (plugin is
+    // authoritative); fall back to Postgres mirror when the plugin
+    // response omits it (older controller image predating the field).
+    const responseInterestTopics = pluginTopics ?? pg?.row?.interest_topics;
+    if (responseInterestTopics !== undefined) {
+      return { ...pluginStatus, interestTopics: responseInterestTopics };
+    }
+    return pluginStatus;
+  }
+
+  async enableMorningBriefing(input: { cron?: string; timezone?: string }) {
+    await this.loadState();
+    const response = await gateway.enableMorningBriefing(this.s, this.env, input);
+    if (response && response.ok !== false) {
+      // Mirror to Postgres after the plugin accepted. Best-effort via
+      // waitUntil — the user-facing success is gated on the plugin write,
+      // not the Postgres mirror. Pass through whichever cron/timezone
+      // the plugin resolved (it echoes them on success); fall back to the
+      // request input.
+      this.ctx.waitUntil(
+        syncMorningBriefingConfigToPostgresHelper(this.env, this.s, {
+          enabled: true,
+          cron: response.cron ?? input.cron,
+          timezone: response.timezone ?? input.timezone,
+        })
+      );
+    }
+    return response;
+  }
+
+  async disableMorningBriefing() {
+    await this.loadState();
+    const response = await gateway.disableMorningBriefing(this.s, this.env);
+    if (response && response.ok !== false) {
+      // Only flip `enabled`; preserve the user's last cron/timezone so a
+      // future re-enable defaults to the same schedule.
+      this.ctx.waitUntil(
+        syncMorningBriefingConfigToPostgresHelper(this.env, this.s, {
+          enabled: false,
+        })
+      );
+    }
+    return response;
+  }
+
+  async runMorningBriefing() {
+    await this.loadState();
+    return gateway.runMorningBriefing(this.s, this.env);
+  }
+
+  /**
+   * Create (or return) the "Today's briefing" conversation and start the
+   * in-chat onboarding briefing. Returns fast — generation runs in the
+   * plugin background. `settingsHref` is the org-aware Settings link the
+   * worker derived for the "Connect more" items.
+   */
+  async startOnboardingBriefing(settingsHref?: string) {
+    await this.loadState();
+    return gateway.startOnboardingBriefing(this.s, this.env, settingsHref);
+  }
+
+  /**
+   * Post-provisioning user-location update from the Settings UI. Mirrors
+   * the shape of `updateBriefingInterests`: a focused mutation that
+   * bypasses the heavy `provision()` lock + envvar rebuild path. The
+   * onboarding flow still routes userLocation through `provision()`
+   * because it's bundled with the rest of the initial config; this method
+   * is for edits after the instance is already running.
+   *
+   * Two gateway calls happen here:
+   *   - writeUserProfile (USER.md write — fast file I/O, must succeed)
+   *   - updateMorningBriefingUserLocation (plugin config.json — best-effort)
+   *
+   * The morning-briefing call is logged-and-swallowed because the env-var
+   * path (KILOCLAW_USER_LOCATION, set at container start from DO state)
+   * already covers the worst case: on next deploy the plugin reads the
+   * new value regardless. Failing the user-facing save on a transient
+   * plugin write-queue stall is worse than silently degrading to "takes
+   * effect on next deploy."
+   *
+   * Rejects when the instance is not running. The plugin reads
+   * `config.json.userLocation` first and a non-empty string there wins
+   * over the env var, so silently persisting a clear/update while
+   * stopped (or during a `starting`/`restarting` window after env vars
+   * were already built for the boot) can result in success toasts that
+   * never affect the next briefing. The Settings UI greys out the
+   * editor when the instance is not running.
+   *
+   * Ordering matters: do not persist the new location to DO state until
+   * the required gateway write has succeeded. If we persisted first and
+   * `writeUserProfile` failed, a retry would short-circuit on the
+   * `previous === input.userLocation` check and report success while
+   * USER.md remained stale.
+   */
+  async updateUserLocation(input: { userLocation: string | null }) {
+    await this.loadState();
+    if (this.s.status !== 'running') {
+      throw new Error('Instance is not running');
+    }
+    const previous = this.s.userLocation ?? null;
+    if (input.userLocation === previous) {
+      return { ok: true, userLocation: previous };
+    }
+
+    await gateway.writeUserProfile(this.s, this.env, {
+      userLocation: input.userLocation,
+    });
+
+    this.s.userLocation = input.userLocation;
+    await this.ctx.storage.put({ userLocation: input.userLocation });
+
+    try {
+      await gateway.updateMorningBriefingUserLocation(this.s, this.env, {
+        userLocation: input.userLocation,
+      });
+    } catch (err) {
+      doWarn(this.s, 'updateMorningBriefingUserLocation failed', {
+        error: toLoggable(err),
+      });
+    }
+
+    return { ok: true, userLocation: input.userLocation };
+  }
+
+  async updateBriefingInterests(input: { topics: string[] }) {
+    await this.loadState();
+    const response = await gateway.updateMorningBriefingInterests(this.s, this.env, input);
+    if (response && response.ok !== false) {
+      // Mirror to Postgres after the plugin accepted. Best-effort via
+      // waitUntil — the user-facing success is gated on the plugin write,
+      // not the Postgres mirror. Patch semantics: only interest_topics is
+      // touched; enabled/cron/timezone are preserved.
+      this.ctx.waitUntil(
+        syncMorningBriefingConfigToPostgresHelper(this.env, this.s, {
+          interestTopics: response.interestTopics ?? input.topics,
+        })
+      );
+    }
+    return response;
+  }
+
+  async readMorningBriefing(day: 'today' | 'yesterday') {
+    await this.loadState();
+    return gateway.readMorningBriefing(this.s, this.env, day);
+  }
+
+  // ── Restart machine (user-facing) ──────────────────────────────────
+
+  async restartMachine(options?: {
+    imageTag?: string;
+  }): Promise<{ success: boolean; error?: string }> {
+    await this.loadState();
+
+    if (!getRuntimeId(this.s)) {
+      return { success: false, error: 'No machine exists' };
+    }
+
+    if (
+      this.s.status === 'provisioned' ||
+      this.s.status === 'destroying' ||
+      this.s.status === 'starting' ||
+      this.s.status === 'restarting' ||
+      this.s.status === 'recovering' ||
+      this.s.status === 'restoring'
+    ) {
+      return { success: false, error: 'Instance is busy' };
+    }
+
+    const action = options?.imageTag
+      ? options.imageTag === 'latest'
+        ? 'upgrade-to-latest'
+        : `pin-to-tag:${options.imageTag}`
+      : 'redeploy-same-image';
+    doLog(this.s, `restartMachine: initiating async restart`, {
+      action,
+      currentStatus: this.s.status,
+      trackedImageTag: this.s.trackedImageTag,
+      flyMachineId: this.s.flyMachineId,
+    });
+
+    try {
+      // Image tag overrides are only meaningful for providers that pull from
+      // a registry. docker-local always runs the locally built image
+      // (resolveRuntimeImageRef hardcodes to env.DOCKER_LOCAL_IMAGE), but we
+      // still allow the trackedImageTag state update so the banner clears and
+      // local-dev exercises the full upgrade UX. The actual local container
+      // is unchanged.
+      if (this.s.provider !== 'fly' && this.s.provider !== 'docker-local' && options?.imageTag) {
+        return {
+          success: false,
+          error: `Provider ${this.s.provider} does not support image tag overrides`,
+        };
+      }
+
+      if (options?.imageTag) {
+        if (options.imageTag === 'latest') {
+          const variant: ImageVariant = 'default';
+          const rolloutSubject = imageRolloutSubjectFromSandboxId(
+            this.s.sandboxId,
+            this.s.userId ?? ''
+          );
+          let autoEnroll = false;
+          if (this.s.userId && this.env.HYPERDRIVE?.connectionString) {
+            try {
+              autoEnroll = await lookupKiloclawEarlyAccess(
+                this.env.HYPERDRIVE.connectionString,
+                this.s.userId
+              );
+            } catch (err) {
+              doWarn(this.s, 'Failed to look up kiloclaw_early_access on upgrade', {
+                error: toLoggable(err),
+              });
+            }
+          }
+          const latest = await selectImageVersionForInstance({
+            kv: this.env.KV_CLAW_CACHE,
+            variant,
+            rolloutSubject,
+            currentImageTag: this.s.trackedImageTag,
+            autoEnroll,
+          });
+          if (latest) {
+            this.s.openclawVersion = latest.openclawVersion;
+            this.s.imageVariant = latest.variant;
+            this.s.trackedImageTag = latest.imageTag;
+            this.s.trackedImageDigest = latest.imageDigest;
+          }
+        } else {
+          this.s.trackedImageTag = options.imageTag;
+          this.s.openclawVersion = null;
+          this.s.imageVariant = null;
+          this.s.trackedImageDigest = null;
+        }
+        await this.persist({
+          openclawVersion: this.s.openclawVersion,
+          imageVariant: this.s.imageVariant,
+          trackedImageTag: this.s.trackedImageTag,
+          trackedImageDigest: this.s.trackedImageDigest,
+        });
+      }
+
+      // Backfill machineSize from live machine for legacy instances. Skipped
+      // when an admin override is active (override-shape isn't tier hardware).
+      if (
+        this.s.provider === 'fly' &&
+        this.s.machineSize === null &&
+        this.s.adminMachineSizeOverride === null &&
+        this.s.flyMachineId
+      ) {
+        const flyConfig = getFlyConfig(this.env, this.s);
+        const machine = await fly.getMachine(flyConfig, this.s.flyMachineId);
+        if (machine.config?.guest) {
+          const parsedSize = parseMachineSizeFromFlyGuest(machine.config.guest);
+          if (parsedSize) {
+            this.s.machineSize = parsedSize;
+            this.s.instanceType = resolveInstanceTypeLabel(this.s.machineSize, this.s.volumeSizeGb);
+            await this.persist({
+              machineSize: this.s.machineSize,
+              instanceType: this.s.instanceType,
+            });
+          } else {
+            doWarn(
+              this.s,
+              'Skipping machineSize backfill: live Fly guest failed schema validation',
+              {
+                source: 'restart-backfill',
+                guest: machine.config.guest,
+              }
+            );
+          }
+        }
+      }
+
+      this.s.status = 'restarting';
+      this.s.restartingAt = Date.now();
+      this.s.restartUpdateSent = false;
+      this.s.lastRestartErrorMessage = null;
+      this.s.lastRestartErrorAt = null;
+      await this.ctx.storage.put(
+        storageUpdate({
+          status: 'restarting',
+          restartingAt: this.s.restartingAt,
+          restartUpdateSent: false,
+          lastRestartErrorMessage: null,
+          lastRestartErrorAt: null,
+        })
+      );
+      await this.scheduleAlarm();
+
+      this.emitEvent({
+        event: 'instance.restarting',
+        status: 'restarting',
+        label: action,
+      });
+
+      this.ctx.waitUntil(this.restartMachineInBackground());
+      return { success: true };
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+      return { success: false, error: errorMessage };
+    }
+  }
+
+  /**
+   * Wake the DO and re-arm its alarm so a freshly-scheduled action will
+   * fire on the next reconcile tick. Called by the web's scheduleAction
+   * tRPC right after it persists the parent + stage + target rows.
+   *
+   * Why this is needed: the wedge in `alarm()` queries Postgres for due
+   * targets, but it can only run when `alarm()` actually fires. In
+   * production Cloudflare, alarms with past timestamps fire immediately
+   * (so this method is belt-and-suspenders). In `wrangler dev`, stale
+   * alarm timestamps don't auto-fire — the DO needs a fresh setAlarm
+   * call to get back on the cadence. Calling scheduleAlarm() here sets
+   * a fresh near-future alarm time and unblocks the wedge.
+   */
+  async notifyScheduledActionPending(): Promise<{ ok: true }> {
+    await this.loadState();
+    if (!this.s.status) return { ok: true };
+    await this.scheduleAlarm();
+    return { ok: true };
+  }
+
+  private async restartMachineInBackground(): Promise<void> {
+    try {
+      await this.loadState();
+
+      // Bail if the instance was destroyed (or otherwise left 'restarting')
+      // while this background task was queued. Reading from storage rather
+      // than this.s mirrors the pattern in startAsync's catch handler —
+      // waitUntil runs after the originating request context completes and
+      // other handlers (e.g. destroy) may have mutated storage in the interim.
+      const currentStatus = await this.ctx.storage.get('status');
+      if (currentStatus !== 'restarting') {
+        console.log(
+          '[DO] restartMachine: aborting background restart, status is now',
+          currentStatus
+        );
+        return;
+      }
+
+      if (!getRuntimeId(this.s)) {
+        throw new Error('No machine exists');
+      }
+
+      const { envVars, bootstrapEnv, minSecretsVersion } = await buildUserEnvVars(
+        this.env,
+        this.ctx,
+        this.s
+      );
+      const imageTag = resolveImageTag(this.s, this.env);
+      doLog(this.s, 'restartMachine: deploying update', {
+        imageTag,
+        flyMachineId: this.s.flyMachineId,
+      });
+      const identity = {
+        userId: this.s.userId ?? '',
+        sandboxId: this.s.sandboxId ?? '',
+        orgId: this.s.orgId,
+        openclawVersion: this.s.openclawVersion,
+        imageVariant: this.s.imageVariant,
+        devCreator: this.env.WORKER_ENV === 'development' ? (this.env.DEV_CREATOR ?? null) : null,
+      };
+      const runtimeSpec = buildRuntimeSpec(
+        resolveRuntimeImageRef(this.s, this.env),
+        envVars,
+        bootstrapEnv,
+        effectiveMachineSize(this.s),
+        identity,
+        this.s.provider
+      );
+
+      const restart = await this.provider().restartRuntime({
+        env: this.env,
+        state: this.s,
+        runtimeSpec,
+        minSecretsVersion,
+        onProviderResult: async result => {
+          const currentStatus = await this.ctx.storage.get('status');
+          if (currentStatus !== 'restarting') return;
+          await this.persistProviderResult(result);
+        },
+      });
+      await this.persistProviderResult(restart);
+      const healthy = await gateway.waitForHealthy(this.s, this.env);
+      if (!healthy) {
+        console.warn(
+          '[DO] restartMachine: gateway health probe timed out, proceeding with running status'
+        );
+      }
+
+      // Final ownership check before persisting success.
+      const preSuccessStatus = await this.ctx.storage.get('status');
+      if (preSuccessStatus !== 'restarting') return;
+
+      await markRestartSuccessful(
+        this.ctx,
+        this.s,
+        createReconcileContext(this.s, this.env, 'restart')
+      );
+      doLog(this.s, 'restartMachine: background restart completed successfully');
+      await this.scheduleAlarm();
+    } catch (err) {
+      // A waitForState 408 after updateMachine was sent is expected — the
+      // machine may take minutes to start. Reconciliation will pick it up.
+      const isExpectedTimeout =
+        this.s.restartUpdateSent && err instanceof fly.FlyApiError && err.status === 408;
+
+      if (isExpectedTimeout) {
+        doWarn(
+          this.s,
+          'restartMachine: waitForState timed out after update, reconciliation will handle',
+          {
+            error: toLoggable(err),
+          }
+        );
+      } else {
+        doError(this.s, 'restartMachine: background restart failed', {
+          error: toLoggable(err),
+        });
+      }
+      // Only persist error if we're still in 'restarting'. If destroy()
+      // ran concurrently, storage may have been wiped — writing here would
+      // recreate partial state on a destroyed instance.
+      const postStatus = await this.ctx.storage.get('status');
+      if (postStatus === 'restarting' && !isExpectedTimeout) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        this.s.lastRestartErrorMessage = errorMessage;
+        this.s.lastRestartErrorAt = Date.now();
+        await this.ctx.storage.put(
+          storageUpdate({
+            lastRestartErrorMessage: errorMessage,
+            lastRestartErrorAt: this.s.lastRestartErrorAt,
+          })
+        );
+      }
+    }
+  }
+
+  private async recoverUnexpectedStopInBackground(): Promise<void> {
+    await runUnexpectedStopRecoveryInBackground(this.recoveryRuntime());
+  }
+
+  // ========================================================================
+  // Alarm (reconciliation loop)
+  // ========================================================================
+
+  override async alarm(): Promise<void> {
+    const pendingRegistryCleanup = await this.ctx.storage.get<PendingRegistryCleanup>(
+      PENDING_REGISTRY_CLEANUP_KEY
+    );
+    if (pendingRegistryCleanup) {
+      await this.cleanupRegistryAfterFinalizedDestroy(
+        pendingRegistryCleanup.userId,
+        pendingRegistryCleanup.orgId,
+        pendingRegistryCleanup.sandboxId,
+        pendingRegistryCleanup.releaseProvisionReservation
+      );
+      return;
+    }
+
+    await this.loadState();
+
+    if (!this.s.userId || !this.s.status) return;
+
+    // Best-effort denormalize trackedImageTag → kiloclaw_instances.tracked_image_tag so
+    // admin tooling can filter populations by current running version via SQL. Fire-and-
+    // forget; Postgres failures must never break alarm reconciliation. Skipped when the
+    // sandbox isn't set yet (pre-provision).
+    if (this.s.sandboxId) {
+      this.ctx.waitUntil(
+        syncTrackedImageTagToPostgresHelper(this.env, this.s, this.s.userId, this.s.sandboxId)
+      );
+    }
+
+    // Best-effort scheduled-action apply pass. Queries Postgres for any
+    // pending targets for this instance whose stage time has passed and
+    // whose parent action is still actionable, dispatches per
+    // action_type, and records outcomes. Wrapped in waitUntil so a slow
+    // apply doesn't block reconcile; wrapped in try/catch inside the
+    // helper so Postgres failures never break this alarm.
+    if (this.s.sandboxId) {
+      this.ctx.waitUntil(
+        runScheduledActionApply({
+          env: this.env,
+          state: this.s,
+          restartCurrentInstance: async (imageTag?: string) => {
+            // Call the public restartMachine entry point (not the
+            // internal *InBackground variant). The entry point sets
+            // status='restarting' and triggers the background restart
+            // via waitUntil. Calling the internal variant directly
+            // bypasses the status flip, which causes its own initial
+            // guard ("status is not 'restarting' → abort") to bail
+            // silently and the actual restart never happens.
+            //
+            // imageTag is optional: omit for `scheduled_restart`
+            // (redeploys current tag); pass for `version_change`
+            // (redeploys on the chosen target tag).
+            const result = await this.restartMachine(imageTag ? { imageTag } : undefined);
+            if (!result.success) {
+              throw new Error(result.error ?? 'restartMachine returned failure');
+            }
+          },
+        }).then(
+          () => undefined,
+          err => {
+            doWarn(this.s, 'scheduled-action-apply pass threw', {
+              error: toLoggable(err),
+            });
+          }
+        )
+      );
+    }
+
+    // Skip reconciliation during restore — the queue worker owns the lifecycle.
+    // Detect stuck restores: if restoreStartedAt is set and older than 30 min,
+    // the queue worker likely failed permanently. Reset to stopped.
+    if (this.s.status === 'restoring') {
+      if (this.s.restoreStartedAt) {
+        const elapsed = Date.now() - new Date(this.s.restoreStartedAt).getTime();
+        if (elapsed > 30 * 60 * 1000) {
+          this.emitEvent({
+            event: 'instance.restore_failed',
+            status: 'restoring',
+            label: 'alarm_timeout',
+            durationMs: elapsed,
+          });
+          await this.failSnapshotRestore();
+          return;
+        }
+      }
+      await this.scheduleAlarm();
+      return;
+    }
+
+    if (this.s.googleWorkspaceConfigSyncPending && this.s.status === 'running') {
+      await this.syncGoogleWorkspaceConfig('alarm_retry');
+    }
+
+    // Flushes patches that landed in DO state while status was not 'running'
+    // (Window B of the onboarding timing analysis). Covers both the rare path
+    // where reconcileStarting — not _startInner — flipped status to 'running'
+    // in a prior alarm tick, and the case where an inline gateway call failed.
+    if (
+      (this.s.botIdentityApplyPending ||
+        this.s.execPresetApplyPending ||
+        this.s.channelsApplyPending) &&
+      this.s.status === 'running'
+    ) {
+      await this.flushPendingConfigToGateway('alarm_retry');
+    }
+
+    if (this.s.status !== 'recovering') {
+      await cleanupPendingRecoveryVolumeIfNeeded(
+        this.recoveryRuntime(),
+        'alarm_pending_recovery_cleanup'
+      );
+    }
+    await cleanupRetainedRecoveryVolumeIfDue(
+      this.recoveryRuntime(),
+      'alarm_retained_recovery_cleanup'
+    );
+
+    const skipProvisionReservationRelease =
+      (await this.ctx.storage.get<boolean>(SKIP_PROVISION_RESERVATION_RELEASE_KEY)) === true;
+    const pendingDestroyIdentity =
+      this.s.status === 'destroying' && this.s.userId && this.s.sandboxId
+        ? {
+            userId: this.s.userId,
+            orgId: this.s.orgId,
+            sandboxId: this.s.sandboxId,
+            releaseProvisionReservation: !skipProvisionReservationRelease,
+          }
+        : null;
+
+    try {
+      if (this.s.provider !== 'fly') {
+        if (this.s.status === 'destroying') {
+          await this.retryNonFlyDestroy();
+          const destroyRctx = createReconcileContext(this.s, this.env, 'alarm_destroy');
+          const result = await finalizeDestroyIfComplete(
+            this.ctx,
+            this.s,
+            destroyRctx,
+            (userId, sandboxId) =>
+              markDestroyedInPostgresHelper(this.env, this.ctx, this.s, userId, sandboxId),
+            pendingDestroyIdentity
+              ? this.registryCleanupRetention(
+                  pendingDestroyIdentity.userId,
+                  pendingDestroyIdentity.orgId,
+                  pendingDestroyIdentity.sandboxId,
+                  pendingDestroyIdentity.releaseProvisionReservation
+                )
+              : undefined
+          );
+          if (result.finalized && pendingDestroyIdentity) {
+            await this.cleanupRegistryAfterFinalizedDestroy(
+              pendingDestroyIdentity.userId,
+              pendingDestroyIdentity.orgId,
+              pendingDestroyIdentity.sandboxId,
+              pendingDestroyIdentity.releaseProvisionReservation
+            );
+          } else if (!result.finalized) {
+            await maybeEmitDestroyStuckTelemetry(this.ctx, this.s, destroyRctx);
+          }
+        } else {
+          await this.reconcileNonFlyRuntimeFromAlarm();
+        }
+        if (this.s.status) {
+          await this.scheduleAlarm();
+        }
+        return;
+      }
+
+      const flyConfig = getFlyConfig(this.env, this.s);
+      const reconcileResult = await reconcileWithFly(
+        flyConfig,
+        this.ctx,
+        this.s,
+        this.env,
+        'alarm',
+        () => this.destroy({ reason: 'stale_provision_cleanup' }).then(() => undefined),
+        (userId, sandboxId) =>
+          markDestroyedInPostgresHelper(this.env, this.ctx, this.s, userId, sandboxId),
+        pendingDestroyIdentity
+          ? this.registryCleanupRetention(
+              pendingDestroyIdentity.userId,
+              pendingDestroyIdentity.orgId,
+              pendingDestroyIdentity.sandboxId,
+              pendingDestroyIdentity.releaseProvisionReservation
+            )
+          : undefined
+      );
+
+      if (pendingDestroyIdentity && this.s.status === null) {
+        await this.cleanupRegistryAfterFinalizedDestroy(
+          pendingDestroyIdentity.userId,
+          pendingDestroyIdentity.orgId,
+          pendingDestroyIdentity.sandboxId,
+          pendingDestroyIdentity.releaseProvisionReservation
+        );
+      }
+
+      if (reconcileResult.beginUnexpectedStopRecovery && this.s.status === 'running') {
+        await beginUnexpectedStopRecovery(
+          this.recoveryRuntime(),
+          reconcileResult.beginUnexpectedStopRecovery
+        );
+        this.ctx.waitUntil(this.recoverUnexpectedStopInBackground());
+        return;
+      }
+
+      if (reconcileResult.completeUnexpectedStopRecovery && this.s.status === 'recovering') {
+        try {
+          await completeUnexpectedStopRecovery(this.recoveryRuntime());
+        } catch (err) {
+          doError(this.s, 'completeUnexpectedStopRecovery failed during alarm reconcile', {
+            error: toLoggable(err),
+          });
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          await failUnexpectedStopRecovery(
+            this.recoveryRuntime(),
+            errorMessage,
+            'alarm_reconcile_complete'
+          );
+        }
+        return;
+      }
+
+      if (reconcileResult.failedUnexpectedStopRecovery && this.s.status === 'recovering') {
+        await failUnexpectedStopRecovery(
+          this.recoveryRuntime(),
+          reconcileResult.failedUnexpectedStopRecovery.errorMessage,
+          reconcileResult.failedUnexpectedStopRecovery.label
+        );
+        await this.scheduleAlarm();
+        return;
+      }
+
+      if (reconcileResult.timedOutUnexpectedStopRecovery && this.s.status === 'recovering') {
+        await failUnexpectedStopRecovery(
+          this.recoveryRuntime(),
+          reconcileResult.timedOutUnexpectedStopRecovery.errorMessage,
+          'alarm_timeout'
+        );
+        await this.scheduleAlarm();
+        return;
+      }
+    } catch (err) {
+      doError(this.s, 'alarm reconcile failed', {
+        error: toLoggable(err),
+      });
+    }
+
+    if (this.s.status) {
+      await this.scheduleAlarm();
+    }
+  }
+}

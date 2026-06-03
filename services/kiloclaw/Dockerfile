@@ -1,0 +1,278 @@
+# Global build args — declared before any FROM so they're available to all stages.
+ARG CONTROLLER_COMMIT=unknown
+ARG CONTROLLER_CACHE_BUST=1
+# Bump APT_CACHE_BUST (any value change) to invalidate the base apt layer and
+# pick up the latest chromium / 1password-cli / etc. from Debian + vendor repos.
+# Last bumped 2026-05-08 to pull chromium 148.x (CVE-2026-7908, CVE-2026-7910).
+ARG APT_CACHE_BUST=2026-05-08
+
+FROM debian:trixie-slim AS runtime
+
+# Install Node.js 24 (required by OpenClaw)
+ENV NODE_VERSION=24.15.0
+ENV OPENCLAW_PLUGIN_STAGE_DIR=/usr/local/share/openclaw-plugin-runtime-deps
+ENV COMPOSIO_INSTALL_DIR=/usr/local/lib/composio
+ENV PATH="${COMPOSIO_INSTALL_DIR}:${PATH}"
+ARG APT_CACHE_BUST
+ARG COMPOSIO_CLI_VERSION=0.2.28
+RUN echo "apt cache bust: ${APT_CACHE_BUST}" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates curl gnupg git xz-utils unzip jq ripgrep rsync zstd \
+       build-essential python3 ffmpeg tmux chromium \
+    && ARCH="$(dpkg --print-architecture)" \
+    && case "${ARCH}" in \
+         amd64) NODE_ARCH="x64" ;; \
+         arm64) NODE_ARCH="arm64" ;; \
+         *) echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz -o /tmp/node.tar.xz \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+    && rm /tmp/node.tar.xz \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=${ARCH} signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
+    && curl -fsSL https://downloads.1password.com/linux/keys/1password.asc \
+       | gpg --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg \
+    && echo "deb [arch=${ARCH} signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/${ARCH} stable main" \
+       > /etc/apt/sources.list.d/1password.list \
+    && mkdir -p /etc/debsig/policies/AC2D62742012EA22/ \
+    && curl -fsSL https://downloads.1password.com/linux/debian/debsig/1password.pol \
+       | tee /etc/debsig/policies/AC2D62742012EA22/1password.pol > /dev/null \
+    && mkdir -p /usr/share/debsig/keyrings/AC2D62742012EA22 \
+    && curl -fsSL https://downloads.1password.com/linux/keys/1password.asc \
+       | gpg --dearmor --output /usr/share/debsig/keyrings/AC2D62742012EA22/debsig.gpg \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh 1password-cli \
+    && apt-get purge -y xz-utils \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version \
+    && npm --version
+
+# Route npm's git-backed deps (GitHub refs, ssh:// transitive deps like
+# baileys → libsignal-node) through https during the build so we don't need
+# an ssh client in the image. The final stage removes /etc/gitconfig so this
+# build-only config does not ship in the runtime image.
+RUN git config --system url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+# Install global CLI tools in a single invocation, then patch openclaw and clean cache once.
+# Packages: pnpm (package manager), openclaw (pinned for reproducible builds; patched below),
+#   clawhub, mcporter, @steipete/summarize, @kilocode/cli (runtime tooling).
+# Patch: bump KiloCode model discovery timeout from 5s to 60s — shared-cpu machines
+# under boot load routinely need 27-35s for the first TLS+fetch to complete.
+# Match the KiloCode chunk explicitly because OpenClaw also ships other provider
+# discovery timeout constants. Remove this patch once the timeout is configurable.
+RUN npm install -g pnpm openclaw@2026.5.26 clawhub mcporter@0.7.3 @steipete/summarize@0.12.0 @kilocode/cli@7.2.31 \
+    && OC_DIST=/usr/local/lib/node_modules/openclaw/dist \
+    && PM_FILES=$(grep -l 'KILOCODE_MODELS_URL' "$OC_DIST"/provider-models-*.js 2>/dev/null || true) \
+    && PM_FILE_COUNT=$(printf '%s\n' "$PM_FILES" | grep -c .) \
+    && if [ "$PM_FILE_COUNT" -ne 1 ]; then echo "ERROR: expected exactly 1 KiloCode provider-models chunk, found $PM_FILE_COUNT - openclaw may have changed" >&2; exit 1; fi \
+    && PM_FILE="$PM_FILES" \
+    && BEFORE=$(grep -c 'DISCOVERY_TIMEOUT_MS = 5e3' "$PM_FILE" 2>/dev/null || true) \
+    && if [ "$BEFORE" -ne 1 ]; then echo "ERROR: expected exactly 1 KiloCode DISCOVERY_TIMEOUT_MS = 5e3 occurrence, found $BEFORE - openclaw may have changed" >&2; exit 1; fi \
+    && sed -i 's/DISCOVERY_TIMEOUT_MS = 5e3/DISCOVERY_TIMEOUT_MS = 60e3/' "$PM_FILE" \
+    && AFTER=$(grep -c 'DISCOVERY_TIMEOUT_MS = 60e3' "$PM_FILE" 2>/dev/null || true) \
+    && if [ "$AFTER" -ne 1 ]; then echo "ERROR: KiloCode sed patch failed - expected 1 occurrence of 60e3, found $AFTER" >&2; exit 1; fi \
+    && if grep -q 'DISCOVERY_TIMEOUT_MS = 5e3' "$PM_FILE" 2>/dev/null; then echo "ERROR: old KiloCode 5e3 value still present after patch" >&2; exit 1; fi \
+    && echo "OK: patched KiloCode DISCOVERY_TIMEOUT_MS 5e3 -> 60e3 in $(basename "$PM_FILE")" \
+    && CT_FILE=$(find "$OC_DIST" -name 'channel-target-*.js' | head -1) \
+    && if [ -z "$CT_FILE" ]; then echo "ERROR: channel-target-*.js not found in openclaw dist" >&2; exit 1; fi \
+    && sed -i 's/MESSAGE_ACTION_TARGET_MODE\[action\] !== "none"/\(MESSAGE_ACTION_TARGET_MODE[action] ?? "none"\) !== "none"/' "$CT_FILE" \
+    && if grep -q 'MESSAGE_ACTION_TARGET_MODE\[action\] !== "none"' "$CT_FILE"; then echo "ERROR: actionRequiresTarget patch failed" >&2; exit 1; fi \
+    && echo "OK: patched actionRequiresTarget in $(basename "$CT_FILE")" \
+    && openclaw --version \
+    && npm cache clean --force
+
+# Composio publishes CLI binaries as GitHub release artifacts rather than as a
+# usable npm package. Pin the tagged install script and stable release so image
+# builds verify the upstream checksum while keeping this install isolated.
+RUN COMPOSIO_INSTALL_TAG="%40composio%2Fcli%40${COMPOSIO_CLI_VERSION}" \
+    && curl -fsSL "https://raw.githubusercontent.com/ComposioHQ/composio/${COMPOSIO_INSTALL_TAG}/install.sh" \
+       -o /tmp/install-composio.sh \
+    && bash /tmp/install-composio.sh "@composio/cli@${COMPOSIO_CLI_VERSION}" \
+    && composio --version \
+    && rm -f /tmp/install-composio.sh
+
+# Bake bundled plugin runtime deps into OpenClaw's external stage dir so first
+# boot is pure startup — no npm install from `openclaw doctor` or gateway plugin
+# load on shared-cpu Fly machines. The stage-root naming mirrors OpenClaw
+# 2026.5.26's resolveExternalBundledRuntimeDepsInstallRoot().
+RUN cd /usr/local/lib/node_modules/openclaw \
+    && OPENCLAW_PACKAGE_ROOT="$(pwd -P)" \
+    && OPENCLAW_PACKAGE_VERSION="$(node -p "require('./package.json').version")" \
+    && OPENCLAW_PACKAGE_HASH="$(node -e "process.stdout.write(require('node:crypto').createHash('sha256').update(process.argv[1]).digest('hex').slice(0, 12))" "$OPENCLAW_PACKAGE_ROOT")" \
+    && OPENCLAW_BUNDLED_RUNTIME_ROOT="${OPENCLAW_PLUGIN_STAGE_DIR}/openclaw-${OPENCLAW_PACKAGE_VERSION}-${OPENCLAW_PACKAGE_HASH}" \
+    && mkdir -p "$OPENCLAW_BUNDLED_RUNTIME_ROOT" \
+    && jq -r '((.dependencies // {}) + (.optionalDependencies // {})) | to_entries[] | select(.value | startswith("workspace:") | not) | "\(.key)@\(.value)"' \
+         dist/extensions/*/package.json > /tmp/bundled-plugin-specs.raw \
+    && sort -u /tmp/bundled-plugin-specs.raw > /tmp/bundled-plugin-specs.txt \
+    && test -s /tmp/bundled-plugin-specs.txt \
+    && xargs -a /tmp/bundled-plugin-specs.txt npm install \
+           --prefix "$OPENCLAW_BUNDLED_RUNTIME_ROOT" \
+           --omit=dev --no-save --package-lock=false \
+           --ignore-scripts --legacy-peer-deps \
+           --no-fund --no-audit \
+    && rm -f /tmp/bundled-plugin-specs.raw /tmp/bundled-plugin-specs.txt \
+    && rm -rf /root/.npm
+
+# Install Go (available at runtime for users to `go install` additional tools)
+ENV GO_VERSION=1.26.2
+RUN ARCH="$(dpkg --print-architecture)" \
+    && curl -fsSL https://dl.google.com/go/go${GO_VERSION}.linux-${ARCH}.tar.gz -o /tmp/go.tar.gz \
+    && EXPECTED_SHA256="$(curl -fsSL https://dl.google.com/go/go${GO_VERSION}.linux-${ARCH}.tar.gz.sha256)" \
+    && echo "${EXPECTED_SHA256}  /tmp/go.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/go.tar.gz -C /usr/local \
+    && rm /tmp/go.tar.gz
+# IMPORTANT: A Fly Volume is mounted at /root at runtime, which shadows
+# everything the image layer writes under /root.
+# - Pre-installed tools use GOBIN=/usr/local/bin so they survive the mount.
+# - At runtime, Go defaults to GOBIN=/root/go/bin (on the persistent volume),
+#   so user-installed tools persist across restarts and are included in snapshots.
+# - npm/Node (installed to /usr/local) and apt packages (/usr/bin) are unaffected.
+ENV PATH="/usr/local/go/bin:/root/go/bin:$PATH"
+RUN ARCH="$(dpkg --print-architecture)" \
+    && curl -fsSL "https://github.com/steipete/gogcli/releases/download/v0.14.0/gogcli_0.14.0_linux_${ARCH}.tar.gz" \
+       | tar xz -C /usr/local/bin gog \
+    && mv /usr/local/bin/gog /usr/local/bin/gog.real \
+    && GOBIN=/usr/local/bin go install github.com/steipete/goplaces/cmd/goplaces@v0.3.0 \
+    && GOBIN=/usr/local/bin go install github.com/Hyaxia/blogwatcher/cmd/blogwatcher@v0.0.2 \
+    && GOBIN=/usr/local/bin go install github.com/xdevplatform/xurl@v1.1.0 \
+    && GOBIN=/usr/local/bin go install github.com/steipete/gifgrep/cmd/gifgrep@v0.2.3 \
+    && go clean -cache -modcache
+
+# Install uv (Python package manager, available at runtime).
+# Install to /usr/local/bin so the binary survives the Fly Volume mount at /root.
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv --version
+
+# ── Builder stage: package custom plugins ───────────────────────────
+# Build the vendored plugin tarball in an isolated stage so dev-time
+# dependencies do not inflate the runtime image layers.
+FROM runtime AS customizer-builder
+
+COPY --from=workspace pnpm-workspace.yaml pnpm-lock.yaml /tmp/plugin-workspace/
+COPY --from=workspace patches/ /tmp/plugin-workspace/patches/
+COPY plugins/kiloclaw-customizer/ /tmp/plugin-workspace/services/kiloclaw/plugins/kiloclaw-customizer/
+RUN cd /tmp/plugin-workspace \
+    && pnpm install --filter @kiloclaw/kiloclaw-customizer --frozen-lockfile --ignore-scripts \
+    && pnpm --dir services/kiloclaw/plugins/kiloclaw-customizer pack --out /tmp/kiloclaw-customizer.tgz \
+    && pnpm store prune \
+    && rm -rf /tmp/plugin-workspace /root/.npm
+
+# ── Builder stage: package kilo-chat plugin ────────────────────────────
+# Build the vendored plugin tarball in an isolated stage so dev-time
+# dependencies do not inflate the runtime image layers.
+FROM runtime AS kilo-chat-builder
+
+COPY --from=workspace pnpm-workspace.yaml pnpm-lock.yaml /tmp/plugin-workspace/
+COPY --from=workspace patches/ /tmp/plugin-workspace/patches/
+COPY plugins/kilo-chat/ /tmp/plugin-workspace/services/kiloclaw/plugins/kilo-chat/
+RUN cd /tmp/plugin-workspace \
+    && pnpm install --filter @kiloclaw/kilo-chat --frozen-lockfile --ignore-scripts \
+    && pnpm --dir services/kiloclaw/plugins/kilo-chat pack --out /tmp/kilo-chat.tgz \
+    && pnpm store prune \
+    && rm -rf /tmp/plugin-workspace /root/.npm
+
+FROM runtime AS morning-briefing-builder
+
+COPY --from=workspace pnpm-workspace.yaml pnpm-lock.yaml /tmp/plugin-workspace/
+COPY --from=workspace patches/ /tmp/plugin-workspace/patches/
+COPY plugins/kiloclaw-morning-briefing/ /tmp/plugin-workspace/services/kiloclaw/plugins/kiloclaw-morning-briefing/
+RUN cd /tmp/plugin-workspace \
+    && pnpm install --filter @kiloclaw/kiloclaw-morning-briefing --frozen-lockfile --ignore-scripts \
+    && pnpm --dir services/kiloclaw/plugins/kiloclaw-morning-briefing pack --out /tmp/kiloclaw-morning-briefing.tgz \
+    && pnpm store prune \
+    && rm -rf /tmp/plugin-workspace /root/.npm
+
+# ── Builder stage: compile the controller with Bun ────────────────────
+# Bun is only needed to bundle the controller TypeScript into a single JS
+# file. By building in a separate stage, Bun (~100MB) stays out of the
+# final image. Bun installed to /root/.bun/ which gets shadowed by the
+# Fly Volume mount at /root, so it was unreachable at runtime anyway.
+FROM debian:trixie-slim AS controller-builder
+
+ENV NODE_VERSION=24.15.0
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip xz-utils \
+    && ARCH="$(dpkg --print-architecture)" \
+    && case "${ARCH}" in \
+         amd64) NODE_ARCH="x64" ;; \
+         arm64) NODE_ARCH="arm64" ;; \
+         *) echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz -o /tmp/node.tar.xz \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+    && rm /tmp/node.tar.xz \
+    && npm install --global pnpm@11.1.2 \
+    && curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.13" \
+    && rm -rf /var/lib/apt/lists/*
+ENV PATH="/root/.bun/bin:$PATH"
+
+# Re-declare global ARGs to make them available in this stage
+ARG CONTROLLER_COMMIT
+ARG CONTROLLER_CACHE_BUST
+COPY --from=workspace pnpm-workspace.yaml pnpm-lock.yaml /tmp/controller-workspace/
+COPY --from=workspace patches/ /tmp/controller-workspace/patches/
+COPY controller/ /tmp/controller-workspace/services/kiloclaw/controller/
+RUN cd /tmp/controller-workspace \
+    && pnpm install --filter kiloclaw-controller --frozen-lockfile --ignore-scripts \
+    && cd services/kiloclaw/controller \
+    && CONTROLLER_VERSION="$(date -u +'%Y.%-m.%-d.%H%M')" \
+    && bun build src/index.ts --outfile=/usr/local/bin/kiloclaw-controller.js --target=node --minify \
+       --define "KILOCLAW_CONTROLLER_VERSION=\"${CONTROLLER_VERSION}\"" \
+       --define "KILOCLAW_CONTROLLER_COMMIT=\"${CONTROLLER_COMMIT}\"" \
+    && bun pm cache rm \
+    && pnpm store prune \
+    && rm -rf /tmp/controller-workspace
+
+# ── Final stage: runtime image ────────────────────────────────────────
+FROM runtime AS final
+
+# Install prebuilt customizer plugin package from builder stage.
+# Also drop /etc/gitconfig (set earlier for the build's ssh→https rewrite) so
+# it doesn't persist in the runtime image.
+COPY --from=customizer-builder /tmp/kiloclaw-customizer.tgz /tmp/kiloclaw-customizer.tgz
+COPY --from=morning-briefing-builder /tmp/kiloclaw-morning-briefing.tgz /tmp/kiloclaw-morning-briefing.tgz
+RUN npm install -g --legacy-peer-deps /tmp/kiloclaw-customizer.tgz /tmp/kiloclaw-morning-briefing.tgz \
+    && rm -f /tmp/kiloclaw-customizer.tgz \
+    && rm -f /tmp/kiloclaw-morning-briefing.tgz \
+    && rm -f /etc/gitconfig \
+    && rm -rf /root/.npm
+
+# Install prebuilt kilo-chat plugin package from builder stage.
+COPY --from=kilo-chat-builder /tmp/kilo-chat.tgz /tmp/kilo-chat.tgz
+RUN npm install -g --legacy-peer-deps /tmp/kilo-chat.tgz \
+    && rm -f /tmp/kilo-chat.tgz \
+    && rm -rf /root/.npm
+
+# Copy the compiled controller from the builder stage
+COPY --from=controller-builder /usr/local/bin/kiloclaw-controller.js /usr/local/bin/kiloclaw-controller.js
+
+# Create OpenClaw directories
+# When a Fly Volume is mounted at /root, these dirs persist across restarts.
+RUN mkdir -p /root/.openclaw \
+    && mkdir -p /root/clawd \
+    && mkdir -p /root/clawd/skills
+
+# Copy helper scripts (used at runtime by the controller/gateway)
+# Build cache bust: 2026-06-01-v69-openclaw-2026.5.26
+RUN echo "14"
+COPY openclaw-pairing-list.js /usr/local/bin/openclaw-pairing-list.js
+COPY openclaw-device-pairing-list.js /usr/local/bin/openclaw-device-pairing-list.js
+
+# Copy custom skills
+COPY skills/ /root/clawd/skills/
+
+# Stage TOOLS.md outside /root so it survives the Fly Volume mount.
+# The controller's bootstrap copies it to /root/.openclaw/workspace/TOOLS.md on first boot.
+COPY container/TOOLS.md /usr/local/share/kiloclaw/TOOLS.md
+
+# Expose the gateway port
+EXPOSE 18789
+
+# Entrypoint: start the KiloClaw controller daemon directly.
+# All bootstrap logic (env decryption, onboard/doctor, config patching,
+# feature flags) lives in the controller's bootstrap module — no shell wrapper needed.
+CMD ["node", "/usr/local/bin/kiloclaw-controller.js"]

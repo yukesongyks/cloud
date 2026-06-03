@@ -1,0 +1,73 @@
+import { api_request_log, type User } from '@kilocode/db/schema';
+import { db } from '@/lib/drizzle';
+import { logExceptInTest } from '@/lib/utils.server';
+import { after } from 'next/server';
+import type { GatewayRequest } from '@/lib/ai-gateway/providers/openrouter/types';
+import { kilologHash } from '@/lib/ai-gateway/kilologHash';
+import { detectToolCallArgumentErrors } from '@/lib/ai-gateway/api-request-log-errors';
+
+const users = [
+  '992891e9fe987b8960a05ed0bc9cc456979d1d71410d467f212e6233dbc0a523', // christiaan
+  'a8cd59cc6df67645c2f509948ee9a579582a7593db43fbad9bcf37cce38f2d87', // https://kilo-code.slack.com/archives/C09H2GDAJ75/p1776149178143169
+  'de30ace080f1ea4d269c0d37b68fd41f3e6895751ce032a713fe6e07eb314dfb', // https://kilo-code.slack.com/archives/C090U1NLQUC/p1778487038443649?thread_ts=1778480356.436739&cid=C090U1NLQUC
+];
+
+const organizations = [
+  '3f48333c176a29aaeeb25f3475e38511fc7184b34321a1605a3c0db54cae6df4', // kilo
+];
+
+async function isLoggingEnabledForUser(
+  user: User | null,
+  organizationId: string | null
+): Promise<boolean> {
+  if (user?.google_user_email.endsWith('@kilo.ai')) return true;
+  if (user?.google_user_email.endsWith('@kilocode.ai')) return true;
+  if (user?.id && users.includes(await kilologHash(user.id))) return true;
+  if (organizationId && organizations.includes(await kilologHash(organizationId))) return true;
+  return false;
+}
+
+export async function handleRequestLogging(params: {
+  clonedResponse: Response;
+  user: User | null;
+  organization_id: string | null;
+  session_id: string | null;
+  provider: string;
+  model: string;
+  request: GatewayRequest;
+}) {
+  const { clonedResponse, user, organization_id, session_id, provider, model, request } = params;
+  if (!(await isLoggingEnabledForUser(user, organization_id))) {
+    return;
+  }
+  after(async () => {
+    let response: string | undefined;
+    try {
+      response = await clonedResponse.text();
+      const error = detectToolCallArgumentErrors(response, request);
+      const apiRequestLogId = await db
+        .insert(api_request_log)
+        .values({
+          kilo_user_id: user?.id,
+          organization_id: organization_id,
+          session_id,
+          status_code: clonedResponse.status,
+          model,
+          provider,
+          request: request.body,
+          response,
+          error,
+        })
+        .returning({ id: api_request_log.id });
+      logExceptInTest(
+        '[handleRequestLogging] Inserted into api_request_log',
+        apiRequestLogId[0].id
+      );
+    } catch (e) {
+      const cause = e instanceof Error ? e.cause : undefined;
+      logExceptInTest(
+        `[handleRequestLogging] failed to insert api_request_log (user=${user?.id}, status=${clonedResponse.status}, model=${model}) cause (truncated): ${String(cause).substring(0, 4000)} error (truncated): ${String(e).substring(0, 4000)}`
+      );
+    }
+  });
+}

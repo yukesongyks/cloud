@@ -1,0 +1,28 @@
+{
+  "name": "cloudflare-security-auto-analysis",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy:prod": "wrangler deploy",
+    "deploy:dev": "wrangler deploy --env dev",
+    "dev": "wrangler dev --env dev",
+    "typecheck": "tsgo --noEmit",
+    "lint": "pnpm -w exec oxlint --config .oxlintrc.json services/security-auto-analysis/src",
+    "types": "wrangler types --env-interface CloudflareEnv worker-configuration.d.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@kilocode/db": "workspace:*",
+    "@kilocode/worker-utils": "workspace:*",
+    "drizzle-orm": "catalog:",
+    "workers-tagged-logger": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@typescript/native-preview": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:",
+    "wrangler": "catalog:"
+  }
+}

@@ -1,0 +1,216 @@
+import { safeLocalStorage } from '@/lib/localStorage';
+import type { ModelOption } from '@/components/shared/ModelCombobox';
+import type { RepositoryOption, RepositoryPlatform } from '@/components/shared/RepositoryCombobox';
+
+const MODEL_STORAGE_KEY_PREFIX = 'cloud-agent:last-used-model';
+const VARIANTS_STORAGE_KEY_PREFIX = 'cloud-agent:last-used-variants';
+const DEVCONTAINER_ENABLED_STORAGE_KEY = 'cloud-agent:devcontainer-enabled';
+const CLOUD_AGENT_NEXT_LOCAL_TEST_MODEL = {
+  id: 'kilo/fake-deterministic',
+  name: 'Deterministic test model',
+} satisfies ModelOption;
+const REPO_STORAGE_KEY_PREFIX = 'cloud-agent:last-used-repo';
+
+type LastUsedRepo = { fullName: string; platform: RepositoryPlatform };
+
+export function shouldExposeCloudAgentNextLocalTestModel() {
+  return (
+    process.env.NODE_ENV === 'development' &&
+    process.env.NEXT_PUBLIC_CLOUD_AGENT_NEXT_ENABLE_LOCAL_FAKE_MODEL === 'true'
+  );
+}
+
+export function appendCloudAgentNextLocalTestModel(
+  modelOptions: ModelOption[],
+  shouldExposeLocalTestModel = shouldExposeCloudAgentNextLocalTestModel()
+): ModelOption[] {
+  if (
+    !shouldExposeLocalTestModel ||
+    modelOptions.some(model => model.id === CLOUD_AGENT_NEXT_LOCAL_TEST_MODEL.id)
+  ) {
+    return modelOptions;
+  }
+
+  return [...modelOptions, CLOUD_AGENT_NEXT_LOCAL_TEST_MODEL];
+}
+
+export function getLastUsedRepoStorageKey(organizationId?: string) {
+  return organizationId
+    ? `${REPO_STORAGE_KEY_PREFIX}:organization:${organizationId}`
+    : `${REPO_STORAGE_KEY_PREFIX}:personal`;
+}
+
+export function parseLastUsedRepo(rawValue: string | null): LastUsedRepo | null {
+  if (!rawValue) return null;
+  try {
+    const parsed: unknown = JSON.parse(rawValue);
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed) &&
+      'fullName' in parsed &&
+      typeof parsed.fullName === 'string' &&
+      'platform' in parsed &&
+      (parsed.platform === 'github' || parsed.platform === 'gitlab')
+    ) {
+      return { fullName: parsed.fullName, platform: parsed.platform };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function getLastUsedRepo(organizationId?: string): LastUsedRepo | null {
+  return parseLastUsedRepo(safeLocalStorage.getItem(getLastUsedRepoStorageKey(organizationId)));
+}
+
+export function setLastUsedRepo(
+  fullName: string,
+  platform: RepositoryPlatform,
+  organizationId?: string
+) {
+  safeLocalStorage.setItem(
+    getLastUsedRepoStorageKey(organizationId),
+    JSON.stringify({ fullName, platform } satisfies LastUsedRepo)
+  );
+}
+
+export function getPreferredInitialRepo({
+  availableRepos,
+  recentRepos,
+  onlyAvailableRepo,
+  lastUsedRepo,
+  isLoadingGitHubRepos,
+  isLoadingGitLabRepos,
+}: {
+  availableRepos: RepositoryOption[];
+  recentRepos: RepositoryOption[];
+  onlyAvailableRepo?: RepositoryOption;
+  lastUsedRepo: LastUsedRepo | null;
+  isLoadingGitHubRepos: boolean;
+  isLoadingGitLabRepos: boolean;
+}): RepositoryOption | undefined {
+  if (lastUsedRepo) {
+    const match = availableRepos.find(
+      repo => repo.fullName === lastUsedRepo.fullName && repo.platform === lastUsedRepo.platform
+    );
+    if (match) return match;
+
+    const isSavedRepoLoading =
+      lastUsedRepo.platform === 'github' ? isLoadingGitHubRepos : isLoadingGitLabRepos;
+    if (isSavedRepoLoading) return undefined;
+  }
+
+  return recentRepos[0] ?? onlyAvailableRepo;
+}
+
+export function getLastUsedModelStorageKey(organizationId?: string) {
+  return organizationId
+    ? `${MODEL_STORAGE_KEY_PREFIX}:organization:${organizationId}`
+    : `${MODEL_STORAGE_KEY_PREFIX}:personal`;
+}
+
+export function getLastUsedModel(organizationId?: string) {
+  return safeLocalStorage.getItem(getLastUsedModelStorageKey(organizationId));
+}
+
+export function setLastUsedModel(model: string, organizationId?: string) {
+  safeLocalStorage.setItem(getLastUsedModelStorageKey(organizationId), model);
+}
+
+export function getDevcontainerEnabledStorageKey() {
+  return DEVCONTAINER_ENABLED_STORAGE_KEY;
+}
+
+export function parseDevcontainerEnabled(rawValue: string | null) {
+  return rawValue === 'true';
+}
+
+export function getDevcontainerEnabled() {
+  return parseDevcontainerEnabled(safeLocalStorage.getItem(DEVCONTAINER_ENABLED_STORAGE_KEY));
+}
+
+export function setDevcontainerEnabled(enabled: boolean) {
+  safeLocalStorage.setItem(DEVCONTAINER_ENABLED_STORAGE_KEY, String(enabled));
+}
+
+export function getPreferredInitialModel({
+  modelOptions,
+  lastUsedModel,
+  defaultModel,
+}: {
+  modelOptions: ModelOption[];
+  lastUsedModel: string | null;
+  defaultModel?: string;
+}) {
+  if (lastUsedModel && modelOptions.some(model => model.id === lastUsedModel)) {
+    return lastUsedModel;
+  }
+
+  if (defaultModel && modelOptions.some(model => model.id === defaultModel)) {
+    return defaultModel;
+  }
+
+  return modelOptions[0]?.id;
+}
+
+export function getLastUsedVariantsStorageKey(organizationId?: string) {
+  return organizationId
+    ? `${VARIANTS_STORAGE_KEY_PREFIX}:organization:${organizationId}`
+    : `${VARIANTS_STORAGE_KEY_PREFIX}:personal`;
+}
+
+function readLastUsedVariants(organizationId?: string): Record<string, string> {
+  const raw = safeLocalStorage.getItem(getLastUsedVariantsStorageKey(organizationId));
+  if (!raw) return {};
+
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+
+    const result: Record<string, string> = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value === 'string') result[key] = value;
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+export function getLastUsedVariant(modelId: string, organizationId?: string): string | null {
+  return readLastUsedVariants(organizationId)[modelId] ?? null;
+}
+
+export function setLastUsedVariant(
+  modelId: string,
+  variant: string,
+  organizationId?: string
+): void {
+  const map = readLastUsedVariants(organizationId);
+  map[modelId] = variant;
+  safeLocalStorage.setItem(getLastUsedVariantsStorageKey(organizationId), JSON.stringify(map));
+}
+
+export function getPreferredInitialVariant({
+  availableVariants,
+  lastUsedVariant,
+  currentVariant,
+}: {
+  availableVariants: string[];
+  lastUsedVariant: string | null;
+  currentVariant?: string;
+}): string | undefined {
+  if (availableVariants.length === 0) return undefined;
+
+  if (lastUsedVariant && availableVariants.includes(lastUsedVariant)) {
+    return lastUsedVariant;
+  }
+
+  if (currentVariant && availableVariants.includes(currentVariant)) {
+    return currentVariant;
+  }
+
+  return availableVariants[0];
+}

@@ -1,0 +1,11 @@
+{
+  "typescript.preferences.importModuleSpecifier": "non-relative",
+  "editor.defaultFormatter": "oxc.oxc-vscode",
+  "editor.formatOnSave": true,
+  "[typescriptreact]": {
+    "editor.defaultFormatter": "oxc.oxc-vscode"
+  },
+  "[typescript]": {
+    "editor.defaultFormatter": "oxc.oxc-vscode"
+  }
+}

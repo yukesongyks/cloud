@@ -1,0 +1,739 @@
+import type { NextRequest } from 'next/server';
+import { after, NextResponse } from 'next/server';
+import { captureException, captureMessage } from '@sentry/nextjs';
+import { verifyGitHubWebhookSignature } from '@/lib/integrations/platforms/github/adapter';
+import {
+  InstallationCreatedPayloadSchema,
+  InstallationDeletedPayloadSchema,
+  InstallationSuspendPayloadSchema,
+  InstallationUnsuspendPayloadSchema,
+  InstallationTargetRenamedPayloadSchema,
+  InstallationRepositoriesPayloadSchema,
+  PushEventPayloadSchema,
+  PullRequestPayloadSchema,
+  IssuePayloadSchema,
+  PullRequestReviewCommentPayloadSchema,
+  PullRequestReviewPayloadSchema,
+  GitHubAppAuthorizationRevokedPayloadSchema,
+} from '@/lib/integrations/platforms/github/webhook-schemas';
+import { findIntegrationByInstallationId } from '@/lib/integrations/db/platform-integrations';
+import {
+  handleInstallationCreated,
+  handleInstallationDeleted,
+  handleInstallationSuspend,
+  handleInstallationUnsuspend,
+  handleInstallationTargetRenamed,
+  handleInstallationRepositories,
+  handlePushEvent,
+  handlePullRequest,
+  handleIssue,
+  handlePRReviewComment,
+  upsertCliSessionPullRequestsFromWebhook,
+  upsertCliSessionPullRequestReviewFromWebhook,
+} from '@/lib/integrations/platforms/github/webhook-handlers';
+import { PLATFORM, GITHUB_EVENT, GITHUB_ACTION } from '@/lib/integrations/core/constants';
+import { logExceptInTest } from '@/lib/utils.server';
+import { logWebhookEvent, updateWebhookEvent } from '@/lib/integrations/db/webhook-events';
+import type { Owner } from '@/lib/integrations/core/types';
+import type { GitHubAppType } from './app-selector';
+import { revokeStoredGitHubUserAuthorization } from './user-authorization';
+import { redactSensitiveHeaders } from '@kilocode/worker-utils/redact-headers';
+
+/**
+ * Shared GitHub App Webhook Handler
+ *
+ * Handles webhooks for both standard and lite GitHub Apps.
+ * Thin routing layer that:
+ * 1. Verifies webhook signature
+ * 2. Parses the event
+ * 3. Routes to appropriate handler
+ * 4. Handles errors
+ *
+ * All business logic is in handler files
+ *
+ * @param request - The incoming Next.js request
+ * @param appType - 'standard' for full-featured app, 'lite' for read-only OSS app
+ */
+export async function handleGitHubWebhook(
+  request: NextRequest,
+  appType: GitHubAppType
+): Promise<Response> {
+  // Helper for app-specific logging
+  const logSuffix = appType === 'lite' ? ' (lite app)' : '';
+  const sentryPrefix = appType === 'lite' ? 'github_lite_' : 'github_';
+
+  try {
+    // 1. Verify signature
+    const rawBody = await request.text();
+    const signature = request.headers.get('x-hub-signature-256') || '';
+
+    if (!verifyGitHubWebhookSignature(rawBody, signature, appType)) {
+      logExceptInTest(`Invalid webhook signature${logSuffix}`);
+      return new NextResponse('Unauthorized', { status: 401 });
+    }
+
+    // 2. Parse JSON payload
+    let payload: unknown;
+    try {
+      payload = JSON.parse(rawBody);
+    } catch (error) {
+      logExceptInTest(`Error parsing GitHub webhook JSON body${logSuffix}:`, error);
+      captureException(error, {
+        tags: { source: `${sentryPrefix}webhook_parse_json` },
+        extra: { rawBodyPreview: rawBody.substring(0, 200) },
+      });
+      return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 });
+    }
+
+    // 3. Get event type and action from headers
+    const eventType = request.headers.get('x-github-event') || '';
+    const eventSignature = request.headers.get('x-github-delivery');
+    const headers = redactSensitiveHeaders(Object.fromEntries(request.headers));
+
+    if (!eventType) {
+      return NextResponse.json({ error: 'Missing x-github-event header' }, { status: 400 });
+    }
+
+    if (!eventSignature) {
+      return NextResponse.json(
+        { error: 'Missing x-github-delivery header in GitHub webhook request' },
+        { status: 400 }
+      );
+    }
+
+    // 4. Helper function to log webhook events
+    const logWebhook = async (
+      integration: { owned_by_organization_id: string | null; owned_by_user_id: string | null },
+      action: string
+    ) => {
+      try {
+        // Determine owner from integration
+        const owner = integration.owned_by_organization_id
+          ? { type: 'org' as const, id: integration.owned_by_organization_id }
+          : ({ type: 'user' as const, id: integration.owned_by_user_id } as Owner);
+
+        const { id, isDuplicate } = await logWebhookEvent({
+          owner,
+          platform: PLATFORM.GITHUB,
+          event_type: eventType,
+          event_action: action,
+          payload,
+          headers,
+          event_signature: eventSignature,
+        });
+
+        if (isDuplicate) {
+          logExceptInTest(`Duplicate webhook event detected${logSuffix}`);
+          return { isDuplicate: true, webhookEventId: id };
+        }
+        return { isDuplicate: false, webhookEventId: id };
+      } catch (error) {
+        logExceptInTest(`Error logging webhook event${logSuffix}:`, error);
+        captureException(error, {
+          tags: { source: 'webhook_event_logging', ...(appType === 'lite' ? { app: 'lite' } : {}) },
+          extra: { event_type: eventType, event_action: action },
+        });
+        return { isDuplicate: false, webhookEventId: undefined };
+      }
+    };
+
+    // 5. Route based on event type with type-safe Zod parsing
+
+    if (eventType === GITHUB_EVENT.APP_AUTHORIZATION) {
+      const parseResult = GitHubAppAuthorizationRevokedPayloadSchema.safeParse(payload);
+      if (!parseResult.success) {
+        return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+      }
+      await revokeStoredGitHubUserAuthorization(
+        parseResult.data.sender.id.toString(),
+        appType,
+        GITHUB_ACTION.REVOKED
+      );
+      return NextResponse.json({ message: 'Authorization revoked' }, { status: 200 });
+    }
+
+    // Handle installation events
+    if (eventType === GITHUB_EVENT.INSTALLATION) {
+      const action = (payload as { action?: string }).action || '';
+
+      if (action === GITHUB_ACTION.CREATED) {
+        const parseResult = InstallationCreatedPayloadSchema.safeParse(payload);
+        if (!parseResult.success) {
+          logExceptInTest(`Invalid installation.created payload${logSuffix}:`, parseResult.error);
+          captureMessage('Invalid GitHub webhook payload structure', {
+            level: 'error',
+            tags: { source: `${sentryPrefix}webhook_validation`, event: 'installation.created' },
+            extra: { errors: parseResult.error.issues },
+          });
+          return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+        }
+        // Note: For installation.created, webhook logging happens inside handler
+        // because we need organization_id which is only available after processing
+        return await handleInstallationCreated(parseResult.data);
+      }
+
+      if (action === GITHUB_ACTION.DELETED) {
+        const parseResult = InstallationDeletedPayloadSchema.safeParse(payload);
+        if (!parseResult.success) {
+          logExceptInTest(`Invalid installation.deleted payload${logSuffix}:`, parseResult.error);
+          captureMessage('Invalid GitHub webhook payload structure', {
+            level: 'error',
+            tags: { source: `${sentryPrefix}webhook_validation`, event: 'installation.deleted' },
+            extra: { errors: parseResult.error.issues },
+          });
+          return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+        }
+
+        // Get integration before deletion to log the event
+        const installationId = parseResult.data.installation.id.toString();
+        const integration = await findIntegrationByInstallationId(PLATFORM.GITHUB, installationId);
+
+        if (integration) {
+          const logResult = await logWebhook(integration, action);
+          if (logResult.isDuplicate) {
+            return NextResponse.json({ message: 'Duplicate event' }, { status: 200 });
+          }
+
+          const result = await handleInstallationDeleted(parseResult.data);
+
+          // Mark webhook event as processed
+          if (logResult.webhookEventId) {
+            try {
+              await updateWebhookEvent(logResult.webhookEventId, {
+                processed: true,
+                processed_at: new Date().toISOString(),
+                handlers_triggered: ['installation_deleted'],
+                errors: null,
+              });
+            } catch (error) {
+              logExceptInTest(`Error updating webhook event${logSuffix}:`, error);
+            }
+          }
+
+          return result;
+        }
+
+        return await handleInstallationDeleted(parseResult.data);
+      }
+
+      if (action === GITHUB_ACTION.SUSPEND) {
+        const parseResult = InstallationSuspendPayloadSchema.safeParse(payload);
+        if (!parseResult.success) {
+          logExceptInTest(`Invalid installation.suspend payload${logSuffix}:`, parseResult.error);
+          captureMessage('Invalid GitHub webhook payload structure', {
+            level: 'error',
+            tags: { source: `${sentryPrefix}webhook_validation`, event: 'installation.suspend' },
+            extra: { errors: parseResult.error.issues },
+          });
+          return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+        }
+
+        const installationId = parseResult.data.installation.id.toString();
+        const integration = await findIntegrationByInstallationId(PLATFORM.GITHUB, installationId);
+
+        if (integration) {
+          const logResult = await logWebhook(integration, action);
+          if (logResult.isDuplicate) {
+            return NextResponse.json({ message: 'Duplicate event' }, { status: 200 });
+          }
+
+          const result = await handleInstallationSuspend(parseResult.data);
+
+          // Mark webhook event as processed
+          if (logResult.webhookEventId) {
+            try {
+              await updateWebhookEvent(logResult.webhookEventId, {
+                processed: true,
+                processed_at: new Date().toISOString(),
+                handlers_triggered: ['installation_suspend'],
+                errors: null,
+              });
+            } catch (error) {
+              logExceptInTest(`Error updating webhook event${logSuffix}:`, error);
+            }
+          }
+
+          return result;
+        }
+
+        return await handleInstallationSuspend(parseResult.data);
+      }
+
+      if (action === GITHUB_ACTION.UNSUSPEND) {
+        const parseResult = InstallationUnsuspendPayloadSchema.safeParse(payload);
+        if (!parseResult.success) {
+          logExceptInTest(`Invalid installation.unsuspend payload${logSuffix}:`, parseResult.error);
+          captureMessage('Invalid GitHub webhook payload structure', {
+            level: 'error',
+            tags: { source: `${sentryPrefix}webhook_validation`, event: 'installation.unsuspend' },
+            extra: { errors: parseResult.error.issues },
+          });
+          return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+        }
+
+        const installationId = parseResult.data.installation.id.toString();
+        const integration = await findIntegrationByInstallationId(PLATFORM.GITHUB, installationId);
+
+        if (integration) {
+          const logResult = await logWebhook(integration, action);
+          if (logResult.isDuplicate) {
+            return NextResponse.json({ message: 'Duplicate event' }, { status: 200 });
+          }
+
+          const result = await handleInstallationUnsuspend(parseResult.data);
+
+          // Mark webhook event as processed
+          if (logResult.webhookEventId) {
+            try {
+              await updateWebhookEvent(logResult.webhookEventId, {
+                processed: true,
+                processed_at: new Date().toISOString(),
+                handlers_triggered: ['installation_unsuspend'],
+                errors: null,
+              });
+            } catch (error) {
+              logExceptInTest(`Error updating webhook event${logSuffix}:`, error);
+            }
+          }
+
+          return result;
+        }
+
+        return await handleInstallationUnsuspend(parseResult.data);
+      }
+
+      return NextResponse.json({ message: 'Event received' }, { status: 200 });
+    }
+
+    if (eventType === GITHUB_EVENT.INSTALLATION_TARGET) {
+      const action = (payload as { action?: string }).action || '';
+      if (action !== GITHUB_ACTION.RENAMED) {
+        return NextResponse.json({ message: 'Event received' }, { status: 200 });
+      }
+
+      const parseResult = InstallationTargetRenamedPayloadSchema.safeParse(payload);
+      if (!parseResult.success) {
+        logExceptInTest(
+          `Invalid installation_target.renamed payload${logSuffix}:`,
+          parseResult.error
+        );
+        captureMessage('Invalid GitHub webhook payload structure', {
+          level: 'error',
+          tags: {
+            source: `${sentryPrefix}webhook_validation`,
+            event: 'installation_target.renamed',
+          },
+          extra: { errors: parseResult.error.issues },
+        });
+        return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+      }
+
+      const installationId = parseResult.data.installation.id.toString();
+      const integration = await findIntegrationByInstallationId(PLATFORM.GITHUB, installationId);
+      if (!integration) {
+        console.warn(`Integration not found${logSuffix}:`, installationId);
+        return NextResponse.json({ message: 'Integration not found' }, { status: 404 });
+      }
+
+      // Identity synchronization is idempotent and must finish before delivery deduplication;
+      // otherwise GitHub redelivery after a transient API or database failure cannot repair metadata.
+      const result = await handleInstallationTargetRenamed(
+        parseResult.data,
+        integration.id,
+        appType
+      );
+
+      const logResult = await logWebhook(integration, action);
+      if (logResult.isDuplicate) {
+        return NextResponse.json({ message: 'Duplicate event' }, { status: 200 });
+      }
+
+      if (logResult.webhookEventId) {
+        try {
+          await updateWebhookEvent(logResult.webhookEventId, {
+            processed: true,
+            processed_at: new Date().toISOString(),
+            handlers_triggered: ['installation_target_renamed'],
+            errors: null,
+          });
+        } catch (error) {
+          logExceptInTest(`Error updating webhook event${logSuffix}:`, error);
+        }
+      }
+
+      return result;
+    }
+
+    // Handle installation_repositories events
+    if (eventType === GITHUB_EVENT.INSTALLATION_REPOSITORIES) {
+      const parseResult = InstallationRepositoriesPayloadSchema.safeParse(payload);
+      if (!parseResult.success) {
+        logExceptInTest(
+          `Invalid installation_repositories payload${logSuffix}:`,
+          parseResult.error
+        );
+        captureMessage('Invalid GitHub webhook payload structure', {
+          level: 'error',
+          tags: { source: `${sentryPrefix}webhook_validation`, event: 'installation_repositories' },
+          extra: { errors: parseResult.error.issues },
+        });
+        return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+      }
+
+      const installationId = parseResult.data.installation.id.toString();
+      const integration = await findIntegrationByInstallationId(PLATFORM.GITHUB, installationId);
+
+      if (!integration) {
+        console.warn(`Integration not found${logSuffix}:`, installationId);
+        return NextResponse.json({ message: 'Integration not found' }, { status: 404 });
+      }
+
+      const action = parseResult.data.action;
+      const logResult = await logWebhook(integration, action);
+      if (logResult.isDuplicate) {
+        return NextResponse.json({ message: 'Duplicate event' }, { status: 200 });
+      }
+
+      const result = await handleInstallationRepositories(parseResult.data);
+
+      // Mark webhook event as processed
+      if (logResult.webhookEventId) {
+        try {
+          await updateWebhookEvent(logResult.webhookEventId, {
+            processed: true,
+            processed_at: new Date().toISOString(),
+            handlers_triggered: ['installation_repositories'],
+            errors: null,
+          });
+        } catch (error) {
+          logExceptInTest(`Error updating webhook event${logSuffix}:`, error);
+        }
+      }
+
+      return result;
+    }
+
+    // For other events, verify integration exists and is not suspended
+    const installation = (payload as { installation?: { id?: number } }).installation;
+    const installationId = installation?.id?.toString();
+
+    if (!installationId) {
+      logExceptInTest(`Missing installation ID in payload${logSuffix}`);
+      return NextResponse.json({ message: 'Missing installation ID' }, { status: 400 });
+    }
+
+    const integration = await findIntegrationByInstallationId(PLATFORM.GITHUB, installationId);
+
+    if (!integration) {
+      console.warn(`Integration not found for installation${logSuffix}:`, installationId);
+      return NextResponse.json({ message: 'Integration not found' }, { status: 404 });
+    }
+
+    if (integration.suspended_at) {
+      logExceptInTest(`Integration suspended, skipping event${logSuffix}`);
+      return NextResponse.json({ message: 'Integration suspended' }, { status: 200 });
+    }
+
+    // Handle push events
+    if (eventType === GITHUB_EVENT.PUSH) {
+      const parseResult = PushEventPayloadSchema.safeParse(payload);
+      if (!parseResult.success) {
+        logExceptInTest(`Invalid push event payload${logSuffix}:`, parseResult.error);
+        captureException(parseResult.error, {
+          tags: { source: `${sentryPrefix}webhook_validation`, event: 'push' },
+          extra: { errors: parseResult.error.issues },
+        });
+        return NextResponse.json({ error: 'Invalid push event payload' }, { status: 400 });
+      }
+
+      if (!parseResult.data.deleted) {
+        // Process async
+        after(async () => {
+          await handlePushEvent(parseResult.data, integration);
+        });
+      }
+      return NextResponse.json({ message: 'Event received' }, { status: 200 });
+    }
+
+    // Handle pull_request events
+    if (eventType === GITHUB_EVENT.PULL_REQUEST) {
+      const parseResult = PullRequestPayloadSchema.safeParse(payload);
+      if (!parseResult.success) {
+        logExceptInTest(`Invalid pull_request payload${logSuffix}:`, parseResult.error);
+        captureMessage('Invalid GitHub webhook payload structure', {
+          level: 'error',
+          tags: { source: `${sentryPrefix}webhook_validation`, event: 'pull_request' },
+          extra: { errors: parseResult.error.issues },
+        });
+        return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+      }
+
+      const action = parseResult.data.action;
+
+      // Log webhook event (also for `closed`, so that closed/merged deliveries
+      // are deduplicated before the upsert mutates pr_state below). Dedup has
+      // to sit above the upsert — otherwise a redelivered older
+      // `opened`/`synchronize` event could stomp a later `closed`/`merged`
+      // terminal state back to `open`.
+      const logResult = await logWebhook(integration, action);
+      if (logResult.isDuplicate) {
+        return NextResponse.json({ message: 'Duplicate event' }, { status: 200 });
+      }
+
+      // Side-effect: upsert the PR summary onto any cloud-agent-next sessions
+      // whose (git_url, git_branch) matches AND that are owned by this
+      // installation's tenant. Runs for all pull_request actions (including
+      // `closed`), independently of the code-review routing below. The upsert
+      // itself guards against demoting `closed`/`merged` back to active states
+      // so that even out-of-order deliveries stay monotonic. Wrapped in after()
+      // to avoid blocking the webhook response — when a matching session is on
+      // a supported platform the function makes an outbound GitHub GraphQL
+      // call, which can add significant latency.
+      const upsertOwner = integration.owned_by_organization_id
+        ? ({
+            kind: 'organization',
+            organizationId: integration.owned_by_organization_id,
+          } as const)
+        : integration.owned_by_user_id
+          ? ({ kind: 'user', userId: integration.owned_by_user_id } as const)
+          : null;
+
+      // `closed` events are not routed to the code-review pipeline.
+      if (action === GITHUB_ACTION.CLOSED) {
+        if (upsertOwner) {
+          after(async () => {
+            await upsertCliSessionPullRequestsFromWebhook(parseResult.data, upsertOwner);
+            if (logResult.webhookEventId) {
+              try {
+                await updateWebhookEvent(logResult.webhookEventId, {
+                  processed: true,
+                  processed_at: new Date().toISOString(),
+                  handlers_triggered: ['cli_session_pr_upsert'],
+                  errors: null,
+                });
+              } catch (error) {
+                logExceptInTest(`Error updating webhook event${logSuffix}:`, error);
+              }
+            }
+          });
+        }
+        return NextResponse.json({ message: 'Event received' }, { status: 200 });
+      }
+
+      if (upsertOwner) {
+        after(async () => {
+          await upsertCliSessionPullRequestsFromWebhook(parseResult.data, upsertOwner);
+        });
+      }
+
+      const result = await handlePullRequest(parseResult.data, integration);
+
+      // Mark webhook event as processed. `cli_session_pr_upsert` is logged
+      // optimistically — the upsert runs in after() so it may not have
+      // completed yet, but errors are swallowed internally and the dedup entry
+      // was already committed by logWebhook above.
+      if (logResult.webhookEventId) {
+        try {
+          await updateWebhookEvent(logResult.webhookEventId, {
+            processed: true,
+            processed_at: new Date().toISOString(),
+            handlers_triggered: ['code_review', 'cli_session_pr_upsert'],
+            errors: null,
+          });
+        } catch (error) {
+          logExceptInTest(`Error updating webhook event${logSuffix}:`, error);
+        }
+      }
+
+      return result;
+    }
+
+    // Handle pull_request_review events — update cached review decision.
+    if (eventType === GITHUB_EVENT.PULL_REQUEST_REVIEW) {
+      const parseResult = PullRequestReviewPayloadSchema.safeParse(payload);
+      if (!parseResult.success) {
+        logExceptInTest(`Invalid pull_request_review payload${logSuffix}:`, parseResult.error);
+        captureException(parseResult.error, {
+          tags: { source: `${sentryPrefix}webhook_validation`, event: 'pull_request_review' },
+        });
+        return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+      }
+
+      const action = parseResult.data.action;
+
+      const logResult = await logWebhook(integration, action);
+      if (logResult.isDuplicate) {
+        return NextResponse.json({ message: 'Duplicate event' }, { status: 200 });
+      }
+
+      const upsertOwner = integration.owned_by_organization_id
+        ? ({ kind: 'organization', organizationId: integration.owned_by_organization_id } as const)
+        : integration.owned_by_user_id
+          ? ({ kind: 'user', userId: integration.owned_by_user_id } as const)
+          : null;
+
+      if (upsertOwner) {
+        after(async () => {
+          try {
+            await upsertCliSessionPullRequestReviewFromWebhook(parseResult.data, upsertOwner);
+            if (logResult.webhookEventId) {
+              await updateWebhookEvent(logResult.webhookEventId, {
+                processed: true,
+                processed_at: new Date().toISOString(),
+                handlers_triggered: ['cli_session_pr_review_upsert'],
+                errors: null,
+              });
+            }
+          } catch (error) {
+            logExceptInTest(`Error handling pull_request_review${logSuffix}:`, error);
+            captureException(error, {
+              tags: { source: `${sentryPrefix}webhook_pr_review` },
+            });
+            if (logResult.webhookEventId) {
+              try {
+                await updateWebhookEvent(logResult.webhookEventId, {
+                  processed: true,
+                  processed_at: new Date().toISOString(),
+                  handlers_triggered: ['cli_session_pr_review_upsert'],
+                  errors: [
+                    {
+                      message: error instanceof Error ? error.message : String(error),
+                      handler: 'cli_session_pr_review_upsert',
+                      stack: error instanceof Error ? error.stack : undefined,
+                    },
+                  ],
+                });
+              } catch {
+                // Best-effort logging
+              }
+            }
+          }
+        });
+      }
+
+      return NextResponse.json({ message: 'Event received' }, { status: 200 });
+    }
+
+    // Handle pull_request_review_comment events
+    if (eventType === GITHUB_EVENT.PULL_REQUEST_REVIEW_COMMENT) {
+      const parseResult = PullRequestReviewCommentPayloadSchema.safeParse(payload);
+      if (!parseResult.success) {
+        logExceptInTest(
+          `Invalid pull_request_review_comment payload${logSuffix}:`,
+          parseResult.error
+        );
+        captureMessage('Invalid GitHub webhook payload structure', {
+          level: 'error',
+          tags: {
+            source: `${sentryPrefix}webhook_validation`,
+            event: 'pull_request_review_comment',
+          },
+          extra: { errors: parseResult.error.issues },
+        });
+        return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+      }
+
+      const action = parseResult.data.action;
+
+      // Only process 'created' actions (new comments)
+      if (action !== GITHUB_ACTION.CREATED) {
+        return NextResponse.json({ message: 'Event received' }, { status: 200 });
+      }
+
+      // Log webhook event
+      const logResult = await logWebhook(integration, action);
+      if (logResult.isDuplicate) {
+        return NextResponse.json({ message: 'Duplicate event' }, { status: 200 });
+      }
+
+      // Process asynchronously to return 200 within GitHub's timeout
+      after(async () => {
+        try {
+          await handlePRReviewComment(parseResult.data, integration);
+          if (logResult.webhookEventId) {
+            await updateWebhookEvent(logResult.webhookEventId, {
+              processed: true,
+              processed_at: new Date().toISOString(),
+              handlers_triggered: ['pr_review_comment_fix'],
+              errors: null,
+            });
+          }
+        } catch (error) {
+          logExceptInTest(`Error handling PR review comment${logSuffix}:`, error);
+          captureException(error, {
+            tags: { source: `${sentryPrefix}webhook_pr_review_comment` },
+          });
+          if (logResult.webhookEventId) {
+            try {
+              await updateWebhookEvent(logResult.webhookEventId, {
+                processed: true,
+                processed_at: new Date().toISOString(),
+                handlers_triggered: ['pr_review_comment_fix'],
+                errors: [
+                  {
+                    message: error instanceof Error ? error.message : String(error),
+                    handler: 'pr_review_comment_fix',
+                    stack: error instanceof Error ? error.stack : undefined,
+                  },
+                ],
+              });
+            } catch {
+              // Best-effort logging
+            }
+          }
+        }
+      });
+
+      return NextResponse.json({ message: 'Event received' }, { status: 200 });
+    }
+
+    // Handle issues events
+    if (eventType === GITHUB_EVENT.ISSUES) {
+      const parseResult = IssuePayloadSchema.safeParse(payload);
+      if (!parseResult.success) {
+        logExceptInTest(`Invalid issues payload${logSuffix}:`, parseResult.error);
+        captureMessage('Invalid GitHub webhook payload structure', {
+          level: 'error',
+          tags: { source: `${sentryPrefix}webhook_validation`, event: 'issues' },
+          extra: { errors: parseResult.error.issues },
+        });
+        return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+      }
+
+      const action = parseResult.data.action;
+
+      // Log webhook event for both user and organization-owned integrations
+      const logResult = await logWebhook(integration, action);
+      if (logResult.isDuplicate) {
+        return NextResponse.json({ message: 'Duplicate event' }, { status: 200 });
+      }
+
+      const result = await handleIssue(parseResult.data, integration);
+
+      // Mark webhook event as processed
+      if (logResult.webhookEventId) {
+        try {
+          await updateWebhookEvent(logResult.webhookEventId, {
+            processed: true,
+            processed_at: new Date().toISOString(),
+            handlers_triggered: ['auto_triage'],
+            errors: null,
+          });
+        } catch (error) {
+          logExceptInTest(`Error updating webhook event${logSuffix}:`, error);
+        }
+      }
+
+      return result;
+    }
+
+    // Default: acknowledge receipt
+    return NextResponse.json({ message: 'Event received' }, { status: 200 });
+  } catch (error) {
+    logExceptInTest(`Webhook error${logSuffix}:`, error);
+    captureException(error, {
+      tags: { source: `${sentryPrefix}webhook_handler` },
+    });
+    return new NextResponse('Internal Server Error', { status: 500 });
+  }
+}

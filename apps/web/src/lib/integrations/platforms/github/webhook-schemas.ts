@@ -1,0 +1,315 @@
+import * as z from 'zod';
+
+/**
+ * Zod schemas for GitHub webhook payload validation
+ * These ensure we receive the expected data structure from GitHub
+ */
+
+// Common schemas used across multiple webhook types
+const GitHubAccountSchema = z.object({
+  id: z.number(),
+  login: z.string(),
+  type: z.string().optional(),
+});
+
+const GitHubRequesterSchema = z.object({
+  id: z.number(),
+  login: z.string(),
+});
+
+const GitHubInstallationSchema = z.object({
+  id: z.number(),
+  account: GitHubAccountSchema,
+  repository_selection: z.string(),
+  permissions: z.record(z.string(), z.unknown()),
+  events: z.array(z.string()).optional(),
+  created_at: z.string(),
+});
+
+export const GitHubSenderSchema = z.object({
+  login: z.string(),
+});
+
+export const GitHubAppAuthorizationRevokedPayloadSchema = z.object({
+  action: z.literal('revoked'),
+  sender: z.object({
+    id: z.number(),
+    login: z.string(),
+  }),
+});
+
+// installation.created webhook payload
+export const InstallationCreatedPayloadSchema = z.object({
+  action: z.literal('created'),
+  installation: GitHubInstallationSchema,
+  requester: GitHubRequesterSchema.nullable().optional(),
+  sender: GitHubSenderSchema.optional(),
+});
+
+// installation.deleted webhook payload
+export const InstallationDeletedPayloadSchema = z.object({
+  action: z.literal('deleted'),
+  installation: z.object({
+    id: z.number(),
+  }),
+  sender: GitHubSenderSchema.optional(),
+});
+
+// installation.suspend webhook payload
+export const InstallationSuspendPayloadSchema = z.object({
+  action: z.literal('suspend'),
+  installation: z.object({
+    id: z.number(),
+  }),
+  sender: GitHubSenderSchema.optional(),
+});
+
+// installation.unsuspend webhook payload
+export const InstallationUnsuspendPayloadSchema = z.object({
+  action: z.literal('unsuspend'),
+  installation: z.object({
+    id: z.number(),
+  }),
+  sender: GitHubSenderSchema.optional(),
+});
+
+// installation_target.renamed webhook payload
+export const InstallationTargetRenamedPayloadSchema = z.object({
+  action: z.literal('renamed'),
+  installation: z.object({
+    id: z.number(),
+  }),
+  account: z.object({}).passthrough(),
+  changes: z.object({}).passthrough(),
+  target_type: z.string(),
+});
+
+// installation_repositories webhook payload
+export const InstallationRepositoriesPayloadSchema = z.object({
+  action: z.enum(['added', 'removed']),
+  installation: z.object({
+    id: z.number(),
+  }),
+  repositories_added: z
+    .array(
+      z.object({
+        id: z.number(),
+        name: z.string(),
+        full_name: z.string(),
+        private: z.boolean(),
+      })
+    )
+    .optional(),
+  repositories_removed: z
+    .array(
+      z.object({
+        id: z.number(),
+        name: z.string(),
+        full_name: z.string(),
+        private: z.boolean(),
+      })
+    )
+    .optional(),
+});
+
+// push webhook payload
+export const PushEventPayloadSchema = z.object({
+  ref: z.string(),
+  repository: z.object({
+    full_name: z.string(),
+  }),
+  deleted: z.boolean(),
+});
+
+// pull_request webhook payload
+export const GitHubRepositorySchema = z.object({
+  id: z.number(),
+  name: z.string(),
+  full_name: z.string(),
+  private: z.boolean().optional(),
+  owner: z.object({
+    login: z.string(),
+  }),
+});
+
+export const PullRequestPayloadSchema = z.object({
+  action: z.string(),
+  pull_request: z.object({
+    number: z.number(),
+    title: z.string(),
+    body: z.string().nullable().optional(),
+    state: z.string(),
+    draft: z.boolean().optional(),
+    merged: z.boolean().nullable().optional(),
+    html_url: z.string().optional(),
+    user: z.object({
+      id: z.number(),
+      login: z.string(),
+      avatar_url: z.string(),
+    }),
+    head: z.object({
+      sha: z.string(),
+      ref: z.string(),
+      repo: z
+        .object({
+          full_name: z.string(),
+          clone_url: z.string().optional(),
+          html_url: z.string().optional(),
+        })
+        .nullable()
+        .optional(),
+    }),
+    base: z.object({
+      sha: z.string(),
+      ref: z.string(),
+    }),
+  }),
+  repository: GitHubRepositorySchema,
+  installation: z.object({
+    id: z.number(),
+  }),
+  sender: GitHubSenderSchema.optional(),
+});
+
+// issues webhook payload
+export const IssuePayloadSchema = z.object({
+  action: z.string(),
+  issue: z.object({
+    number: z.number(),
+    html_url: z.string(),
+    title: z.string(),
+    body: z.string().nullable().optional(),
+    user: z.object({
+      login: z.string(),
+      type: z.string().optional(),
+    }),
+    labels: z
+      .array(
+        z.union([
+          z.string(),
+          z.object({
+            name: z.string(),
+          }),
+        ])
+      )
+      .optional(),
+  }),
+  // Label field is present for "labeled" and "unlabeled" actions
+  label: z
+    .object({
+      name: z.string(),
+      color: z.string().optional(),
+    })
+    .optional(),
+  repository: GitHubRepositorySchema,
+  installation: z.object({
+    id: z.number(),
+  }),
+  sender: z.object({
+    login: z.string(),
+    type: z.string().optional(),
+  }),
+});
+
+// GitHub author_association values from webhook payloads
+export const GitHubAuthorAssociationSchema = z.enum([
+  'COLLABORATOR',
+  'CONTRIBUTOR',
+  'FIRST_TIMER',
+  'FIRST_TIME_CONTRIBUTOR',
+  'MANNEQUIN',
+  'MEMBER',
+  'NONE',
+  'OWNER',
+]);
+
+// pull_request_review_comment webhook payload
+export const PullRequestReviewCommentPayloadSchema = z.object({
+  action: z.string(),
+  comment: z.object({
+    id: z.number().int(),
+    body: z.string(),
+    user: z.object({
+      login: z.string(),
+    }),
+    html_url: z.string(),
+    path: z.string(),
+    line: z.number().nullable().optional(),
+    diff_hunk: z.string(),
+    author_association: GitHubAuthorAssociationSchema,
+  }),
+  pull_request: z.object({
+    number: z.number(),
+    title: z.string(),
+    html_url: z.string().optional(),
+    user: z.object({
+      login: z.string(),
+    }),
+    head: z.object({
+      sha: z.string(),
+      ref: z.string(),
+    }),
+    base: z.object({
+      ref: z.string(),
+    }),
+  }),
+  repository: GitHubRepositorySchema,
+  installation: z.object({
+    id: z.number(),
+  }),
+  sender: GitHubSenderSchema.optional(),
+});
+
+// pull_request_review webhook payload
+export const PullRequestReviewPayloadSchema = z.object({
+  action: z.enum(['submitted', 'edited', 'dismissed']),
+  review: z.object({
+    id: z.number(),
+    state: z.enum(['approved', 'changes_requested', 'commented', 'dismissed']),
+    user: z.object({ login: z.string() }).nullish(),
+  }),
+  pull_request: z.object({
+    number: z.number(),
+    state: z.enum(['open', 'closed']),
+    merged: z.boolean().optional(),
+    html_url: z.string(),
+    title: z.string(),
+    head: z.object({
+      sha: z.string(),
+      ref: z.string(),
+      repo: z
+        .object({
+          full_name: z.string(),
+          clone_url: z.string(),
+          html_url: z.string(),
+        })
+        .nullable(),
+    }),
+  }),
+  repository: z.object({
+    id: z.number(),
+    name: z.string(),
+    full_name: z.string(),
+    owner: z.object({ login: z.string() }),
+  }),
+  installation: z.object({ id: z.number() }),
+});
+
+// Type exports for use in the webhook handler
+export type GitHubAppAuthorizationRevokedPayload = z.infer<
+  typeof GitHubAppAuthorizationRevokedPayloadSchema
+>;
+export type InstallationCreatedPayload = z.infer<typeof InstallationCreatedPayloadSchema>;
+export type InstallationDeletedPayload = z.infer<typeof InstallationDeletedPayloadSchema>;
+export type InstallationSuspendPayload = z.infer<typeof InstallationSuspendPayloadSchema>;
+export type InstallationUnsuspendPayload = z.infer<typeof InstallationUnsuspendPayloadSchema>;
+export type InstallationTargetRenamedPayload = z.infer<
+  typeof InstallationTargetRenamedPayloadSchema
+>;
+export type InstallationRepositoriesPayload = z.infer<typeof InstallationRepositoriesPayloadSchema>;
+export type PushEventPayload = z.infer<typeof PushEventPayloadSchema>;
+export type PullRequestPayload = z.infer<typeof PullRequestPayloadSchema>;
+export type IssuePayload = z.infer<typeof IssuePayloadSchema>;
+export type PullRequestReviewCommentPayload = z.infer<typeof PullRequestReviewCommentPayloadSchema>;
+export type PullRequestReviewPayload = z.infer<typeof PullRequestReviewPayloadSchema>;
+export type GitHubAuthorAssociation = z.infer<typeof GitHubAuthorAssociationSchema>;

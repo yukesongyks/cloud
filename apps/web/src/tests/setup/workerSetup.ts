@@ -1,0 +1,82 @@
+import { getEnvVariable } from '@/lib/dotenvx';
+import 'tsconfig-paths/register';
+
+import { cleanupDbForTest, closeAllDrizzleConnections, Pool, Client } from '@/lib/drizzle';
+import { LEGACY_KILOCLAW_PRICE_VERSION } from '@kilocode/db';
+import { kiloclaw_subscriptions } from '@kilocode/db/schema';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { migrate } from 'drizzle-orm/node-postgres/migrator';
+import { provisionExaUsageLogPartitions } from '@/lib/exa-usage-partitions';
+import { existsSync, writeFileSync, mkdirSync } from 'fs';
+import { join } from 'path';
+import { shutdownPosthog } from '@/lib/posthog';
+
+// Use a file-system flag to ensure this setup runs only once per worker across all test files
+const getSetupFlagPath = (workerId: string) =>
+  join(process.cwd(), '.tmp', `jest-worker-${workerId}-setup.flag`);
+
+const isSetupCompleted = (workerId: string) => existsSync(getSetupFlagPath(workerId));
+const markSetupCompleted = (workerId: string) => {
+  const flagPath = getSetupFlagPath(workerId);
+  mkdirSync(join(process.cwd(), '.tmp'), { recursive: true });
+  writeFileSync(flagPath, 'completed');
+};
+
+// Existing tests use direct Drizzle inserts as fixtures. Default those fixtures to
+// legacy pricing while keeping the database column default-free, so raw SQL and
+// production writers still fail unless they set the price version explicitly.
+(kiloclaw_subscriptions.kiloclaw_price_version as { defaultFn: () => string }).defaultFn = () =>
+  LEGACY_KILOCLAW_PRICE_VERSION;
+
+beforeAll(async () => {
+  const workerId = getEnvVariable('JEST_WORKER_ID');
+  if (!workerId) throw new Error('JEST_WORKER_ID environment variable is not set.');
+  if (isSetupCompleted(workerId)) return;
+  const originalUrl = getEnvVariable('POSTGRES_URL') ?? '';
+  const url = new URL(originalUrl);
+  const targetDbName = url.pathname.slice(1); // Remove leading slash
+  const dbName = `${targetDbName}-${workerId}`;
+  const testDbUrl = originalUrl.replace(/\/[^/]+$/, `/${dbName}`);
+
+  const client = new Client({
+    connectionString: originalUrl.replace('sslmode=require&', ''),
+  });
+  await client.connect();
+  await client.query(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`);
+  await client.query(`CREATE DATABASE "${dbName}"`);
+  await client.end();
+
+  const testPool = new Pool({
+    connectionString: testDbUrl.replace('sslmode=require&', ''),
+  });
+  try {
+    const testDb = drizzle(testPool);
+    await migrate(testDb, { migrationsFolder: '../../packages/db/src/migrations' });
+
+    // Production keeps this rolling window current via cron. Each Jest worker
+    // starts from the static migration snapshot, so it needs the same window
+    // before tests insert rows whose created_at defaults to now().
+    const { errors: partitionErrors } = await provisionExaUsageLogPartitions(testDb);
+    if (partitionErrors.length > 0) {
+      const [{ name, error }] = partitionErrors;
+      throw new Error(
+        `Failed to create Exa usage log partition ${name}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  } finally {
+    await testPool.end();
+  }
+
+  // IMPORTANT: Update the environment variable for the current worker process.
+  // We set it to the base URL (without worker ID) so that drizzle.ts can add the worker ID suffix
+  process.env.POSTGRES_URL = originalUrl;
+
+  markSetupCompleted(workerId);
+}, 60000);
+
+afterAll(async () => {
+  const posthogPromise = shutdownPosthog();
+  await cleanupDbForTest();
+  await closeAllDrizzleConnections();
+  await posthogPromise;
+}, 10000);

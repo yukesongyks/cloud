@@ -1,0 +1,343 @@
+/**
+ * KiloClawApp Durable Object
+ *
+ * Manages owner-scoped bootstrap state shared across KiloClaw providers.
+ *
+ * Today that includes:
+ * - Fly App lifecycle for Fly-backed runtimes
+ * - the env encryption key used to encrypt sensitive controller env vars
+ *
+ * The env key is provider-neutral durable state. Fly secret propagation is
+ * best-effort provider-specific bootstrap layered on top when a Fly app exists.
+ * Keyed by userId: env.KILOCLAW_APP.idFromName(userId) — one per user.
+ *
+ * Separate from KiloClawInstance to support future multi-instance per user,
+ * where one Fly App contains multiple instances (machines + volumes).
+ *
+ * ensureApp() remains Fly-specific and idempotent: safe to call multiple times,
+ * only creates the Fly app + IPs + synced env key on first call.
+ *
+ * If setup partially fails, the alarm retries.
+ */
+
+import { DurableObject } from 'cloudflare:workers';
+import { z } from 'zod';
+import type { KiloClawEnv } from '../types';
+import * as apps from '../fly/apps';
+import { setAppSecret } from '../fly/secrets';
+import { generateEnvKey } from '../utils/env-encryption';
+import { METADATA_KEY_USER_ID } from './machine-config';
+
+/** UUID v4 pattern — used to detect instance-keyed ownerKeys. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// -- Persisted state schema --
+
+const AppStateSchema = z.object({
+  userId: z.string().default(''),
+  flyAppName: z.string().nullable().default(null),
+  ipv4Allocated: z.boolean().default(false),
+  ipv6Allocated: z.boolean().default(false),
+  envKeySet: z.boolean().default(false),
+  envKey: z.string().nullable().default(null),
+});
+
+type AppState = z.infer<typeof AppStateSchema>;
+
+const STORAGE_KEYS = Object.keys(AppStateSchema.shape);
+
+/** How often to retry incomplete setup (IP allocation / env key failures). */
+const RETRY_ALARM_MS = 60 * 1000; // 1 min
+
+/** Name of the Fly app secret that holds the AES encryption key. */
+const ENV_KEY_SECRET_NAME = 'KILOCLAW_ENV_KEY';
+
+// -- DO --
+
+export class KiloClawApp extends DurableObject<KiloClawEnv> {
+  private loaded = false;
+  private userId: string | null = null;
+  private flyAppName: string | null = null;
+  private ipv4Allocated = false;
+  private ipv6Allocated = false;
+  private envKeySet = false;
+  private envKey: string | null = null;
+
+  private async loadState(): Promise<void> {
+    if (this.loaded) return;
+
+    const entries = await this.ctx.storage.get(STORAGE_KEYS);
+    const raw = Object.fromEntries(entries.entries());
+    const parsed = AppStateSchema.safeParse(raw);
+
+    if (parsed.success) {
+      const s = parsed.data;
+      this.userId = s.userId || null;
+      this.flyAppName = s.flyAppName;
+      this.ipv4Allocated = s.ipv4Allocated;
+      this.ipv6Allocated = s.ipv6Allocated;
+      this.envKeySet = s.envKeySet;
+      this.envKey = s.envKey;
+    }
+
+    this.loaded = true;
+  }
+
+  /** Check if Fly app setup is complete. */
+  private isSetupComplete(): boolean {
+    return this.ipv4Allocated && this.ipv6Allocated && this.envKeySet;
+  }
+
+  /**
+   * Ensure a Fly App exists for this owner with IPs allocated and env key set.
+   * Idempotent: creates the app only if it doesn't exist yet.
+   * Returns the app name for callers to cache.
+   *
+   * @param ownerKey - Either a userId (personal) or `"org:{orgId}"` (org).
+   *   Org keys derive an `oapp-{hash}` app name instead of `acct-{hash}`.
+   */
+  async ensureApp(ownerKey: string): Promise<{ appName: string }> {
+    await this.loadState();
+
+    if (this.userId && this.userId !== ownerKey) {
+      throw new Error(`ownerKey mismatch: DO has ${this.userId}, caller passed ${ownerKey}`);
+    }
+
+    const apiToken = this.env.FLY_API_TOKEN;
+    if (!apiToken) throw new Error('FLY_API_TOKEN is not configured');
+    const orgSlug = this.env.FLY_ORG_SLUG;
+    if (!orgSlug) throw new Error('FLY_ORG_SLUG is not configured');
+
+    // Derive app name based on ownerKey type:
+    // - UUID (instanceId) → inst-{hash} (per-instance app)
+    // - userId string → acct-{hash} (legacy per-user app)
+    const prefix = this.env.WORKER_ENV === 'development' ? 'dev' : undefined;
+    const isInstanceKeyed = UUID_RE.test(ownerKey);
+    const appName = this.flyAppName
+      ? this.flyAppName
+      : isInstanceKeyed
+        ? await apps.appNameFromInstanceId(ownerKey, prefix)
+        : await apps.appNameFromUserId(ownerKey, prefix);
+
+    // Persist ownerKey + appName early so we can retry on partial failure.
+    // The `userId` storage field stores the ownerKey (historical name).
+    if (!this.userId || !this.flyAppName) {
+      this.userId = ownerKey;
+      this.flyAppName = appName;
+      await this.ctx.storage.put({
+        userId: ownerKey,
+        flyAppName: appName,
+      } satisfies Partial<AppState>);
+    }
+
+    try {
+      // Step 1: Create app if it doesn't exist
+      if (!this.ipv4Allocated || !this.ipv6Allocated) {
+        const existing = await apps.getApp({ apiToken }, appName);
+        if (!existing) {
+          await apps.createApp({ apiToken }, appName, orgSlug, ownerKey, METADATA_KEY_USER_ID);
+          console.log('[AppDO] Created Fly App:', appName, 'owner:', ownerKey);
+        }
+      }
+
+      // Step 2: Allocate IPv6 if not done
+      if (!this.ipv6Allocated) {
+        await apps.allocateIP(apiToken, appName, 'v6');
+        this.ipv6Allocated = true;
+        await this.ctx.storage.put({ ipv6Allocated: true } satisfies Partial<AppState>);
+        console.log('[AppDO] Allocated IPv6 for:', appName);
+      }
+
+      // Step 3: Allocate shared IPv4 if not done
+      if (!this.ipv4Allocated) {
+        await apps.allocateIP(apiToken, appName, 'shared_v4');
+        this.ipv4Allocated = true;
+        await this.ctx.storage.put({ ipv4Allocated: true } satisfies Partial<AppState>);
+        console.log('[AppDO] Allocated shared IPv4 for:', appName);
+      }
+
+      // Step 4: Generate and store env encryption key if not done.
+      // Uses the same locked path as ensureEnvKey() to prevent interleaving.
+      if (!this.envKeySet) {
+        await this.ensureEnvKey(ownerKey);
+      }
+    } catch (err) {
+      // Partial state persisted above — arm a retry alarm so the DO self-heals
+      // even if the caller doesn't retry.
+      if (!this.isSetupComplete()) {
+        await this.ctx.storage.setAlarm(Date.now() + RETRY_ALARM_MS);
+        console.error('[AppDO] Partial failure, retry alarm armed for:', appName, err);
+      }
+      throw err;
+    }
+
+    return { appName };
+  }
+
+  /**
+   * Get the env encryption key for this owner's app.
+   * Enforces ownerKey match to prevent cross-owner key fetches.
+   * Returns null if key hasn't been set yet.
+   */
+  async getEnvKey(ownerKey: string): Promise<string | null> {
+    await this.loadState();
+
+    if (this.userId && this.userId !== ownerKey) {
+      throw new Error(`ownerKey mismatch: DO has ${this.userId}, caller passed ${ownerKey}`);
+    }
+
+    return this.envKey;
+  }
+
+  /**
+   * Ensure the env encryption key exists, creating it if needed.
+   *
+   * The key itself is provider-neutral durable state and may exist even when
+   * no Fly app has been created yet. When a Fly app exists, this method also
+   * re-sets the Fly secret (idempotent) to self-heal if it was deleted.
+   *
+   * Interleaving safety: the key is generated and persisted to in-memory state
+   * + durable storage before the optional setAppSecret() fetch. Any interleaved call
+   * entering during the await will see this.envKey already set and reuse it,
+   * so no two calls can generate different keys.
+   *
+   * Called by Instance DO at machine start time. This ensures every provider can
+   * bootstrap encrypted env vars, while legacy Fly apps still get their Fly secret
+   * synced on first start.
+   *
+   * @param ownerKey - The App DO owner key (userId or instanceId).
+   * @param flyAppName - Optional Fly app name from the Instance DO. If the App DO
+   *   doesn't have a flyAppName yet (e.g., instance provisioned before per-instance
+   *   Fly apps existed), it adopts this value so it can sync the env key to the
+   *   correct Fly app secret store.
+   */
+  async ensureEnvKey(
+    ownerKey: string,
+    flyAppName?: string
+  ): Promise<{ key: string; secretsVersion: number }> {
+    await this.loadState();
+
+    if (this.userId && this.userId !== ownerKey) {
+      throw new Error(`ownerKey mismatch: DO has ${this.userId}, caller passed ${ownerKey}`);
+    }
+
+    if (!this.userId) {
+      this.userId = ownerKey;
+      await this.ctx.storage.put({ userId: ownerKey } satisfies Partial<AppState>);
+    }
+
+    // Adopt flyAppName from the Instance DO if we don't have one yet.
+    // This self-heals instances provisioned before per-instance Fly apps existed,
+    // where the App DO was created by ensureEnvKey (not ensureApp) and never
+    // learned the Fly app name.
+    if (!this.flyAppName && flyAppName) {
+      this.flyAppName = flyAppName;
+      await this.ctx.storage.put({ flyAppName } satisfies Partial<AppState>);
+      console.log('[AppDO] Adopted flyAppName from Instance DO:', flyAppName);
+    }
+
+    // Persist key before any async I/O so interleaved calls reuse the same key.
+    // envKeySet: false means "key generated but not yet confirmed in a provider secret store."
+    if (!this.envKey) {
+      this.envKey = generateEnvKey();
+      await this.ctx.storage.put({
+        envKey: this.envKey,
+        envKeySet: false,
+      } satisfies Partial<AppState>);
+    }
+
+    if (!this.envKeySet) {
+      this.envKeySet = true;
+      await this.ctx.storage.put({ envKeySet: true } satisfies Partial<AppState>);
+      console.log(
+        '[AppDO] Persisted env encryption key for:',
+        this.flyAppName ?? `owner ${ownerKey}`
+      );
+    }
+
+    if (!this.flyAppName) {
+      return { key: this.envKey, secretsVersion: 0 };
+    }
+
+    const apiToken = this.env.FLY_API_TOKEN;
+    if (!apiToken) throw new Error('FLY_API_TOKEN is not configured');
+
+    // Always re-set the Fly secret (idempotent) to self-heal if deleted externally.
+    // Returns the secrets version for use with min_secrets_version on Fly machine create/update.
+    const { version: secretsVersion } = await setAppSecret(
+      { apiToken, appName: this.flyAppName },
+      ENV_KEY_SECRET_NAME,
+      this.envKey
+    );
+
+    return { key: this.envKey, secretsVersion };
+  }
+
+  /**
+   * Get the stored app name, or null if not yet created.
+   */
+  async getAppName(): Promise<string | null> {
+    await this.loadState();
+    return this.flyAppName;
+  }
+
+  /**
+   * Return diagnostic info for the admin debug UI.
+   */
+  async getDiagnostics(): Promise<{
+    flyAppName: string | null;
+    envKeySet: boolean;
+  }> {
+    await this.loadState();
+    return {
+      flyAppName: this.flyAppName,
+      envKeySet: this.envKeySet,
+    };
+  }
+
+  /**
+   * Delete the Fly App entirely.
+   * For future use (e.g. account deletion). Not called on instance destroy.
+   */
+  async destroyApp(): Promise<void> {
+    await this.loadState();
+
+    if (!this.flyAppName) return;
+
+    const apiToken = this.env.FLY_API_TOKEN;
+    if (!apiToken) throw new Error('FLY_API_TOKEN is not configured');
+
+    await apps.deleteApp({ apiToken }, this.flyAppName);
+    console.log('[AppDO] Deleted Fly App:', this.flyAppName);
+
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+
+    this.userId = null;
+    this.flyAppName = null;
+    this.ipv4Allocated = false;
+    this.ipv6Allocated = false;
+    this.envKeySet = false;
+    this.envKey = null;
+    this.loaded = false;
+  }
+
+  /**
+   * Alarm: retry incomplete setup (IP allocation + env key).
+   */
+  override async alarm(): Promise<void> {
+    await this.loadState();
+
+    if (!this.userId || !this.flyAppName) return;
+    if (this.isSetupComplete()) return;
+
+    console.log('[AppDO] Retrying incomplete setup for:', this.flyAppName);
+
+    try {
+      await this.ensureApp(this.userId);
+    } catch (err) {
+      console.error('[AppDO] Retry failed, rescheduling:', err);
+      await this.ctx.storage.setAlarm(Date.now() + RETRY_ALARM_MS);
+    }
+  }
+}

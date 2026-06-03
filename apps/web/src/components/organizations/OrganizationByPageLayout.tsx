@@ -1,0 +1,46 @@
+'use server';
+import { getAuthorizedOrgContext } from '@/lib/organizations/organization-auth';
+import { signInUrlWithCallbackPath } from '@/lib/user/server';
+import type { OrganizationRole } from '@/lib/organizations/organization-types';
+import type { Organization } from '@kilocode/db/schema';
+import { redirect } from 'next/navigation';
+import type { JSX } from 'react';
+import { OrganizationTrialWrapper } from './OrganizationTrialWrapper';
+
+export async function OrganizationByPageLayout({
+  params,
+  render,
+  fullBleed = false,
+  roles,
+}: {
+  params: Promise<{ id: string }>;
+  render: ({
+    role,
+    organization,
+    isGlobalAdmin,
+  }: {
+    role: OrganizationRole;
+    organization: Organization;
+    isGlobalAdmin: boolean;
+  }) => JSX.Element;
+  roles?: OrganizationRole[];
+  /** When true, skip the PageContainer wrapper (used by gastown fullscreen pages). */
+  fullBleed?: boolean;
+}) {
+  const { id } = await params;
+  const organizationId = decodeURIComponent(id);
+  const result = await getAuthorizedOrgContext(organizationId, roles);
+  if (!result.success) {
+    if (result.nextResponse.status === 401) {
+      redirect(await signInUrlWithCallbackPath());
+    }
+    redirect('/profile');
+  }
+  const { user, organization } = result.data;
+  const role = user.is_admin ? 'owner' : user.role;
+  return (
+    <OrganizationTrialWrapper organizationId={organization.id} fullBleed={fullBleed}>
+      {render({ role, organization, isGlobalAdmin: user.is_admin })}
+    </OrganizationTrialWrapper>
+  );
+}

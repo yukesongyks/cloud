@@ -1,0 +1,1264 @@
+import { Octokit } from '@octokit/rest';
+import { createAppAuth } from '@octokit/auth-app';
+import { exchangeWebFlowCode } from '@octokit/oauth-methods';
+import { logExceptInTest, warnExceptInTest } from '@/lib/utils.server';
+
+import crypto from 'crypto';
+import type { InstallationToken } from '@/lib/integrations/core/types';
+import { type GitHubAppType, getGitHubAppCredentials } from './app-selector';
+
+export type { GitHubAppType } from './app-selector';
+
+/**
+ * Verifies GitHub webhook signature
+ * @param appType - The type of GitHub App to verify against (defaults to 'standard')
+ */
+export function verifyGitHubWebhookSignature(
+  payload: string,
+  signature: string,
+  appType: GitHubAppType = 'standard'
+): boolean {
+  const credentials = getGitHubAppCredentials(appType);
+  const hmac = crypto.createHmac('sha256', credentials.webhookSecret);
+  const digest = 'sha256=' + hmac.update(payload).digest('hex');
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(digest));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Generates GitHub App installation token
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+export async function generateGitHubInstallationToken(
+  installationId: string,
+  appType: GitHubAppType = 'standard'
+): Promise<InstallationToken> {
+  const credentials = getGitHubAppCredentials(appType);
+
+  if (!credentials.appId || !credentials.privateKey) {
+    throw new Error(`GitHub ${appType} App credentials not configured`);
+  }
+
+  const auth = createAppAuth({
+    appId: credentials.appId,
+    privateKey: credentials.privateKey,
+    installationId,
+  });
+
+  const authResult = await auth({ type: 'installation' });
+
+  return {
+    token: authResult.token,
+    expires_at: authResult.expiresAt,
+  };
+}
+
+/**
+ * Deletes a GitHub App installation
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+export async function deleteGitHubInstallation(
+  installationId: string,
+  appType: GitHubAppType = 'standard'
+): Promise<void> {
+  const credentials = getGitHubAppCredentials(appType);
+
+  if (!credentials.appId || !credentials.privateKey) {
+    throw new Error(`GitHub ${appType} App credentials not configured`);
+  }
+
+  // Create app-level authentication (not installation-level)
+  const auth = createAppAuth({
+    appId: credentials.appId,
+    privateKey: credentials.privateKey,
+  });
+
+  const { token } = await auth({ type: 'app' });
+  const octokit = new Octokit({ auth: token });
+
+  // Delete the installation
+  await octokit.apps.deleteInstallation({
+    installation_id: parseInt(installationId),
+  });
+}
+
+type GitHubRepository = {
+  id: number;
+  name: string;
+  full_name: string;
+  private: boolean;
+  created_at: string;
+};
+
+type GitHubBranch = {
+  name: string;
+  isDefault: boolean;
+};
+
+/**
+ * Fetches all repositories accessible by a GitHub App installation
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+export async function fetchGitHubRepositories(
+  installationId: string,
+  appType: GitHubAppType = 'standard'
+): Promise<GitHubRepository[]> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  // Fetch all repositories accessible by the installation using pagination
+  const repositories: GitHubRepository[] = [];
+  let page = 1;
+  const perPage = 100;
+
+  while (true) {
+    const { data } = await octokit.apps.listReposAccessibleToInstallation({
+      per_page: 100,
+      page,
+    });
+
+    // Filter out archived repositories
+    repositories.push(
+      ...data.repositories
+        .filter(repo => !repo.archived)
+        .map(repo => ({
+          id: repo.id,
+          name: repo.name,
+          full_name: repo.full_name,
+          private: repo.private,
+          created_at: repo.created_at ?? new Date().toISOString(),
+        }))
+    );
+
+    if (data.repositories.length < perPage) break;
+    page++;
+  }
+
+  return repositories;
+}
+
+/**
+ * Fetches all branches for a GitHub repository
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+export async function fetchGitHubBranches(
+  installationId: string,
+  repositoryFullName: string,
+  appType: GitHubAppType = 'standard'
+): Promise<GitHubBranch[]> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  const [owner, repo] = repositoryFullName.split('/');
+
+  // Fetch the repository to get the default branch
+  const { data: repoData } = await octokit.repos.get({
+    owner,
+    repo,
+  });
+  const defaultBranch = repoData.default_branch;
+
+  // Fetch all branches using pagination
+  const branches: GitHubBranch[] = [];
+  let page = 1;
+  const perPage = 100;
+
+  while (true) {
+    const { data } = await octokit.repos.listBranches({
+      owner,
+      repo,
+      per_page: perPage,
+      page,
+    });
+
+    branches.push(
+      ...data.map(branch => ({
+        name: branch.name,
+        isDefault: branch.name === defaultBranch,
+      }))
+    );
+
+    if (data.length < perPage) break;
+    page++;
+  }
+
+  return branches;
+}
+
+/*
+ * Fetches GitHub App installation details including permissions
+ * Uses app-level authentication to get installation info
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+export async function fetchGitHubInstallationDetails(
+  installationId: string,
+  appType: GitHubAppType = 'standard'
+): Promise<{
+  id: number;
+  account: {
+    id: number;
+    login: string;
+    type: string;
+  };
+  repository_selection: string;
+  permissions: Record<string, string>;
+  events: string[];
+  created_at: string;
+}> {
+  const credentials = getGitHubAppCredentials(appType);
+
+  if (!credentials.appId || !credentials.privateKey) {
+    throw new Error(`GitHub ${appType} App credentials not configured`);
+  }
+
+  // Create app-level authentication (not installation-level)
+  const auth = createAppAuth({
+    appId: credentials.appId,
+    privateKey: credentials.privateKey,
+  });
+
+  const { token } = await auth({ type: 'app' });
+  const octokit = new Octokit({ auth: token });
+
+  const { data } = await octokit.apps.getInstallation({
+    installation_id: parseInt(installationId),
+  });
+
+  return {
+    id: data.id,
+    account: {
+      id: data.account?.id ?? 0,
+      login: (data.account as { login?: string })?.login ?? '',
+      type: (data.account as { type?: string })?.type ?? 'User',
+    },
+    repository_selection: data.repository_selection ?? 'all',
+    permissions: data.permissions as Record<string, string>,
+    events: data.events ?? [],
+    created_at: data.created_at,
+  };
+}
+
+/**
+ * Adds a reaction to a PR (or issue)
+ * Used to show that Kilo is reviewing a PR (e.g., 👀 eyes reaction)
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+export async function addReactionToPR(
+  installationId: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  reaction: 'eyes' | '+1' | '-1' | 'laugh' | 'confused' | 'heart' | 'hooray' | 'rocket',
+  appType: GitHubAppType = 'standard'
+): Promise<void> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  await octokit.reactions.createForIssue({
+    owner,
+    repo,
+    issue_number: prNumber,
+    content: reaction,
+  });
+}
+
+/**
+ * Creates a new top-level comment on a PR (issue comment).
+ */
+export async function createPRComment(
+  installationId: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  body: string,
+  appType: GitHubAppType = 'standard'
+): Promise<void> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  await octokit.issues.createComment({
+    owner,
+    repo,
+    issue_number: prNumber,
+    body,
+  });
+
+  logExceptInTest('[createPRComment] Created comment', { owner, repo, prNumber });
+}
+
+/**
+ * Checks whether a comment containing the given marker already exists on a PR.
+ */
+export async function hasPRCommentWithMarker(
+  installationId: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  marker: string,
+  appType: GitHubAppType = 'standard'
+): Promise<boolean> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  const comments = await octokit.paginate(octokit.issues.listComments, {
+    owner,
+    repo,
+    issue_number: prNumber,
+    per_page: 100,
+  });
+
+  return comments.some(c => c.body?.includes(marker));
+}
+
+/**
+ * Adds a reaction to a PR review comment
+ * Used to acknowledge @kilo fix mentions on inline review comments
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+export async function addReactionToPRReviewComment(
+  installationId: string,
+  owner: string,
+  repo: string,
+  commentId: number,
+  reaction: 'eyes' | '+1' | '-1' | 'laugh' | 'confused' | 'heart' | 'hooray' | 'rocket',
+  appType: GitHubAppType = 'standard'
+): Promise<void> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  await octokit.reactions.createForPullRequestReviewComment({
+    owner,
+    repo,
+    comment_id: commentId,
+    content: reaction,
+  });
+}
+
+/**
+ * Checks the collaborator permission level for a user on a repository.
+ * Returns the permission string ('admin' | 'write' | 'read' | 'none') or null
+ * if the lookup fails (e.g. the App lacks permission to query collaborators).
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+type CollaboratorPermission = 'admin' | 'write' | 'read' | 'none';
+
+const KNOWN_PERMISSIONS = new Set<string>(['admin', 'write', 'read', 'none']);
+
+export async function getCollaboratorPermissionLevel(
+  installationId: string,
+  owner: string,
+  repo: string,
+  username: string,
+  appType: GitHubAppType = 'standard'
+): Promise<CollaboratorPermission | null> {
+  try {
+    const tokenData = await generateGitHubInstallationToken(installationId, appType);
+    const octokit = new Octokit({ auth: tokenData.token });
+
+    const { data } = await octokit.repos.getCollaboratorPermissionLevel({
+      owner,
+      repo,
+      username,
+    });
+
+    if (KNOWN_PERMISSIONS.has(data.permission)) {
+      // Safe: value validated against the known set above
+      return data.permission as CollaboratorPermission;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Replies to a PR review comment thread
+ * Used by auto-fix to post completion/failure replies on review threads
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+export async function replyToReviewComment(
+  installationId: string,
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  commentId: number,
+  body: string,
+  appType: GitHubAppType = 'standard'
+): Promise<void> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  await octokit.pulls.createReplyForReviewComment({
+    owner,
+    repo,
+    pull_number: pullNumber,
+    comment_id: commentId,
+    body,
+  });
+}
+
+/**
+ * Exchange GitHub OAuth code for user information
+ * Used during installation request flow to identify the GitHub user
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+export async function exchangeGitHubOAuthCode(
+  code: string,
+  appType: GitHubAppType = 'standard'
+): Promise<{
+  id: string;
+  login: string;
+}> {
+  const credentials = getGitHubAppCredentials(appType);
+
+  if (!credentials.clientId || !credentials.clientSecret) {
+    throw new Error(`Missing GitHub ${appType} App credentials`);
+  }
+
+  const { authentication } = await exchangeWebFlowCode({
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    clientType: 'github-app',
+    code,
+  });
+
+  if (!authentication.token) {
+    throw new Error(`Token exchange failed`);
+  }
+
+  const accessToken = authentication.token;
+
+  const octokit = new Octokit({
+    auth: accessToken,
+  });
+
+  const { data: githubUser } = await octokit.rest.users.getAuthenticated();
+
+  return {
+    id: githubUser.id.toString(),
+    login: githubUser.login,
+  };
+}
+
+const KILO_REVIEW_COMMENTS_PER_PAGE = 100;
+const MAX_KILO_REVIEW_COMMENT_PAGES = 5;
+
+/**
+ * Finds an existing Kilo review comment on a PR
+ * Looks for the <!-- kilo-review --> marker in issue comments
+ * Falls back to detecting older Kilo comments by patterns if no marker found
+ * Returns the most recent comment ID and body if found, null otherwise
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+export async function findKiloReviewComment(
+  installationId: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  appType: GitHubAppType = 'standard'
+): Promise<{ commentId: number; body: string } | null> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  const comments: Array<{ id: number; body?: string | null; updated_at: string }> = [];
+  let reachedScanLimit = false;
+
+  for (let page = 1; page <= MAX_KILO_REVIEW_COMMENT_PAGES; page++) {
+    const { data: pageComments } = await octokit.issues.listComments({
+      owner,
+      repo,
+      issue_number: prNumber,
+      per_page: KILO_REVIEW_COMMENTS_PER_PAGE,
+      page,
+    });
+    comments.push(...pageComments);
+
+    if (pageComments.length < KILO_REVIEW_COMMENTS_PER_PAGE) break;
+    reachedScanLimit = page === MAX_KILO_REVIEW_COMMENT_PAGES;
+  }
+
+  logExceptInTest('[findKiloReviewComment] Fetched comments', {
+    owner,
+    repo,
+    prNumber,
+    totalComments: comments.length,
+  });
+
+  // Primary: Look for comments with the kilo-review marker
+  const markedComments = comments.filter(c => c.body?.includes('<!-- kilo-review -->'));
+
+  if (markedComments.length > 0) {
+    // Sort by updated_at descending and pick the latest
+    const latestComment = markedComments.sort((a, b) => {
+      return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+    })[0];
+    logExceptInTest('[findKiloReviewComment] Found comment with marker', {
+      owner,
+      repo,
+      prNumber,
+      commentId: latestComment.id,
+      markedCommentsCount: markedComments.length,
+      detectionMethod: 'marker',
+    });
+    return { commentId: latestComment.id, body: latestComment.body || '' };
+  }
+
+  if (reachedScanLimit) {
+    throw new Error('Kilo review comment lookup exceeded the safe issue-comment scan limit');
+  }
+
+  logExceptInTest('[findKiloReviewComment] No existing Kilo review comment found', {
+    owner,
+    repo,
+    prNumber,
+    totalComments: comments.length,
+  });
+
+  return null;
+}
+
+/**
+ * Updates an existing Kilo review comment on a GitHub PR
+ * Used to append usage footer (model + token count) after review completion
+ */
+export async function updateKiloReviewComment(
+  installationId: string,
+  owner: string,
+  repo: string,
+  commentId: number,
+  body: string,
+  appType: GitHubAppType = 'standard'
+): Promise<void> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  await octokit.issues.updateComment({
+    owner,
+    repo,
+    comment_id: commentId,
+    body,
+  });
+
+  logExceptInTest('[updateKiloReviewComment] Updated comment', {
+    owner,
+    repo,
+    commentId,
+  });
+}
+
+/**
+ * Fetches existing inline review comments on a PR
+ * Used to detect duplicates and track outdated comments
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+export async function fetchPRInlineComments(
+  installationId: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  appType: GitHubAppType = 'standard'
+): Promise<
+  Array<{
+    id: number;
+    path: string;
+    line: number | null;
+    body: string;
+    isOutdated: boolean;
+    user: { login: string };
+  }>
+> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  const comments: Array<{
+    id: number;
+    path: string;
+    line: number | null;
+    body: string;
+    isOutdated: boolean;
+    user: { login: string };
+  }> = [];
+
+  let page = 1;
+  const perPage = 100;
+
+  while (true) {
+    const { data } = await octokit.pulls.listReviewComments({
+      owner,
+      repo,
+      pull_number: prNumber,
+      per_page: perPage,
+      page,
+    });
+
+    comments.push(
+      ...data.map(c => ({
+        id: c.id,
+        path: c.path,
+        line: c.line ?? null,
+        body: c.body,
+        isOutdated: c.position === null, // null position = outdated
+        user: { login: c.user?.login ?? 'unknown' },
+      }))
+    );
+
+    if (data.length < perPage) break;
+    page++;
+  }
+
+  logExceptInTest('[fetchPRInlineComments] Fetched comments', {
+    owner,
+    repo,
+    prNumber,
+    totalComments: comments.length,
+  });
+
+  return comments;
+}
+
+/**
+ * Gets the HEAD commit SHA for a PR
+ * Required for creating inline comments via gh api
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+export async function getPRHeadCommit(
+  installationId: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  appType: GitHubAppType = 'standard'
+): Promise<string> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  const { data: pr } = await octokit.pulls.get({
+    owner,
+    repo,
+    pull_number: prNumber,
+  });
+
+  logExceptInTest('[getPRHeadCommit] Got HEAD commit', {
+    owner,
+    repo,
+    prNumber,
+    headSha: pr.head.sha.substring(0, 8),
+  });
+
+  return pr.head.sha;
+}
+
+type GitHubRepositoryContent = {
+  type?: string;
+  content?: string;
+  encoding?: string;
+};
+
+export function decodeGitHubBase64Content(content: string): string {
+  return Buffer.from(content.replace(/\n/g, ''), 'base64').toString('utf8');
+}
+
+/**
+ * Fetches a root text file from a repository at a specific ref.
+ * Returns null for missing files, directories, or unsupported content responses.
+ */
+export async function fetchGitHubRootTextFileAtRef(params: {
+  token: string;
+  owner: string;
+  repo: string;
+  path: string;
+  ref: string;
+}): Promise<string | null> {
+  const { token, owner, repo, path, ref } = params;
+  const octokit = new Octokit({ auth: token });
+
+  try {
+    const { data } = await octokit.repos.getContent({
+      owner,
+      repo,
+      path,
+      ref,
+    });
+
+    if (Array.isArray(data)) return null;
+
+    const content = data as GitHubRepositoryContent;
+    if (content.type !== 'file' || content.encoding !== 'base64' || !content.content) {
+      return null;
+    }
+
+    return decodeGitHubBase64Content(content.content);
+  } catch (error) {
+    if (isHttpError(error) && error.status === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Type guard to check if an error is an HTTP error from Octokit
+ */
+function isHttpError(error: unknown): error is { status: number; message: string } {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'status' in error &&
+    typeof (error as { status: unknown }).status === 'number'
+  );
+}
+
+export type AssociatedPullRequest = {
+  number: number;
+  htmlUrl: string;
+  state: 'open' | 'closed' | 'merged' | 'draft';
+  title: string;
+  headSha: string;
+  updatedAt: string; // ISO
+};
+
+/**
+ * Thrown when GitHub returns a rate-limit response. The caller can surface
+ * `resetAt` to the user so they know when to retry.
+ */
+export class GitHubRateLimitError extends Error {
+  public readonly resetAt: Date;
+  constructor(resetAt: Date) {
+    super(`GitHub rate limited until ${resetAt.toISOString()}`);
+    this.name = 'GitHubRateLimitError';
+    this.resetAt = resetAt;
+  }
+}
+
+function getResponseHeader(error: unknown, name: string): string | undefined {
+  if (typeof error !== 'object' || error === null) return undefined;
+  const response = (error as { response?: { headers?: Record<string, unknown> } }).response;
+  const headers = response?.headers;
+  if (!headers) return undefined;
+  const value = headers[name] ?? headers[name.toLowerCase()];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function parseRateLimitResetAt(error: unknown): Date {
+  const resetHeader = getResponseHeader(error, 'x-ratelimit-reset');
+  const resetSeconds = resetHeader ? Number(resetHeader) : NaN;
+  if (Number.isFinite(resetSeconds) && resetSeconds > 0) {
+    return new Date(resetSeconds * 1000);
+  }
+  // Fall back to "retry in 60s" if the header is missing/invalid, so callers
+  // always have a usable Date to show.
+  return new Date(Date.now() + 60_000);
+}
+
+function getErrorMessage(error: unknown): string {
+  if (typeof error !== 'object' || error === null) return '';
+  const message = (error as { message?: unknown }).message;
+  return typeof message === 'string' ? message : '';
+}
+
+function isRateLimitError(error: unknown): boolean {
+  if (!isHttpError(error)) return false;
+  // 429 is unambiguously rate limiting.
+  if (error.status === 429) return true;
+  // `x-ratelimit-remaining: 0` signals the primary rate limit is exhausted
+  // regardless of status.
+  const remaining = getResponseHeader(error, 'x-ratelimit-remaining');
+  if (remaining === '0') return true;
+  // 403 is overloaded: it can mean rate/abuse limiting OR a plain permission
+  // denial (e.g. installation lacks pull request access). Only treat 403 as
+  // rate-limited when the message indicates so, so that genuine permission
+  // failures are surfaced to the caller.
+  if (error.status === 403) {
+    const message = getErrorMessage(error).toLowerCase();
+    return (
+      message.includes('rate limit') ||
+      message.includes('secondary rate limit') ||
+      message.includes('abuse')
+    );
+  }
+  return false;
+}
+
+/**
+ * Look up the pull request associated with a `(repo, branch)` pair using an
+ * installation token. Returns the most recently updated PR whose head ref
+ * matches `branch`, preferring `open` PRs when multiple exist.
+ *
+ * This helper is only invoked from the manual "Refresh PR info" mutation; the
+ * webhook path updates the DB directly. Intentionally no caching or dedup —
+ * the mutation is throttled server-side to once per 60 s per (git_url, branch, tenant).
+ *
+ * @returns The associated PR, or `null` if no PR matches (or the repo is no
+ *   longer accessible to this installation).
+ * @throws {GitHubRateLimitError} when GitHub rate-limits the request.
+ */
+export async function fetchPullRequestForBranch(params: {
+  installationId: number;
+  owner: string;
+  repo: string;
+  branch: string;
+  appType: GitHubAppType;
+}): Promise<AssociatedPullRequest | null> {
+  const { installationId, owner, repo, branch, appType } = params;
+
+  const tokenData = await generateGitHubInstallationToken(String(installationId), appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  try {
+    const { data: prs } = await octokit.pulls.list({
+      owner,
+      repo,
+      head: `${owner}:${branch}`,
+      state: 'all',
+      per_page: 10,
+      sort: 'updated',
+      direction: 'desc',
+    });
+
+    if (prs.length === 0) {
+      return null;
+    }
+
+    const chosen = prs.find(pr => pr.state === 'open') ?? prs[0];
+
+    const state: AssociatedPullRequest['state'] =
+      chosen.merged_at != null
+        ? 'merged'
+        : chosen.state === 'open' && chosen.draft
+          ? 'draft'
+          : chosen.state === 'open'
+            ? 'open'
+            : 'closed';
+
+    return {
+      number: chosen.number,
+      htmlUrl: chosen.html_url,
+      state,
+      title: chosen.title,
+      headSha: chosen.head.sha,
+      updatedAt: chosen.updated_at,
+    };
+  } catch (error) {
+    if (isRateLimitError(error)) {
+      throw new GitHubRateLimitError(parseRateLimitResetAt(error));
+    }
+    if (isHttpError(error) && error.status === 404) {
+      warnExceptInTest('[fetchPullRequestForBranch] Repo not accessible or deleted', {
+        owner,
+        repo,
+        branch,
+      });
+      return null;
+    }
+    throw error;
+  }
+}
+
+export type ReviewDecision = 'approved' | 'changes_requested' | 'review_required';
+
+export type BatchedPrInput = {
+  alias: string;
+  owner: string;
+  repo: string;
+  number: number;
+};
+
+function normalizeReviewDecision(decision: string | null | undefined): ReviewDecision | null {
+  switch (decision) {
+    case 'APPROVED':
+      return 'approved';
+    case 'CHANGES_REQUESTED':
+      return 'changes_requested';
+    case 'REVIEW_REQUIRED':
+      return 'review_required';
+    default:
+      return null;
+  }
+}
+
+/**
+ * Fetches `reviewDecision` for multiple PRs in a single aliased GraphQL query.
+ * All PRs must belong to the same installation (one token is generated).
+ * Returns a Map from alias → ReviewDecision|null.
+ * @throws {GitHubRateLimitError} on 403 secondary rate limit.
+ */
+export async function fetchBatchedReviewDecisions(args: {
+  installationId: string;
+  prs: BatchedPrInput[];
+  appType?: GitHubAppType;
+}): Promise<Map<string, ReviewDecision | null>> {
+  const { installationId, prs, appType = 'standard' } = args;
+  if (prs.length === 0) return new Map();
+
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  const fragments = prs
+    .map(
+      ({ alias, owner, repo, number }) =>
+        `${alias}: repository(owner: "${owner}", name: "${repo}") { pullRequest(number: ${number}) { reviewDecision } }`
+    )
+    .join('\n');
+
+  try {
+    const response = (await octokit.request('POST /graphql', {
+      query: `{ ${fragments} }`,
+    })) as {
+      data: {
+        data: Record<string, { pullRequest: { reviewDecision: string | null } | null } | null>;
+      };
+    };
+
+    const result = new Map<string, ReviewDecision | null>();
+    for (const { alias } of prs) {
+      const repoData = response.data.data?.[alias];
+      result.set(alias, normalizeReviewDecision(repoData?.pullRequest?.reviewDecision));
+    }
+    return result;
+  } catch (error) {
+    if (isRateLimitError(error)) {
+      throw new GitHubRateLimitError(parseRateLimitResetAt(error));
+    }
+    throw error;
+  }
+}
+
+/**
+ * Fetches the rolled-up `reviewDecision` for a single PR via GitHub's GraphQL API.
+ * Returns lowercase values matching our DB enum, or `null` when GitHub returns
+ * null (no required reviewers and no review submitted yet).
+ * @throws {GitHubRateLimitError} on 403 secondary rate limit.
+ */
+export async function fetchPullRequestReviewDecision(args: {
+  installationId: string;
+  owner: string;
+  repo: string;
+  number: number;
+  appType?: GitHubAppType;
+}): Promise<ReviewDecision | null> {
+  const { installationId, owner, repo, number, appType = 'standard' } = args;
+  const results = await fetchBatchedReviewDecisions({
+    installationId,
+    prs: [{ alias: 'pr0', owner, repo, number }],
+    appType,
+  });
+  return results.get('pr0') ?? null;
+}
+
+/**
+ * Get repository details including whether it's empty.
+ * Used to validate target repo before migration.
+ *
+ * @param installationId - The GitHub App installation ID
+ * @param repoFullName - The full name of the repository (owner/repo)
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ * @returns Repository details or null if not found/not accessible
+ */
+export async function getRepositoryDetails(
+  installationId: string,
+  repoFullName: string,
+  appType: GitHubAppType = 'standard'
+): Promise<{
+  fullName: string;
+  cloneUrl: string;
+  htmlUrl: string;
+  isEmpty: boolean;
+  isPrivate: boolean;
+} | null> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  const [owner, repo] = repoFullName.split('/');
+  if (!owner || !repo) {
+    return null;
+  }
+
+  try {
+    const { data: repoData } = await octokit.repos.get({
+      owner,
+      repo,
+    });
+
+    // Check if repo is empty by trying to get commits
+    // An empty repo has no commits
+    let isEmpty = false;
+    try {
+      const { data: commits } = await octokit.repos.listCommits({
+        owner,
+        repo,
+        per_page: 1,
+      });
+      isEmpty = commits.length === 0;
+    } catch (error) {
+      // 409 Conflict means "Git Repository is empty" - this is expected for empty repos
+      if (isHttpError(error) && error.status === 409) {
+        isEmpty = true;
+      } else {
+        throw error;
+      }
+    }
+
+    logExceptInTest('[getRepositoryDetails] Got repository details', {
+      fullName: repoData.full_name,
+      isEmpty,
+      private: repoData.private,
+    });
+
+    return {
+      fullName: repoData.full_name,
+      cloneUrl: repoData.clone_url,
+      htmlUrl: repoData.html_url,
+      isEmpty,
+      isPrivate: repoData.private,
+    };
+  } catch (error) {
+    // 404 means repo doesn't exist or not accessible
+    if (isHttpError(error) && error.status === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Get the URL to the GitHub App installation settings page.
+ * Users may need to grant access to newly created repos here.
+ *
+ * @param installationId - The GitHub App installation ID
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ * @returns The URL to the installation settings page
+ */
+export async function getInstallationSettingsUrl(
+  installationId: string,
+  appType: GitHubAppType = 'standard'
+): Promise<string> {
+  const credentials = getGitHubAppCredentials(appType);
+
+  if (!credentials.appId || !credentials.privateKey) {
+    throw new Error(`GitHub ${appType} App credentials not configured`);
+  }
+
+  // Create app-level authentication to get installation details
+  const auth = createAppAuth({
+    appId: credentials.appId,
+    privateKey: credentials.privateKey,
+  });
+
+  const { token } = await auth({ type: 'app' });
+  const octokit = new Octokit({ auth: token });
+
+  const { data } = await octokit.apps.getInstallation({
+    installation_id: parseInt(installationId),
+  });
+
+  // The account type determines the URL format
+  const accountLogin = (data.account as { login?: string })?.login ?? '';
+  const accountType = (data.account as { type?: string })?.type ?? 'User';
+
+  // GitHub App installation settings URL format
+  // For orgs: https://github.com/organizations/{org}/settings/installations/{id}
+  // For users: https://github.com/settings/installations/{id}
+  if (accountType === 'Organization') {
+    return `https://github.com/organizations/${accountLogin}/settings/installations/${installationId}`;
+  }
+  return `https://github.com/settings/installations/${installationId}`;
+}
+
+/**
+ * Check if user already has a fork of a repository
+ * @param accountLogin - The GitHub username of the account where the fork would be created
+ * @param appType - The type of GitHub App to use (defaults to 'standard')
+ */
+export async function checkExistingFork(
+  installationId: string,
+  accountLogin: string,
+  sourceOwner: string,
+  sourceRepo: string,
+  appType: GitHubAppType = 'standard'
+): Promise<{ exists: boolean; fullName: string | null }> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  try {
+    // Check if the user has a repo with the same name as the source
+    const { data: repo } = await octokit.repos.get({
+      owner: accountLogin,
+      repo: sourceRepo,
+    });
+
+    // Verify it's actually a fork of the source repo
+    if (repo.fork && repo.parent?.full_name === `${sourceOwner}/${sourceRepo}`) {
+      return {
+        exists: true,
+        fullName: repo.full_name,
+      };
+    }
+
+    // User has a repo with the same name but it's not a fork of our source
+    // This is an edge case - the fork will be created with a different name
+    return { exists: false, fullName: null };
+  } catch (error) {
+    // 404 means the repo doesn't exist - no existing fork
+    if (isHttpError(error) && error.status === 404) {
+      return { exists: false, fullName: null };
+    }
+    throw error;
+  }
+}
+
+// ============================================================================
+// Commit Inspection
+// ============================================================================
+
+/**
+ * Checks whether a commit is a merge commit (has 2+ parents).
+ * Used to skip code reviews triggered by "merge base into feature" pushes.
+ * Returns false if the API call fails so the review proceeds (fail-open).
+ */
+export async function isMergeCommit(
+  installationId: string,
+  owner: string,
+  repo: string,
+  commitSha: string,
+  appType: GitHubAppType = 'standard'
+): Promise<boolean> {
+  try {
+    const tokenData = await generateGitHubInstallationToken(installationId, appType);
+    const octokit = new Octokit({ auth: tokenData.token });
+
+    const { data } = await octokit.git.getCommit({
+      owner,
+      repo,
+      commit_sha: commitSha,
+    });
+
+    const result = data.parents.length > 1;
+
+    logExceptInTest('[isMergeCommit] Checked commit parents', {
+      owner,
+      repo,
+      sha: commitSha.substring(0, 8),
+      parentCount: data.parents.length,
+      isMergeCommit: result,
+    });
+
+    return result;
+  } catch (error) {
+    logExceptInTest(
+      '[isMergeCommit] Failed to check commit parents, proceeding with review:',
+      error
+    );
+    return false;
+  }
+}
+
+// ============================================================================
+// Check Runs API (PR gate checks)
+// ============================================================================
+
+/**
+ * Conclusion values for a completed GitHub Check Run.
+ * @see https://docs.github.com/en/rest/checks/runs#create-a-check-run
+ */
+export type CheckRunConclusion =
+  | 'success'
+  | 'failure'
+  | 'neutral'
+  | 'cancelled'
+  | 'timed_out'
+  | 'action_required';
+
+type CheckRunOutput = {
+  title: string;
+  summary: string;
+  text?: string;
+};
+
+/**
+ * Creates a GitHub Check Run on a commit.
+ *
+ * Used when a code review is first queued so the PR immediately shows
+ * a pending "Kilo Code Review" check that can be configured as a
+ * required status check in branch protection rules.
+ *
+ * @returns The numeric Check Run ID (store this to update the check later)
+ */
+export async function createCheckRun(
+  installationId: string,
+  owner: string,
+  repo: string,
+  headSha: string,
+  options: {
+    detailsUrl?: string;
+    output?: CheckRunOutput;
+  } = {},
+  appType: GitHubAppType = 'standard'
+): Promise<number> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  const { data } = await octokit.checks.create({
+    owner,
+    repo,
+    name: 'Kilo Code Review',
+    head_sha: headSha,
+    status: 'queued',
+    ...(options.detailsUrl ? { details_url: options.detailsUrl } : {}),
+    ...(options.output ? { output: options.output } : {}),
+  });
+
+  logExceptInTest('[createCheckRun] Created check run', {
+    owner,
+    repo,
+    headSha: headSha.substring(0, 8),
+    checkRunId: data.id,
+  });
+
+  return data.id;
+}
+
+/**
+ * Updates an existing GitHub Check Run.
+ *
+ * Called as the review progresses through its lifecycle:
+ * - queued  -> in_progress  (review starts running)
+ * - in_progress -> completed (review finishes, with a conclusion)
+ */
+export async function updateCheckRun(
+  installationId: string,
+  owner: string,
+  repo: string,
+  checkRunId: number,
+  options: {
+    status?: 'queued' | 'in_progress' | 'completed';
+    conclusion?: CheckRunConclusion;
+    detailsUrl?: string;
+    output?: CheckRunOutput;
+  },
+  appType: GitHubAppType = 'standard'
+): Promise<void> {
+  const tokenData = await generateGitHubInstallationToken(installationId, appType);
+  const octokit = new Octokit({ auth: tokenData.token });
+
+  await octokit.checks.update({
+    owner,
+    repo,
+    check_run_id: checkRunId,
+    ...(options.status ? { status: options.status } : {}),
+    ...(options.conclusion ? { conclusion: options.conclusion } : {}),
+    ...(options.detailsUrl ? { details_url: options.detailsUrl } : {}),
+    ...(options.output ? { output: options.output } : {}),
+    ...(options.status === 'completed' ? { completed_at: new Date().toISOString() } : {}),
+  });
+
+  logExceptInTest('[updateCheckRun] Updated check run', {
+    owner,
+    repo,
+    checkRunId,
+    status: options.status,
+    conclusion: options.conclusion,
+  });
+}

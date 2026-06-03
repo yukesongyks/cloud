@@ -1,0 +1,40 @@
+{
+  "name": "@kilocode/worker-utils",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./instance-id": "./src/instance-id.ts",
+    "./kilo-token-auth": "./src/kilo-token-auth.ts",
+    "./sandbox-id": "./src/sandbox-id.ts",
+    "./hostname-label": "./src/hostname-label.ts",
+    "./redact-headers": "./src/redact-headers.ts",
+    "./normalize-git-url": "./src/normalize-git-url.ts",
+    "./kiloclaw-billing-observability": "./src/kiloclaw-billing-observability.ts",
+    "./kilo-pass-bonus-projection": "./src/kilo-pass-bonus-projection.ts",
+    "./git-url": "./src/git-url.ts",
+    "./callback-token": "./src/callback-token.ts",
+    "./kilo-model-id": "./src/kilo-model-id.ts",
+    "./cloud-agent-queue-report": "./src/cloud-agent-queue-report.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsgo --noEmit",
+    "lint": "pnpm -w exec oxlint --config .oxlintrc.json packages/worker-utils/src"
+  },
+  "dependencies": {
+    "@kilocode/db": "workspace:*",
+    "aws4fetch": "catalog:",
+    "drizzle-orm": "catalog:",
+    "hono": "catalog:",
+    "jose": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@typescript/native-preview": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

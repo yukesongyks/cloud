@@ -1,0 +1,449 @@
+import { type User } from '@kilocode/db/schema';
+import { type BalanceForUser, getBalanceForUser } from '@/lib/user/balance';
+import { FIRST_TOPUP_BONUS_AMOUNT, APP_URL } from '@/lib/constants';
+import { getUserOrganizationsWithSeats } from '@/lib/organizations/organizations';
+import type { UserOrganizationWithSeats } from '@/lib/organizations/organization-types';
+import { summarizeUserPayments } from '@/lib/creditTransactions';
+import { hasOrganizationEverPaid, hasUserEverPaid } from '@/lib/creditTransactions';
+import { cachedPosthogQuery } from '@/lib/posthog-query';
+import * as z from 'zod';
+
+import { fromMicrodollars } from '@/lib/utils';
+
+/** Pre-fetched data shared across notification generators to avoid duplicate DB queries. */
+type NotificationContext = {
+  userOrganizations: UserOrganizationWithSeats[];
+  isInTeam: boolean;
+  balance: BalanceForUser;
+};
+
+export type KiloNotification = {
+  id: string;
+  title: string;
+  message: string;
+  action?: {
+    actionText: string;
+    actionURL: string;
+  };
+  suggestModelId?: string;
+  // When showIn is specified this can be used to target specific apps. When not specified all apps with notification support will show it:
+  // CAUTION: use extension-native sparingly since it shows up as a native VSCode notification and is spammy
+  showIn?: ('extension' | 'extension-native' | 'cli')[];
+  // ISO 8601 timestamp after which this notification should no longer be shown
+  expiresAt?: string;
+};
+
+const normalUnconditionalNotifications: KiloNotification[] = [
+  //If you need to check or personalize the notification, see examples at the bottom of this file
+  //if you just want a simple straightforward global message, add it here.
+  {
+    id: 'stealth-opus-discount-may-25',
+    title: 'Claude Opus 4.7 at 20% Off — Only in Kilo Code!',
+    message:
+      'A stealth provider is offering Claude Opus 4.7 at 20% off list price, exclusively in Kilo Code.',
+    suggestModelId: 'stealth/claude-opus-4.7',
+    expiresAt: '2026-06-08T08:00:00Z',
+  },
+  {
+    id: 'kilo-cli-jan-5',
+    title: 'Kilo CLI',
+    message: 'Prefer the terminal? Install the Kilo CLI with npm install -g @kilocode/cli',
+    action: {
+      actionText: 'Learn more',
+      actionURL: 'https://kilo.ai/docs/cli',
+    },
+    showIn: ['extension'],
+  },
+  {
+    id: 'kilo-cloud-agents-jan-15',
+    title: 'Kilo Cloud Agents',
+    message: 'You can use Kilo in the browser - no local machine required. Try it here.',
+    action: {
+      actionText: 'Cloud Agents',
+      actionURL: 'https://app.kilo.ai/cloud',
+    },
+    showIn: ['extension', 'cli'],
+  },
+  {
+    id: 'app-builder-promo-mar-6',
+    title: 'Try App Builder',
+    message: "Don't feel like coding? Try App Builder to build with natural language from the web",
+    action: {
+      actionText: 'Try App Builder',
+      actionURL: 'https://app.kilo.ai/app-builder',
+    },
+    showIn: ['extension'],
+    expiresAt: '2026-03-09T08:00:00Z',
+  },
+  {
+    id: 'nvidia-nemotron-3-super-launch-mar-11',
+    title: 'NVIDIA Nemotron 3 Super is live in Kilo!',
+    message:
+      'NVIDIA Nemotron 3 Super is now free to use for a limited time in Kilo — 120B parameter model with 256k context window!',
+    action: {
+      actionText: 'Learn more',
+      actionURL: 'https://blog.kilo.ai/nvidia-nemotron-3-super-launch',
+    },
+    suggestModelId: 'nvidia/nemotron-3-super-120b-a12b:free',
+    showIn: ['extension', 'cli'],
+    expiresAt: '2026-03-25T08:00:00Z',
+  },
+];
+
+export async function generateUserNotifications(user: User): Promise<KiloNotification[]> {
+  // Pre-fetch shared data once to avoid duplicate DB queries across generators.
+  // This eliminates ~5 redundant queries per request (2× userHasOrganizations,
+  // 3× getUserOrganizationsWithSeats, 2× getBalanceForUser → 1+1 queries).
+  const [userOrganizations, balance] = await Promise.all([
+    getUserOrganizationsWithSeats(user.id),
+    getBalanceForUser(user),
+  ]);
+  const ctx: NotificationContext = {
+    userOrganizations,
+    // Replaces the old userHasOrganizations() LIMIT-1 existence check; acceptable
+    // because getUserOrganizationsWithSeats is already needed by other generators.
+    isInTeam: userOrganizations.length > 0,
+    balance,
+  };
+
+  const conditionalNotifications: ((
+    user: User,
+    ctx: NotificationContext
+  ) => Promise<KiloNotification[]>)[] = [
+    generateTeamsTrialNotification,
+    generateLowCreditNotification,
+    generateAutoTopUpNotification,
+    generateAutoTopUpOrgsNotification,
+    generateByokProvidersNotification,
+    generateGrokCodeFast1OptimizedDiscontinuedNotification,
+    generateKiloPassNotification,
+    generateKiloPassPromoMay29Notification,
+  ];
+
+  const resolvedConditionalNotifications = (
+    await Promise.all(conditionalNotifications.map(f => f(user, ctx)))
+  ).flat();
+
+  const now = new Date();
+  return [...resolvedConditionalNotifications, ...normalUnconditionalNotifications].filter(
+    n => !n.expiresAt || new Date(n.expiresAt) > now
+  );
+}
+
+async function generateLowCreditNotification(
+  user: User,
+  ctx: NotificationContext
+): Promise<KiloNotification[]> {
+  // For now, let's not confuse users when they're on a team
+  if (ctx.isInTeam) return [];
+
+  const { balance } = ctx.balance;
+
+  if (balance >= 2) return [];
+  const payments = await summarizeUserPayments(user.id);
+
+  const message =
+    !payments.payments_count && FIRST_TOPUP_BONUS_AMOUNT > 0
+      ? `Your credit balance is low. Top up now and get $${FIRST_TOPUP_BONUS_AMOUNT} extra on your first purchase! Add any amount of credits and we'll add $${FIRST_TOPUP_BONUS_AMOUNT} on top instantly.`
+      : 'Your credit balance is low. Add credits to continue using the service without interruption.';
+
+  return [
+    {
+      id: 'low-credit-warning',
+      title: 'Low Credit Balance',
+      message,
+      action: {
+        actionText:
+          !payments.payments_count && FIRST_TOPUP_BONUS_AMOUNT > 0
+            ? `Add Credits & Get $${FIRST_TOPUP_BONUS_AMOUNT} Free`
+            : 'Add Credits',
+        actionURL: `${APP_URL}/profile`,
+      },
+    },
+  ];
+}
+
+async function generateAutoTopUpNotification(
+  user: User,
+  ctx: NotificationContext
+): Promise<KiloNotification[]> {
+  if (!(await hasUserEverPaid(user.id))) {
+    return [];
+  }
+
+  for (const org of ctx.userOrganizations) {
+    if (await hasOrganizationEverPaid(org.organizationId)) {
+      return [];
+    }
+  }
+
+  return [
+    {
+      id: 'auto-top-up-dec-19',
+      title: 'New: Auto Top-Ups',
+      message:
+        "Set your top-up amount once—we'll automatically add credits when you drop below $5.",
+      action: {
+        actionText: 'Enable Auto Top-Ups',
+        actionURL: 'https://app.kilo.ai/credits',
+      },
+      showIn: ['cli', 'extension'],
+    },
+  ];
+}
+
+async function generateAutoTopUpOrgsNotification(
+  _user: User,
+  ctx: NotificationContext
+): Promise<KiloNotification[]> {
+  const isOwnerOrAdmin = ctx.userOrganizations.some(org => org.role === 'owner');
+  if (!isOwnerOrAdmin) return [];
+
+  return [
+    {
+      id: 'auto-top-up-orgs-march-10',
+      title: 'New: Auto Top-Ups For Organizations',
+      message:
+        "Set your top-up amount once—we'll automatically add credits to your organization's balance when it drops below $50.",
+      action: {
+        actionText: 'Enable Auto Top-Ups',
+        actionURL: 'https://app.kilo.ai/',
+      },
+      showIn: ['cli', 'extension'],
+    },
+  ];
+}
+
+async function generateTeamsTrialNotification(
+  _user: User,
+  ctx: NotificationContext
+): Promise<KiloNotification[]> {
+  // Only show teams notification if user is NOT already in a team
+  if (ctx.isInTeam) return [];
+
+  return [
+    {
+      id: 'teams-free-trial-oct-17',
+      title: 'Try Kilo with Your Team — Free for 14 Days',
+      message:
+        'Get usage analytics, centralized billing, shared context, and other features you need to scale AI coding across your org.',
+      action: {
+        actionText: 'Get Started',
+        actionURL: 'https://app.kilocode.ai/get-started/teams',
+      },
+      showIn: ['cli', 'extension'],
+    },
+  ];
+}
+
+const getByokProviderUsers = cachedPosthogQuery(
+  z.array(
+    z.tuple([z.string(), z.string()]).transform(([userId, provider]) => ({ userId, provider }))
+  )
+);
+
+async function generateByokProvidersNotification(
+  user: User,
+  _ctx: NotificationContext
+): Promise<KiloNotification[]> {
+  try {
+    const byokProviderUsers = await getByokProviderUsers(
+      'byok-provider-usage-users',
+      'select id, apiProvider from notification_byok_providers_jan_19 limit 5e5'
+    );
+
+    const provider = byokProviderUsers.find(p => p.userId === user.id)?.provider;
+    if (!provider) {
+      console.debug('[generateByokProvidersNotification] not using a BYOK supported provider');
+      return [];
+    }
+
+    // Maps an extension `apiProvider` id to a user-facing label. Multiple ids can
+    // refer to the same underlying service (regional/plan/legacy variants), and we
+    // only list ids for services we actually support BYOK for via Kilo Gateway
+    // (see UserByokProviderIdSchema).
+    const names = {
+      // Anthropic / Claude
+      anthropic: 'Claude API Key',
+      claude: 'Claude API Key',
+
+      // Amazon Bedrock
+      bedrock: 'Amazon Bedrock API Key',
+      'amazon-bedrock': 'Amazon Bedrock API Key',
+
+      // Chutes
+      chutes: 'Chutes API Key',
+
+      // DeepSeek
+      deepseek: 'DeepSeek API Key',
+      deepseek1: 'DeepSeek API Key',
+      'deepseek-v4': 'DeepSeek API Key',
+      'deepseek-v4-pro': 'DeepSeek API Key',
+
+      // Fireworks
+      fireworks: 'Fireworks API Key',
+      'fireworks-ai': 'Fireworks API Key',
+
+      // Google AI (Gemini)
+      gemini: 'Google AI API Key',
+      google: 'Google AI API Key',
+
+      // OpenAI
+      'openai-native': 'OpenAI API Key',
+      openai: 'OpenAI API Key',
+      'openai-responses': 'OpenAI API Key',
+
+      // Moonshot AI / Kimi
+      moonshot: 'Moonshot AI API Key',
+      moonshotai: 'Moonshot AI API Key',
+      kimi: 'Moonshot AI API Key',
+      'kimi-for-coding': 'Kimi Code Plan',
+
+      // MiniMax
+      minimax: 'MiniMax Coding Plan',
+      'minimax-coding-plan': 'MiniMax Coding Plan',
+
+      // Mistral
+      mistral: 'Mistral AI API Key',
+
+      // Novita
+      novita: 'Novita AI API Key',
+
+      // xAI
+      xai: 'xAI API Key',
+
+      // Z.ai / Zhipu (GLM)
+      zai: 'GLM Coding Plan',
+      'z-ai': 'GLM Coding Plan',
+      'zai-coding-plan': 'GLM Coding Plan',
+      glm: 'GLM Coding Plan',
+      zhipuai: 'GLM Coding Plan',
+      'zhipuai-coding-plan': 'GLM Coding Plan',
+
+      // Xiaomi MiMo
+      xiaomi: 'Xiaomi MiMo API Key',
+      'xiaomi-mimo': 'Xiaomi MiMo API Key',
+      xiaomimimo: 'Xiaomi MiMo API Key',
+      mimo: 'Xiaomi MiMo API Key',
+      'xiaomi-token-plan-sgp': 'Xiaomi Token Plan',
+      'xiaomi-token-plan-ams': 'Xiaomi Token Plan',
+
+      // Ollama Cloud
+      'ollama-cloud': 'Ollama Cloud API Key',
+    } as Record<string, string>;
+
+    const providerName = names[provider];
+    if (!providerName) {
+      console.debug(
+        `[generateByokProvidersNotification] unknown BYOK supported provider ${provider}`
+      );
+      return [];
+    }
+
+    console.debug(
+      `[generateByokProvidersNotification] has used BYOK supported provider ${provider}`
+    );
+    return [
+      {
+        id: 'byok-providers-jan-19',
+        title: 'Try BYOK for Kilo Gateway',
+        message: `BYOK now supported for your ${providerName}, allowing faster model support, Kilo platform features, and more!`,
+        action: {
+          actionText: 'Learn more',
+          actionURL: 'https://kilo.ai/docs/basic-usage/byok',
+        },
+        showIn: ['cli', 'extension'],
+      },
+    ];
+  } catch (e) {
+    console.error('[generateByokProvidersNotification]', e);
+    return [];
+  }
+}
+
+const getGrokCodeFast1OptimizedDiscontinuedUsers = cachedPosthogQuery(
+  z.array(z.tuple([z.string()]).transform(([userId]) => userId))
+);
+
+async function generateGrokCodeFast1OptimizedDiscontinuedNotification(
+  user: User,
+  _ctx: NotificationContext
+): Promise<KiloNotification[]> {
+  try {
+    const users = await getGrokCodeFast1OptimizedDiscontinuedUsers(
+      'grok-code-fast-1-optimized-discontinued-users',
+      'select kilo_user_id from notification_grok_code_may_15 limit 5e5'
+    );
+
+    if (!users.includes(user.id)) {
+      console.debug(
+        '[generateGrokCodeFast1OptimizedDiscontinuedNotification] not showing notification for user'
+      );
+      return [];
+    }
+
+    console.debug(
+      '[generateGrokCodeFast1OptimizedDiscontinuedNotification] showing notification for user'
+    );
+    return [
+      {
+        id: 'grok-code-fast-1-optimized-discontinued-may-15',
+        title: 'Grok Code Fast 1 Optimized is discontinued',
+        message:
+          'Grok Code Fast 1 Optimized has been discontinued. Give Grok Build 0.1 a try as a replacement.',
+        suggestModelId: 'x-ai/grok-build-0.1',
+        showIn: ['cli', 'extension'],
+      },
+    ];
+  } catch (e) {
+    console.error('[generateGrokCodeFast1OptimizedDiscontinuedNotification]', e);
+    return [];
+  }
+}
+
+async function generateKiloPassPromoMay29Notification(
+  user: User,
+  _ctx: NotificationContext
+): Promise<KiloNotification[]> {
+  if (!(await hasUserEverPaid(user.id))) {
+    return [];
+  }
+
+  return [
+    {
+      id: 'kilo-pass-promo-may-29',
+      title: 'Get more from every dollar with Kilo Pass',
+      message: 'A monthly AI token subscription with up to 50% bonus credits included.',
+      action: {
+        actionText: 'Explore Kilo Pass',
+        actionURL: 'https://kilo.ai/pricing/kilo-pass',
+      },
+      showIn: ['cli', 'extension'],
+      expiresAt: '2026-06-30T08:00:00Z',
+    },
+  ];
+}
+
+async function generateKiloPassNotification(
+  user: User,
+  ctx: NotificationContext
+): Promise<KiloNotification[]> {
+  // Check if user belongs to an organization with balance > $5
+  const hasHighBalanceOrg = ctx.userOrganizations.some(org => fromMicrodollars(org.balance) > 5);
+  if (hasHighBalanceOrg) {
+    return [];
+  }
+
+  return [
+    {
+      id: 'kilo-pass-announcement-jan-12',
+      title: 'Introducing Kilo Pass',
+      message: 'Subscribe to Kilo Pass and get up to 50% free bonus credits every month.',
+      action: {
+        actionText: 'Learn More',
+        actionURL: 'https://blog.kilo.ai/p/introducing-kilo-pass',
+      },
+      showIn: ['cli', 'extension'],
+    },
+  ];
+}

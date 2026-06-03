@@ -1,0 +1,49 @@
+# Build outputs
+.next/
+build/
+dist/
+**/dist-types/
+out/
+.api/
+apps/storybook/storybook-static/
+
+#approval tests
+apps/web/src/tests/sample
+apps/web/src/tests/req_sample
+
+**/*.approved.json
+**/*.approved.md
+
+# Dependencies
+node_modules/
+
+# Public assets
+public/
+
+# Generated files
+*.generated.*
+*.min.*
+_journal.json
+**/meta/*_snapshot.json
+**/worker-configuration.d.ts
+
+# Package files
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Kilo agent runtime artifacts
+.kilocode/
+.kilo
+
+# Markdown is excluded because prettier re-pads markdown table cells for column
+# alignment, which creates large spurious diffs on any unrelated content change.
+# See AGENTS.md "Markdown Tables" and script/check-md-table-padding.ts.
+*.md
+
+# Misc
+.DS_Store
+.env*
+!.env.example
+*.sql
+

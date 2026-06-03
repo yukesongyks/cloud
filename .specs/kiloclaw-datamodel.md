@@ -1,0 +1,425 @@
+# KiloClaw Data Model
+
+## Role of This Document
+
+This spec defines the business rules and invariants for the KiloClaw
+data model — specifically the `kiloclaw_instance` and
+`kiloclaw_subscription` tables and the relationships between them. It
+is the source of truth for _what_ the system is required to guarantee
+about record existence, immutability, lookup patterns, and creation
+order.
+It deliberately does not prescribe _how_ to implement those
+guarantees: column layouts, migration strategies, backfill scripts,
+and other implementation choices belong in plan documents and code,
+not here.
+
+Multiple services and apps operate on this data model (the web app,
+the kiloclaw CF worker service, the kiloclaw-billing service, and
+background jobs). All consumers MUST comply with the rules below.
+
+## Status
+
+Draft -- created 2026-04-15.
+Updated 2026-05-12 -- required KiloClaw price-version lineage invariants.
+Updated 2026-05-27 -- required durable fresh-provision admission reservations.
+Updated 2026-05-28 -- fraud-enforcement subscription mutation invariants.
+
+## Conventions
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+"SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+"OPTIONAL" in this document are to be interpreted as described in
+BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all
+capitals, as shown here.
+
+## Definitions
+
+- **Instance record**: A row in `kiloclaw_instance` representing a
+  KiloClaw instance, whether or not the underlying infrastructure
+  (CF worker Durable Object and infra provider resources) still exists.
+- **Subscription record**: A row in `kiloclaw_subscription`
+  representing a billing subscription tied to a specific instance.
+- **KiloClaw price version**: The required catalog key recorded on a
+  subscription row as `kiloclaw_price_version`. It selects the row's
+  KiloClaw prices, trial duration, and self-service instance
+  entitlement.
+- **Subscription lineage**: The live chain formed by a subscription row
+  and any successor rows created during personal reprovision transfer.
+  A lineage has one immutable price version.
+- **Destroyed instance**: An instance record whose underlying
+  infrastructure has been torn down. The record persists with a
+  destroyed marker.
+- **Early-bird subscriber**: A user who purchased early-bird access
+  before the subscription billing system was available. These users
+  have instance records but may lack subscription records until
+  backfill is complete.
+- **Subscription change log entry**: A row in the subscription audit
+  log that captures a single mutation to a `kiloclaw_subscription`
+  record — what changed, when, and who or what caused it.
+- **Actor**: The entity responsible for a subscription mutation.
+  An actor is either a user (identified by user ID) or the system
+  (identified by a service or process name).
+- **Context**: The ownership scope of an instance -- either
+  _personal_ (not associated with any organization) or
+  _organizational_ (associated with a specific organization). A user
+  has one personal context and one organizational context per
+  organization they belong to.
+- **Fraud-enforcement mutation**: Exceptional personal subscription
+  cancellation or suspension required by an enforced Stripe Early
+  Fraud Warning under `.specs/stripe-early-fraud-warnings.md`.
+- **Active instance**: An instance record that has not been marked
+  as destroyed.
+- **Provision reservation**: Durable coordination state for one fresh
+  provisioning attempt in a user context. A reservation assigns the
+  candidate instance identifier that the attempt MUST use if it succeeds,
+  but it is not an instance record, does not assert that infrastructure
+  exists, and does not grant access.
+- **Mutation**: Any database write (INSERT or UPDATE) to a
+  `kiloclaw_subscription` row that changes one or more of its
+  business-relevant fields (status, plan, billing period, payment
+  source, cancellation flags, suspension state, etc.). Automated
+  timestamp updates (e.g., `updated_at`) that occur without any
+  other field change are not mutations for change log purposes.
+- **Infra Provider**: The backing service provider where we provision compute and storage and onto which we actually deploy OpenClaw. For example fly.io, docker-local, Northflank.
+- **Infra Provider Base Resource**: Some infra providers have base top-level organizational resource that must exist. For example fly.io has a app concept, Northflank has projects.
+
+## Overview
+
+The KiloClaw data model centers on two core entities: instances and
+subscriptions. An instance record tracks the existence and state of a
+KiloClaw hosted environment. A subscription record tracks the billing
+relationship that funds that instance. Together they form the
+foundation that the web app, CF worker services, billing service, and
+background jobs all rely on.
+
+The data model supports multiple instances per user or organization,
+though the system currently limits provisioning to one active instance
+per user per context (personal, and each organization the user belongs
+to) via UI and router constraints. These constraints are enforced at
+the application layer, not the data layer, so removing them in the
+future requires no schema changes.
+
+A subscription change log provides a complete audit trail of every
+mutation to a subscription record. Because subscriptions are never
+deleted and are mutated by multiple services (web app, kiloclaw CF
+worker, kiloclaw-billing service, background jobs, and payment
+provider webhooks), the change log gives operators and support a
+reliable history of what happened, when, and why — without relying
+on application logs that may be rotated or incomplete.
+
+## Rules
+
+### Record Immutability
+
+1. An instance record MUST NOT be deleted from `kiloclaw_instance`,
+   even after the underlying infrastructure (CF worker Durable Object
+   and infra provider resources) is destroyed. Destroyed instances MUST be marked as
+   destroyed rather than removed.
+2. A subscription record MUST NOT be deleted from
+   `kiloclaw_subscription`. Subscription lifecycle transitions
+   (cancellation, expiry, etc.) MUST be represented as status changes
+   on the existing record, never as row deletion.
+3. When a user account is deleted (e.g., GDPR right-to-erasure),
+   instance and subscription records MUST be retained. Ownership
+   references MUST be anonymized rather than cascaded or removed.
+   Subscription change log rows MUST also be retained as canonical
+   audit history. Any directly identifying fields in those rows MUST
+   be anonymized under the GDPR exception in Subscription Change Log
+   rule 14.
+   Foreign key constraints on these tables MUST NOT cascade deletes
+   from parent tables.
+
+### Instance–Subscription Relationship
+
+4. Every instance record MUST have a corresponding subscription
+   record. This is an eventually-consistent invariant: during the
+   creation sequence (rules 19–23), a brief window exists between
+   the instance INSERT and the subscription INSERT where the
+   instance has no subscription. Outside that bounded creation
+   window, there MUST NOT exist an instance record without a
+   subscription record, except an instance explicitly quarantined
+   for bootstrap remediation after both primary and fallback
+   subscription-bootstrap paths failed (rule 22). That exception
+   MUST be rare, MUST cause the provisioning request to fail, and
+   MUST NOT be treated as a live provisioned instance for user
+   access or onboarding completion. This invariant is enforced at the
+   application layer; the creation-order rules define the sequence
+   that satisfies it.
+5. Each subscription record MUST reference exactly one instance. The
+   relationship is one-to-one: at most one subscription per instance
+   (see kiloclaw-billing.md, Plans rule 5).
+6. Early-bird subscribers who have instance records without
+   subscription records are a known violation of rule 4. These
+   MUST be resolved by backfilling canonical subscription records
+   for those instances. Runtime code MUST NOT continue granting
+   access from purchase-table fallback once migration cleanup is
+   complete; users without canonical rows are treated as exceptions
+   requiring manual remediation.
+
+### Subscription Price Version
+
+Every `kiloclaw_subscription` row MUST have a required, non-null
+`kiloclaw_price_version`. Subscription writers MUST set
+`kiloclaw_price_version` explicitly when creating rows; they MUST NOT
+rely on an implicit application or database default to select pricing.
+
+A subscription lineage MUST keep one immutable price version. Renewals,
+plan switches, payment-source transitions, pending cancellation,
+reactivation before final cancellation, and live personal reprovision
+successor transfer MUST preserve the recorded version.
+
+A live successor row MUST copy the predecessor row's
+`kiloclaw_price_version` when transferring an access-granting personal
+lineage to a replacement instance. The transferred-out predecessor row
+remains historical and is excluded from live subscription selection.
+
+Canceled historical rows MUST retain their recorded
+`kiloclaw_price_version` for audit and reporting, but they MUST NOT
+seed legacy eligibility for later fresh subscription rows. Fresh rows
+after fully canceled history use the current price version defined by
+KiloClaw billing.
+
+### Multi-Instance Support
+
+7. The data model MUST accommodate multiple instances per user or
+   organization. No schema-level constraint SHALL restrict a user or
+   organization to a single instance.
+8. The system MUST limit provisioning to one active instance per
+   user per context. A user MAY have one active instance in their
+   personal context and one active instance in each organization
+   they belong to, simultaneously. The limit is per context, not
+   per user globally. This limit MUST be enforced at the UI and
+   router layer, not at the database layer.
+9. When the single-instance limit is relaxed in the future, no
+   schema migration SHALL be required.
+
+### Fresh Provision Admission
+
+1. Before a fresh personal or organization-context provision invokes an
+   instance Durable Object or any infra provider operation, the KiloClaw
+   Worker MUST persist a provision reservation for the requesting user and
+   context.
+2. A provision reservation MUST remain coordination metadata only. It MUST
+   NOT be stored as an instance record, routed as an active instance, treated
+   as billing access, or reported as completed onboarding.
+3. A provision reservation MUST assign one candidate instance identifier.
+   An admitted attempt MUST carry that identifier through Durable Object
+   routing, instance record insertion, subscription bootstrap, and routing
+   registry publication; runtime MUST NOT silently choose a replacement
+   identifier during that attempt.
+4. While an admitted fresh attempt is in progress or its provider-side
+   outcome requires reconciliation, another fresh attempt for the same user
+   and context MUST NOT execute provider creation work. The system MUST fail
+   closed or report a retryable conflict rather than risk duplicate
+   infrastructure.
+5. Before performing provider creation under an admitted reservation, the
+   Worker MUST reconcile authoritative active-instance state for the same
+   user/context. Existing active state MUST prevent another fresh provision
+   even if a routing index entry is absent or stale.
+6. If a provision attempt fails after provider resources may have been
+   created, its reservation MUST remain blocked or marked for reconciliation
+   until cleanup or canonical recovery has been confirmed. An expired request
+   or lease alone MUST NOT authorize another fresh attempt.
+7. A completed instance that is intentionally destroyed MAY later be
+   reprovisioned when no active instance remains in the context, subject to
+   subscription successor-transfer and entitlement rules.
+8. Reservation storage and admission enforcement MUST remain application/
+   Worker-layer behavior; they MUST NOT introduce a schema-level constraint
+   that prevents future multi-instance product behavior.
+
+### Operational Instance Markers
+
+Instance records MAY store operational lifecycle markers that do not
+by themselves grant or revoke billing entitlement. These markers are
+runtime metadata on the instance record, not a substitute for
+subscription status, suspension, or destruction fields.
+Markers MAY be cleared when the lifecycle condition they represent no
+longer applies.
+
+### Record Lookup
+
+10. Fetching a single record from `kiloclaw_instance` or
+    `kiloclaw_subscription` SHOULD use the table's primary key;
+    non-primary-key lookups are acceptable only when the caller does
+    not yet know the primary key (e.g., initial resolution from an
+    external identifier). Queries MUST NOT rely on fuzzy matching,
+    partial string comparison, or heuristic selection to locate a
+    specific record.
+11. When a query requires filtering by user, organization, or other
+    non-primary-key attributes (e.g., listing all instances for a
+    user), the query MUST use exact equality on indexed columns.
+
+### Subscription Change Log
+
+Every mutation to a `kiloclaw_subscription` record MUST be
+accompanied by a change log entry. The change log is append-only
+and serves as the authoritative audit trail for subscription state.
+
+12. Each service or process that mutates a subscription record MUST
+    write the corresponding change log entry. This includes
+    creation, status transitions, plan changes, billing period
+    advancement, payment source changes, cancellation, reactivation,
+    suspension, destruction scheduling, and any other mutation.
+13. Each change log entry MUST capture the following information:
+    a. The subscription identifier (foreign key to the subscription
+    record).
+    b. A timestamp of when the change occurred. The timestamp MUST
+    be the database server's current time at the moment of
+    insertion, not the application's wall clock or an external
+    event timestamp.
+    c. The actor type: `user` or `system`.
+    d. The actor identifier: for user actors, the user ID; for
+    system actors, a service or process name (e.g.,
+    `kiloclaw-billing`, `kiloclaw-worker`, `billing-lifecycle-job`,
+    `stripe-webhook`, `credit-renewal-sweep`).
+    e. The action performed, as a descriptive label (e.g.,
+    `created`, `status_changed`, `plan_switched`,
+    `period_advanced`, `canceled`, `reactivated`, `suspended`,
+    `destruction_scheduled`, `reassigned`). All services MUST use
+    consistent action labels. New labels MUST be documented before
+    use.
+    f. Sufficient detail to reconstruct the state of the
+    subscription before and after the mutation. For the initial
+    creation entry, the prior state MUST be recorded as absent.
+    g. An optional context or reason string providing additional
+    detail (e.g., `stripe_invoice:inv_xxx`, `insufficient_credits`,
+    `user_requested`, `trial_expired`).
+14. Change log entries MUST NOT be updated or deleted during normal
+    operation. The log is strictly append-only. GDPR-required
+    anonymization of directly identifying fields is the sole
+    exception. That anonymization MUST preserve the event's audit
+    meaning, timestamps, action labels, and non-identifying context.
+15. When the change log entry is written in the same database
+    transaction as the mutation, a change log failure that aborts
+    the transaction is acceptable — the entire operation will be
+    retried. When no enclosing transaction exists, a change log
+    failure MUST NOT prevent the mutation from succeeding; the
+    system MUST log the failure and proceed. The system MUST
+    retry the failed change log write or run a reconciliation
+    process that detects and backfills missing entries. Missing
+    entries MUST be resolved within a bounded time (defined by
+    the implementing service's SLA) so the audit trail remains
+    complete.
+16. When a subscription mutation occurs within a database
+    transaction, the change log entry SHOULD be written within the
+    same transaction so that the log is consistent with the
+    subscription state. Out-of-transaction writes are acceptable
+    only when the mutation itself is not transactional (e.g., a
+    single atomic UPDATE).
+17. The change log MUST be queryable by subscription identifier and
+    by time range to support debugging and support investigations.
+18. Change log entries MUST NOT contain sensitive data such as
+    payment tokens, card numbers, or credentials. Payment provider
+    identifiers (e.g., Stripe subscription ID, invoice ID) MAY be
+    included as context.
+
+### Fraud-Enforcement Mutations
+
+- An enforced personal Stripe Early Fraud Warning is an exceptional immediate mutation path. It MUST cancel or suspend affected personal subscription state without relying on ordinary paid-period continuation.
+- A fraud-enforcement cancellation or suspension MUST write subscription change log entries with a system actor, consistent action labels, and a non-sensitive fraud-enforcement reason.
+- A fraud-enforcement suspension MUST retain the associated instance and subscription records and MUST assign the seven-day destruction grace defined by KiloClaw billing rather than destroying data immediately.
+- Organization-managed subscription and instance rows MUST NOT be mutated automatically for an organization-owned Early Fraud Warning in the initial rollout.
+
+### Record Creation Order
+
+The creation order below reflects the target lifecycle. This order
+MUST be enforced only after the existing data model has been brought
+into the desired state (rules 1–6 satisfied, early-bird backfill
+complete).
+
+19. A Cloudflare Worker Durable Object and an infra provider base resource MUST both exist
+    before an instance record is created in `kiloclaw_instance`.
+    Infrastructure MUST be provisioned first; the record is a
+    reflection of existing infrastructure, not a reservation. A
+    provision reservation created under Fresh Provision Admission is
+    coordination metadata and does not violate this creation order.
+20. If either infrastructure component fails to provision, the system
+    MUST NOT create an instance record. Cleanup of any partially
+    provisioned infrastructure is the responsibility of the
+    provisioning service.
+21. The kiloclaw CF worker service MUST be the sole creator of
+    `kiloclaw_instance` records. No other service or application
+    MAY insert rows into this table.
+22. After the instance record has been committed to the database,
+    the kiloclaw CF worker service MUST call the kiloclaw-billing
+    service to create the corresponding `kiloclaw_subscription`
+    record. Subscription creation MUST NOT be attempted before the
+    instance record is persisted. This call MUST occur as part of
+    the same provisioning request — the window between instance
+    commit and subscription creation (see rule 4) MUST be bounded
+    to the duration of that request. If the primary subscription
+    bootstrap path fails after the instance row is persisted, the
+    provisioning service MUST retry or run a fallback path that
+    still creates canonical subscription state before the request
+    exits. The request MUST NOT complete successfully while leaving
+    a silently unpaired instance row. If both primary and fallback
+    bootstrap fail, the provisioning request MUST fail and the
+    instance MUST be explicitly quarantined for remediation rather
+    than left as an unnoticed orphan. This quarantine state is the
+    sole temporary exception to rule 4 and MUST NOT be surfaced as a
+    successful provisioned instance.
+23. The onboarding flow MUST NOT be considered complete (and MUST NOT
+    play the completion "ding" sound) until both the instance record
+    and the subscription record have been persisted to the database.
+
+## Migration Path
+
+The creation-order rules (19–23) represent the target state. They
+MUST NOT be enforced until the following prerequisites are met:
+
+1. All existing instance records satisfy rules 1–6 (no orphaned
+   instances without subscriptions).
+2. Early-bird subscription backfill is complete (rule 6).
+3. Any existing code paths that create records in a different order
+   have been updated.
+
+Until these prerequisites are met, the existing creation order
+remains in effect and the system MUST tolerate records created under
+the prior ordering.
+
+## Not Yet Implemented
+
+The following rules use SHOULD and reflect intended behavior that is
+not yet enforced in the current codebase:
+
+1. Early-bird subscription backfill SHOULD be completed before
+   enforcing the creation-order rules. (Currently, early-bird users
+   may have instance records without subscription records.)
+2. The onboarding flow SHOULD gate completion on both records
+   existing. (Currently, the onboarding flow may complete before
+   subscription creation.)
+3. The subscription change log (rules 12–18) SHOULD be implemented
+   across all services that mutate subscription records. Some
+   subscription-creation paths may already write change-log entries;
+   complete cross-service coverage remains the intended invariant.
+
+## Changelog
+
+### 2026-05-28 -- Fraud-enforcement subscription mutations
+
+- Defined enforced personal Stripe Early Fraud Warnings as exceptional immediate cancellation/suspension mutations that retain instance history, write system-attributed change logs, and preserve the seven-day destruction grace.
+- Excluded organization-owned warnings from automatic organization-managed instance or subscription mutation.
+
+### 2026-05-27 -- Required durable fresh-provision admission reservations
+
+- Defined provision reservations as non-routable, non-entitling coordination state.
+- Required Worker-side admission before any fresh provider creation and fail-closed handling for concurrent or ambiguous failed attempts.
+- Preserved Worker-only instance insertion and infrastructure-before-row ordering.
+
+### 2026-05-12 -- Required KiloClaw price-version lineage invariants
+
+- Added required `kiloclaw_price_version` row semantics.
+- Documented lineage immutability, live-successor copying, and
+  canceled-row historical semantics.
+
+### 2026-04-15 -- Initial spec
+
+- Record immutability (rules 1–3), including GDPR anonymization.
+- Instance–subscription pairing invariant (rules 4–6) with
+  early-bird backfill requirement.
+- Multi-instance support with per-context single-instance limit
+  (rules 7–9).
+- Primary-key-based record lookup rules (rules 10–11).
+- Subscription change log with actor tracking, action labels,
+  before/after state, and transaction semantics (rules 12–18).
+- Record creation order and partial-failure handling (rules 19–23).

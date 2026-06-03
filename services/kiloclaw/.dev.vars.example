@@ -1,0 +1,166 @@
+# KiloClaw worker secrets (used by wrangler dev).
+# The dev-start script creates .dev.vars from this file on first run.
+#
+# Most values below are working defaults. The script auto-manages:
+#   NEXTAUTH_SECRET, INTERNAL_API_SECRET                     (synced from Vercel)
+#   GOOGLE_WORKSPACE_OAUTH_CLIENT_ID, GOOGLE_WORKSPACE_OAUTH_REDIRECT_URI,
+#   GOOGLE_WORKSPACE_OAUTH_CLIENT_SECRET,
+#   GOOGLE_WORKSPACE_REFRESH_TOKEN_ENCRYPTION_KEY            (synced from Vercel)
+#   KILOCLAW_CHECKIN_URL                                     (set from tunnel URL)
+#   FLY_API_TOKEN                                            (auto-created when provider=fly)
+#   KILOCODE_API_BASE_URL                                    (set from tunnel URL)
+#
+# Values you may need to set manually:
+#   AGENT_ENV_VARS_PRIVATE_KEY            (get from 1Password)
+#   FLY_IMAGE_TAG / FLY_IMAGE_DIGEST / FLY_IMAGE_CONTENT_MODE / OPENCLAW_VERSION
+#                                         (set by scripts/push-dev.sh,
+#                                          or ask a team member for values)
+
+# Auth (synced automatically from Vercel by the dev-start script)
+# JWT verification secret (shared with Next.js for token signing/verification)
+# @from NEXTAUTH_SECRET
+NEXTAUTH_SECRET=dev-secret-change-me
+# Platform API authentication key (for internal service-to-service calls)
+# @from INTERNAL_API_SECRET
+INTERNAL_API_SECRET=dev-internal-secret
+
+# Auth (static defaults — these work as-is for local dev)
+# HMAC secret for deriving per-sandbox gateway tokens (machine authentication)
+GATEWAY_TOKEN_SECRET=dev-gateway-secret-kiloclaw
+# Default provider for new provisions in local dev. Use "docker-local" or "fly".
+# docker-local runs containers on your machine (no Fly.io access needed).
+# fly requires access to the kilo-dev org on Fly.io.
+KILOCLAW_DEFAULT_PROVIDER=docker-local
+# Override WORKER_ENV to "development" for local development.
+# Production default is set in wrangler.jsonc. This selects the development
+# Fly app naming prefix ("dev-") for per-user app creation.
+WORKER_ENV=development
+
+# Docker-local demo provider (wrangler dev only).
+# Expose the Docker socket over loopback first:
+#   socat TCP-LISTEN:23750,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/var/run/docker.sock
+DOCKER_LOCAL_API_BASE=http://127.0.0.1:23750
+DOCKER_LOCAL_IMAGE=kiloclaw:local
+DOCKER_LOCAL_PORT_RANGE=45000-45999
+
+# Northflank provider (used when KILOCLAW_DEFAULT_PROVIDER=northflank or when
+# the runtime provider rollout KV config routes this user to Northflank).
+# NF_API_TOKEN and NF_EDGE_HEADER_VALUE are always secrets; in prod they live
+# in the Workers dashboard (wrangler secret put). For local dev, add them to
+# .env.local and the dev-start script will sync them into .dev.vars.
+# @from NF_API_TOKEN
+NF_API_TOKEN=
+NF_API_BASE=https://api.northflank.com/v1
+NF_TEAM_ID=kilo-dev
+NF_REGION=us-central
+NF_DEPLOYMENT_PLAN=nf-compute-200
+NF_STORAGE_CLASS_NAME=nf-multi-rw
+NF_STORAGE_ACCESS_MODE=ReadWriteMany
+NF_VOLUME_SIZE_MB=10240
+NF_EPHEMERAL_STORAGE_MB=10240
+NF_EDGE_HEADER_NAME=x-kiloclaw-northflank-edge-dev
+# @from NF_EDGE_HEADER_VALUE
+NF_EDGE_HEADER_VALUE=dev-local-northflank-edge-secret
+NF_IMAGE_PATH_TEMPLATE=ghcr.io/kilo-org/kiloclaw:{tag}
+NF_IMAGE_CREDENTIALS_ID=
+
+# Auto-populated by dev-start from `fly auth whoami`.
+# Tags Fly machines with developer identity for cleanup.
+# @exec fly auth whoami
+DEV_CREATOR=
+
+# Backend app origin for internal API calls (e.g. instance-ready email).
+# In dev, point this at your local Next.js server.
+BACKEND_API_URL=http://localhost:3000
+
+# Tunnel URL (set automatically by the dev-start script)
+# OpenClaw's native kilocode provider hardcodes https://api.kilo.ai/api/gateway/.
+# In dev, the script sets this to the Cloudflare tunnel URL pointing to your
+# local Next.js app so Fly machines route model requests through the tunnel.
+# KILOCODE_API_BASE_URL=https://<tunnel>.trycloudflare.com/api/gateway/
+# KILOCLAW_CHECKIN_URL=https://<tunnel>.trycloudflare.com/api/controller/checkin
+
+# Google OAuth (KiloClaw broker)
+# Google OAuth values are synced from .env.local.
+# @from GOOGLE_WORKSPACE_OAUTH_CLIENT_ID
+GOOGLE_WORKSPACE_OAUTH_CLIENT_ID=
+# @from GOOGLE_WORKSPACE_OAUTH_REDIRECT_URI
+GOOGLE_WORKSPACE_OAUTH_REDIRECT_URI=http://localhost:3000/api/integrations/google/callback
+# @from GOOGLE_WORKSPACE_OAUTH_CLIENT_SECRET
+GOOGLE_WORKSPACE_OAUTH_CLIENT_SECRET=
+# Symmetric key used to encrypt/decrypt stored Google refresh tokens.
+# Must be a base64-encoded 32-byte key (AES-256-GCM).
+# @from GOOGLE_WORKSPACE_REFRESH_TOKEN_ENCRYPTION_KEY
+GOOGLE_WORKSPACE_REFRESH_TOKEN_ENCRYPTION_KEY=
+
+# Fly.io Machines API (only needed when KILOCLAW_DEFAULT_PROVIDER=fly)
+# Token is auto-created in .env.local by `pnpm dev:env` when the provider is "fly",
+# using `fly tokens create org <FLY_ORG_SLUG>`. Skipped for docker-local.
+# @from FLY_API_TOKEN
+FLY_API_TOKEN=
+# Fly org slug. The dev-start script reads this value for token creation.
+# Use "kilo-dev" for Kilo team members, or "personal" for your own Fly account.
+FLY_ORG_SLUG=kilo-dev
+# Shared Docker image registry app (images are pushed here, referenced by all per-user apps).
+# In production this is "kiloclaw-machines". For dev, use "kiloclaw-registry-dev".
+FLY_REGISTRY_APP=kiloclaw-registry-dev
+# Default region for new users. Comma-separated priority list of region codes or aliases.
+# Fly tries the first region, falls back to the next if unavailable.
+# Examples: "us,eu" (try US first, then Europe), "lhr,fra" (London first, then Frankfurt)
+# The platform API can override per-user at provision time.
+FLY_REGION=us,eu
+# Docker image tag on registry.fly.io/{FLY_REGISTRY_APP}:{tag}.
+# Set automatically by scripts/push-dev.sh, or use "latest" to start.
+FLY_IMAGE_TAG=latest
+# Docker image digest (sha256:...) for immutable image references.
+# Set automatically by scripts/push-dev.sh when pushing images.
+FLY_IMAGE_DIGEST=
+# Image content hash mode: "production" for Dockerfile or "local" for
+# Dockerfile.local plus openclaw-build/openclaw-*.tgz.
+FLY_IMAGE_CONTENT_MODE=production
+# OpenClaw version (must match the openclaw@x.x.x version in the Dockerfile).
+# Used by the worker to self-register the version → image tag mapping in KV,
+# enabling per-user version tracking. Without this, version tracking fields
+# will be null and instances fall back to FLY_IMAGE_TAG directly.
+OPENCLAW_VERSION=2026.4.23
+
+# Legacy fallback for existing instances without per-user apps.
+# New instances get per-user apps (acct-{hash}) created automatically.
+FLY_APP_NAME=kiloclaw-dev
+
+# Allowed origins for the OpenClaw Control UI WebSocket (comma-separated).
+# Must include the origins that the browser connects from.
+# NOTE: wrangler dev rewrites the Origin header to match the custom domain route
+# (claw.kilosessions.ai), so that origin must be included for local dev.
+OPENCLAW_ALLOWED_ORIGINS=http://localhost:3000,http://localhost:8795,http://claw.kilosessions.ai
+
+# Per-instance host suffix + scheme. The worker uses these for (1) injecting
+# `<scheme>://<label><suffix>` into each machine's OPENCLAW_ALLOWED_ORIGINS
+# and (2) recognising `<label><suffix>` as an instance selector in the
+# catch-all proxy. Both are required — the worker refuses to start without
+# them, and there is no silent fallback.
+#
+# Dev default mirrors production routing on loopback:
+# `.kiloclaw.localhost` auto-resolves to 127.0.0.1 on modern browsers/OSes
+# per RFC 6761, so no /etc/hosts edit is needed. Open e.g.
+# http://i-<32hex>.kiloclaw.localhost:8795/ to route through the host
+# branch in dev. Hitting http://localhost:8795 directly still works —
+# that host doesn't match the suffix, so traffic falls through to the
+# existing path-based flow and the cookie-based catch-all.
+#
+# If wrangler dev is running on a port other than 8795, update the port
+# here to match.
+KILOCLAW_INSTANCE_HOST_SUFFIX=.kiloclaw.localhost:8795
+KILOCLAW_INSTANCE_URL_SCHEME=http
+
+# PostHog product telemetry (public project token, same as .env).
+NEXT_PUBLIC_POSTHOG_KEY=phc_GK2Pxl0HPj5ZPfwhLRjXrtdz8eD7e9MKnXiFrOqnB6z
+
+# Encryption (for user secrets)
+# Get the dev version from 1Password (engineering vault). Quote the value.
+# AGENT_ENV_VARS_PRIVATE_KEY=...
+
+# Hyperdrive is configured in wrangler.jsonc, not here.
+# In wrangler dev, it connects to the remote Postgres via the Hyperdrive service.
+# To use a local Postgres instead, add "localConnectionString" to the hyperdrive
+# config in wrangler.jsonc (see https://developers.cloudflare.com/hyperdrive/configuration/local-development/).

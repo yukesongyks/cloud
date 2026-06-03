@@ -1,0 +1,1906 @@
+// admin-router.ts
+import { adminProcedure, createTRPCRouter } from '@/lib/trpc/init';
+import { db, type DrizzleTransaction } from '@/lib/drizzle';
+import { insertKiloClawSubscriptionChangeLog, type KiloClawSubscription } from '@kilocode/db';
+import {
+  user_admin_notes,
+  kilocode_users,
+  stytch_fingerprints,
+  enrichment_data,
+  user_auth_provider,
+  modelStats,
+  cliSessions,
+  cli_sessions_v2,
+  credit_transactions,
+  kiloclaw_subscriptions,
+  kiloclaw_subscription_change_log,
+  kiloclaw_email_log,
+  kiloclaw_instances,
+  organizations,
+  modelsByProvider,
+  api_request_log,
+} from '@kilocode/db/schema';
+import { isNewSession } from '@/lib/cloud-agent/session-type';
+import { fetchSessionSnapshot, type SessionMessage } from '@/lib/session-ingest-client';
+import { syncAndStoreProviders } from '@/lib/ai-gateway/providers/openrouter/sync-providers';
+import { adminAppBuilderRouter } from '@/routers/admin-app-builder-router';
+import { adminDeploymentsRouter } from '@/routers/admin-deployments-router';
+import { adminKiloclawInstancesRouter } from '@/routers/admin-kiloclaw-instances-router';
+import { adminKiloclawVersionsRouter } from '@/routers/admin-kiloclaw-versions-router';
+import { adminKiloclawRegionsRouter } from '@/routers/admin-kiloclaw-regions-router';
+import { adminKiloclawProvidersRouter } from '@/routers/admin-kiloclaw-providers-router';
+import { adminFeatureInterestRouter } from '@/routers/admin-feature-interest-router';
+import { adminCodeReviewsRouter } from '@/routers/admin-code-reviews-router';
+import { adminCloudAgentNextRouter } from '@/routers/admin-cloud-agent-next-router';
+import { adminAIAttributionRouter } from '@/routers/admin-ai-attribution-router';
+import { ossSponsorshipRouter } from '@/routers/admin/oss-sponsorship-router';
+import { contributorChampionsRouter } from '@/routers/admin/contributor-champions-router';
+import { bulkUserCreditsRouter } from '@/routers/admin/bulk-user-credits-router';
+import { creditCampaignsRouter } from '@/routers/admin/credit-campaigns-router';
+import { emailTestingRouter } from '@/routers/admin/email-testing-router';
+import { adminGastownRouter } from '@/routers/admin/gastown-router';
+import { extendClawTrialRouter } from '@/routers/admin/extend-claw-trial-router';
+import { adminCustomLlmRouter } from '@/routers/admin/custom-llm-router';
+import { adminModelExperimentsRouter } from '@/routers/admin/model-experiments-router';
+import { adminGatewayConfigRouter } from '@/routers/admin/gateway-config-router';
+import { adminBlacklistDomainsRouter } from '@/routers/admin/blacklist-domains-router';
+import { adminBulkBlockRouter } from '@/routers/admin/bulk-block-router';
+import { adminKiloPassRouter } from '@/routers/admin/kilo-pass-router';
+import { adminKiloclawReferralsRouter } from '@/routers/admin/kiloclaw-referrals-router';
+import { adminStripeEarlyFraudWarningsRouter } from '@/routers/admin/stripe-early-fraud-warnings-router';
+import { adminShellSecurityContentRouter } from '@/routers/admin/shell-security-content-router';
+import { adminWebhookTriggersRouter } from '@/routers/admin-webhook-triggers-router';
+import { adminAlertingRouter } from '@/routers/admin-alerting-router';
+import { adminBotRequestsRouter } from '@/routers/admin-bot-requests-router';
+import { adminFreeModelUsageRouter } from '@/routers/admin/free-model-usage-router';
+import { adminModelEvalIngestRouter } from '@/routers/admin-model-eval-ingest-router';
+import { workerInstanceId } from '@/lib/kiloclaw/instance-registry';
+import { clearTrialInactivityStopAfterStart } from '@/lib/kiloclaw/instance-lifecycle';
+import * as z from 'zod';
+import { eq, and, ne, or, ilike, desc, asc, sql, isNull, inArray } from 'drizzle-orm';
+import { findUsersByIds, findUserById } from '@/lib/user';
+import { reportEvents } from '@/lib/ai-gateway/abuse-service';
+import { getBlobContent } from '@/lib/r2/cli-sessions';
+import { toNonNullish } from '@/lib/utils';
+import { TRPCError } from '@trpc/server';
+import { assertNoError, successResult } from '@/lib/maybe-result';
+import { maybeIssueKiloPassBonusFromUsageThreshold } from '@/lib/kilo-pass/usage-triggered-bonus';
+import { getKiloPassStateForUser } from '@/lib/kilo-pass/state';
+import { revokeWebSessions } from '@/lib/web-session-revocation';
+import {
+  kilo_pass_issuances,
+  kilo_pass_issuance_items,
+  microdollar_usage,
+} from '@kilocode/db/schema';
+import { KiloPassIssuanceItemKind } from '@/lib/kilo-pass/enums';
+import { fromMicrodollars } from '@/lib/utils';
+import { sum } from 'drizzle-orm';
+import { CRON_SECRET } from '@/lib/config.server';
+import { APP_URL } from '@/lib/constants';
+import { revalidatePath } from 'next/cache';
+import { recomputeUserBalances } from '@/lib/user/recompute-balances';
+import { getStripeInvoices } from '@/lib/stripe';
+import { client as stripeClient } from '@/lib/stripe-client';
+import { cancelAndRefundKiloPassForUser } from '@/lib/kilo-pass/cancel-and-refund';
+import { KILOCLAW_EARLYBIRD_EXPIRY_DATE } from '@/lib/kiloclaw/constants';
+import {
+  CurrentPersonalSubscriptionResolutionError,
+  getCurrentPersonalKiloClawSubscriptionForUser,
+  getEffectiveKiloClawSubscription,
+  getKiloClawEarlybirdStateForUser,
+  getKiloClawSubscriptionAccessReason,
+} from '@/lib/kiloclaw/access-state';
+import { createKiloClawAdminAuditLog } from '@/lib/kiloclaw/admin-audit-log';
+import { KiloClawInternalClient } from '@/lib/kiloclaw/kiloclaw-internal-client';
+import {
+  getKilocodeRepoOpenPullRequestCounts,
+  getKilocodeRepoOpenPullRequestsSummary,
+  getKilocodeRepoRecentlyClosedExternalPRs,
+  getKilocodeRepoRecentlyMergedExternalPRs,
+  ALL_REPO_IDS,
+} from '@/lib/github/open-pull-request-counts';
+
+const SyncResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string().optional(),
+});
+
+type SyncResponse = z.infer<typeof SyncResponseSchema>;
+
+function adminSubscriptionActor(ctxUser: {
+  id: string;
+  google_user_email: string;
+  google_user_name: string | null;
+}) {
+  return {
+    actorType: 'user',
+    actorId: ctxUser.id,
+  } as const;
+}
+
+const TRANSFERRED_KILOCLAW_SUBSCRIPTION_ERROR =
+  'Transferred KiloClaw subscriptions are historical and cannot be modified. Edit the current subscription instead.';
+
+function assertKiloClawSubscriptionIsMutable(
+  subscription: Pick<KiloClawSubscription, 'transferred_to_subscription_id'>
+) {
+  if (subscription.transferred_to_subscription_id) {
+    throw new TRPCError({
+      code: 'BAD_REQUEST',
+      message: TRANSFERRED_KILOCLAW_SUBSCRIPTION_ERROR,
+    });
+  }
+}
+
+type KiloClawCancelReconciliationStatus =
+  | 'updated'
+  | 'already_desired'
+  | 'local_row_changed_after_stripe';
+
+type KiloClawCancelAuditMetadata = {
+  subscriptionId: string;
+  mode: 'period_end' | 'immediate';
+  previousStatus: string;
+  stripeMutationAttempted: boolean;
+  stripeSubscriptionId: string | null;
+  scheduleReleased: boolean;
+  scheduleIdToRelease: string | null;
+  reconciliationStatus: KiloClawCancelReconciliationStatus;
+  localStateAtReconcile?: Partial<KiloClawSubscription> | null;
+};
+
+async function findKiloClawSubscriptionForUpdate(params: {
+  tx: DrizzleTransaction;
+  userId: string;
+  subscriptionId: string;
+}) {
+  const [subscription] = await params.tx
+    .select()
+    .from(kiloclaw_subscriptions)
+    .where(
+      and(
+        eq(kiloclaw_subscriptions.id, params.subscriptionId),
+        eq(kiloclaw_subscriptions.user_id, params.userId)
+      )
+    )
+    .for('update')
+    .limit(1);
+
+  return subscription ?? null;
+}
+
+async function lockKiloClawSubscription(params: {
+  tx: DrizzleTransaction;
+  userId: string;
+  subscriptionId: string;
+  notFoundCode: 'BAD_REQUEST' | 'NOT_FOUND';
+  notFoundMessage: string;
+}) {
+  const subscription = await findKiloClawSubscriptionForUpdate(params);
+
+  if (!subscription) {
+    throw new TRPCError({
+      code: params.notFoundCode,
+      message: params.notFoundMessage,
+    });
+  }
+
+  return subscription;
+}
+
+async function lockMutableKiloClawSubscription(
+  params: Parameters<typeof lockKiloClawSubscription>[0]
+) {
+  const subscription = await lockKiloClawSubscription(params);
+  assertKiloClawSubscriptionIsMutable(subscription);
+  return subscription;
+}
+
+function localKiloClawSubscriptionStateForAudit(subscription: KiloClawSubscription | null) {
+  if (!subscription) return null;
+  return {
+    id: subscription.id,
+    status: subscription.status,
+    plan: subscription.plan,
+    cancel_at_period_end: subscription.cancel_at_period_end,
+    transferred_to_subscription_id: subscription.transferred_to_subscription_id,
+    stripe_subscription_id: subscription.stripe_subscription_id,
+    stripe_schedule_id: subscription.stripe_schedule_id,
+    scheduled_plan: subscription.scheduled_plan,
+    scheduled_by: subscription.scheduled_by,
+    current_period_end: subscription.current_period_end,
+    credit_renewal_at: subscription.credit_renewal_at,
+    trial_ends_at: subscription.trial_ends_at,
+  };
+}
+
+function isKiloClawCancelDesiredState(params: {
+  subscription: KiloClawSubscription;
+  mode: 'period_end' | 'immediate';
+}) {
+  if (params.mode === 'period_end') {
+    return (
+      params.subscription.cancel_at_period_end &&
+      !params.subscription.stripe_schedule_id &&
+      !params.subscription.scheduled_plan &&
+      !params.subscription.scheduled_by
+    );
+  }
+
+  return (
+    params.subscription.status === 'canceled' &&
+    !params.subscription.cancel_at_period_end &&
+    !params.subscription.pending_conversion &&
+    !params.subscription.stripe_schedule_id &&
+    !params.subscription.scheduled_plan &&
+    !params.subscription.scheduled_by
+  );
+}
+
+function parseJsonSafe(text: string): unknown {
+  return JSON.parse(text) as unknown;
+}
+
+const AddNoteSchema = z.object({
+  kilo_user_id: z.string(),
+  noteContent: z.string().min(1, 'Note content cannot be empty').trim(),
+});
+
+const DeleteNoteSchema = z.object({
+  note_id: z.string(),
+});
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const sessionIdSchema = z
+  .string()
+  .min(1)
+  .refine(s => UUID_REGEX.test(s) || s.startsWith('ses_'), {
+    message: 'Must be a UUID or ses_-prefixed session ID',
+  });
+
+const ResetAPIKeySchema = z.object({
+  userId: z.string(),
+});
+
+const CheckKiloPassSchema = z.object({
+  userId: z.string(),
+});
+
+const ResetToMagicLinkLoginSchema = z.object({
+  userId: z.string(),
+});
+
+const UpdateUserBlockStatusSchema = z.object({
+  userId: z.string(),
+  blocked_reason: z.string().trim().min(1).nullable(),
+});
+
+const GetStytchFingerprintsSchema = z.object({
+  kilo_user_id: z.string(),
+  fingerprint_type: z
+    .enum([
+      'visitor_fingerprint',
+      'browser_fingerprint',
+      'network_fingerprint',
+      'hardware_fingerprint',
+    ])
+    .default('visitor_fingerprint'),
+});
+
+const UpsertEnrichmentDataSchema = z.object({
+  user_id: z.string(),
+  github_enrichment_data: z.record(z.string(), z.unknown()).nullable().optional(),
+  linkedin_enrichment_data: z.record(z.string(), z.unknown()).nullable().optional(),
+  clay_enrichment_data: z.record(z.string(), z.unknown()).nullable().optional(),
+});
+
+const ModelStatsListSchema = z.object({
+  page: z.number().min(1).default(1),
+  limit: z.number().min(1).max(100).default(100),
+  sortBy: z.enum(['name', 'openrouterId', 'createdAt', 'isActive']).default('createdAt'),
+  sortOrder: z.enum(['asc', 'desc']).default('desc'),
+  search: z.string().optional(),
+  isActive: z.enum(['true', 'false', '']).optional(),
+});
+
+const CreateModelSchema = z.object({
+  openrouterId: z.string().min(1),
+  name: z.string().min(1),
+  slug: z.string().optional(),
+  aaSlug: z.string().optional(),
+  isActive: z.boolean().default(true),
+});
+
+const UpdateModelSchema = z.object({
+  id: z.string(),
+  aaSlug: z.string().nullable().optional(),
+  isActive: z.boolean().optional(),
+  isFeatured: z.boolean().optional(),
+  isStealth: z.boolean().optional(),
+});
+
+const GetUserInvoicesSchema = z.object({
+  stripe_customer_id: z.string(),
+});
+
+const CancelAndRefundKiloPassSchema = z.object({
+  userId: z.string(),
+  reason: z.string().min(1, 'Reason is required').trim(),
+});
+
+const GetKiloClawStateSchema = z.object({
+  userId: z.string(),
+});
+
+const GetKiloClawSubscriptionChangeLogsSchema = z.object({
+  userId: z.string(),
+  subscriptionId: z.string(),
+  limit: z.number().int().min(1).max(100).default(50),
+});
+
+const UpdateKiloClawTrialEndAtSchema = z.object({
+  userId: z.string(),
+  subscriptionId: z.string(),
+  trial_ends_at: z.string().datetime(),
+});
+
+const CancelKiloClawSubscriptionSchema = z.object({
+  userId: z.string(),
+  subscriptionId: z.string(),
+  mode: z.enum(['period_end', 'immediate']),
+});
+
+export const adminRouter = createTRPCRouter({
+  kiloclawReferrals: adminKiloclawReferralsRouter,
+  webhookTriggers: adminWebhookTriggersRouter,
+  github: createTRPCRouter({
+    getKilocodeOpenPullRequestCounts: adminProcedure.query(async () => {
+      return getKilocodeRepoOpenPullRequestCounts({ ttlMs: 2 * 60_000 });
+    }),
+
+    getKilocodeOpenPullRequestsSummary: adminProcedure
+      .input(
+        z
+          .object({
+            includeDrafts: z.boolean().optional(),
+            repos: z
+              .array(z.enum(['kilocode', 'cloud', 'kilo-marketplace', 'kilocode-legacy']))
+              .optional(),
+          })
+          .optional()
+      )
+      .query(async ({ input }) => {
+        const repos = input?.repos ?? [...ALL_REPO_IDS];
+        return getKilocodeRepoOpenPullRequestsSummary({
+          ttlMs: 2 * 60_000,
+          includeDrafts: input?.includeDrafts ?? false,
+          repos,
+        });
+      }),
+
+    getKilocodeRecentlyMergedExternalPRs: adminProcedure.query(async () => {
+      return getKilocodeRepoRecentlyMergedExternalPRs({ ttlMs: 2 * 60_000, maxResults: 50 });
+    }),
+
+    getKilocodeRecentlyClosedExternalPRs: adminProcedure
+      .input(
+        z
+          .object({
+            repos: z
+              .array(z.enum(['kilocode', 'cloud', 'kilo-marketplace', 'kilocode-legacy']))
+              .optional(),
+          })
+          .optional()
+      )
+      .query(async ({ input }) => {
+        const repos = input?.repos ?? [...ALL_REPO_IDS];
+        return getKilocodeRepoRecentlyClosedExternalPRs({
+          ttlMs: 2 * 60_000,
+          maxResults: 50,
+          repos,
+        });
+      }),
+  }),
+
+  users: createTRPCRouter({
+    addNote: adminProcedure.input(AddNoteSchema).mutation(async ({ input, ctx }) => {
+      const insertResult = await db
+        .insert(user_admin_notes)
+        .values({
+          kilo_user_id: input.kilo_user_id,
+          note_content: input.noteContent,
+          admin_kilo_user_id: ctx.user.id,
+        })
+        .returning();
+
+      return {
+        ...insertResult[0],
+        admin_kilo_user: ctx.user,
+      };
+    }),
+
+    deleteNote: adminProcedure.input(DeleteNoteSchema).mutation(async ({ input }) => {
+      const res = await db.delete(user_admin_notes).where(eq(user_admin_notes.id, input.note_id));
+      return { success: (res.rowCount ?? 0) > 0 };
+    }),
+
+    resetAPIKey: adminProcedure.input(ResetAPIKeySchema).mutation(async ({ input }) => {
+      await db
+        .update(kilocode_users)
+        .set({ api_token_pepper: crypto.randomUUID() })
+        .where(eq(kilocode_users.id, input.userId));
+
+      return successResult();
+    }),
+
+    signOutBrowserSessions: adminProcedure.input(ResetAPIKeySchema).mutation(async ({ input }) => {
+      await revokeWebSessions(input.userId);
+
+      return successResult();
+    }),
+
+    checkKiloPass: adminProcedure.input(CheckKiloPassSchema).mutation(async ({ input }) => {
+      const before = await db.query.kilocode_users.findFirst({
+        columns: {
+          microdollars_used: true,
+          kilo_pass_threshold: true,
+        },
+        where: eq(kilocode_users.id, input.userId),
+      });
+
+      if (!before) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'User not found' });
+      }
+
+      await maybeIssueKiloPassBonusFromUsageThreshold({
+        kiloUserId: input.userId,
+        nowIso: new Date().toISOString(),
+      });
+
+      const after = await db.query.kilocode_users.findFirst({
+        columns: {
+          microdollars_used: true,
+          kilo_pass_threshold: true,
+        },
+        where: eq(kilocode_users.id, input.userId),
+      });
+
+      return { before, after };
+    }),
+
+    resetToMagicLinkLogin: adminProcedure
+      .input(ResetToMagicLinkLoginSchema)
+      .mutation(async ({ input }) => {
+        // Check if user has SSO (workos) provider - forbid reset for SSO users
+        const ssoProvider = await db.query.user_auth_provider.findFirst({
+          where: and(
+            eq(user_auth_provider.kilo_user_id, input.userId),
+            eq(user_auth_provider.provider, 'workos')
+          ),
+        });
+
+        if (ssoProvider) {
+          throw new TRPCError({
+            code: 'FORBIDDEN',
+            message:
+              'Cannot reset to magic link login for SSO users. The user must authenticate through their organization SSO provider.',
+          });
+        }
+
+        await db
+          .delete(user_auth_provider)
+          .where(eq(user_auth_provider.kilo_user_id, input.userId));
+
+        return successResult();
+      }),
+
+    updateBlockStatus: adminProcedure
+      .input(UpdateUserBlockStatusSchema)
+      .mutation(async ({ input, ctx }) => {
+        const isBlocking = Boolean(input.blocked_reason);
+        let didTransition = false;
+
+        await db.transaction(async tx => {
+          const [current] = await tx
+            .select({ blocked_reason: kilocode_users.blocked_reason })
+            .from(kilocode_users)
+            .where(eq(kilocode_users.id, input.userId))
+            .for('update')
+            .limit(1);
+
+          const wasBlocked = Boolean(current?.blocked_reason);
+          didTransition = isBlocking !== wasBlocked;
+
+          const blockMetadata = isBlocking
+            ? {
+                blocked_reason: input.blocked_reason,
+                blocked_at: new Date().toISOString(),
+                blocked_by_kilo_user_id: ctx.user.id,
+              }
+            : {
+                blocked_reason: null,
+                blocked_at: null,
+                blocked_by_kilo_user_id: null,
+              };
+
+          await tx
+            .update(kilocode_users)
+            .set(blockMetadata)
+            .where(eq(kilocode_users.id, input.userId));
+        });
+
+        if (didTransition) {
+          void reportEvents({
+            events: [
+              {
+                type: isBlocking ? 'user.blocked' : 'user.unblocked',
+                data: {
+                  kilo_user_id: input.userId,
+                  reason: input.blocked_reason ?? null,
+                  actor_email: ctx.user.google_user_email,
+                },
+              },
+            ],
+          });
+        }
+
+        return successResult();
+      }),
+
+    getStytchFingerprints: adminProcedure
+      .input(GetStytchFingerprintsSchema)
+      .query(async ({ input }) => {
+        const userId = input.kilo_user_id;
+        const fingerprintType = input.fingerprint_type;
+
+        const fingerprintsQuery = db
+          .select({
+            id: stytch_fingerprints.id,
+            visitor_fingerprint: stytch_fingerprints.visitor_fingerprint,
+            browser_fingerprint: stytch_fingerprints.browser_fingerprint,
+            network_fingerprint: stytch_fingerprints.network_fingerprint,
+            hardware_fingerprint: stytch_fingerprints.hardware_fingerprint,
+            kilo_user_id: stytch_fingerprints.kilo_user_id,
+            verdict_action: stytch_fingerprints.verdict_action,
+            kilo_free_tier_allowed: stytch_fingerprints.kilo_free_tier_allowed,
+            created_at: stytch_fingerprints.created_at,
+            reasons: stytch_fingerprints.reasons,
+          })
+          .from(stytch_fingerprints);
+
+        const userFingerprints = await fingerprintsQuery.where(
+          eq(stytch_fingerprints.kilo_user_id, userId)
+        );
+
+        // Get all unique fingerprints of the selected type
+        const uniqueFingerprints = [
+          ...new Set(userFingerprints.map(fp => fp[fingerprintType]).filter(fp => fp != 'UNKNOWN')),
+        ];
+
+        // Find all other users with the same fingerprints (excluding current user)
+        const relatedFingerprints =
+          uniqueFingerprints.length > 0
+            ? await fingerprintsQuery
+                .where(
+                  and(
+                    ne(stytch_fingerprints.kilo_user_id, userId),
+                    or(
+                      ...uniqueFingerprints.map(fp => eq(stytch_fingerprints[fingerprintType], fp))
+                    )
+                  )
+                )
+                .limit(100)
+            : [];
+
+        const usersById = await findUsersByIds(relatedFingerprints.map(fp => fp.kilo_user_id));
+
+        // Map over unique user IDs to build result
+        const relatedUsers = relatedFingerprints.map(fp => {
+          const user = toNonNullish(usersById.get(fp.kilo_user_id));
+          return {
+            ...fp,
+            google_user_email: user.google_user_email,
+            google_user_name: user.google_user_name,
+            google_user_image_url: user.google_user_image_url,
+            has_validation_stytch: user.has_validation_stytch,
+            user_created_at: user.created_at,
+          };
+        });
+
+        return {
+          fingerprints: userFingerprints,
+          relatedUsers,
+          fingerprintType,
+        };
+      }),
+
+    getKiloPassState: adminProcedure
+      .input(z.object({ userId: z.string() }))
+      .query(async ({ input }) => {
+        const user = await db.query.kilocode_users.findFirst({
+          columns: {
+            microdollars_used: true,
+            total_microdollars_acquired: true,
+            kilo_pass_threshold: true,
+          },
+          where: eq(kilocode_users.id, input.userId),
+        });
+
+        if (!user) {
+          throw new TRPCError({ code: 'NOT_FOUND', message: 'User not found' });
+        }
+
+        const subscription = await getKiloPassStateForUser(db, input.userId);
+        if (!subscription) {
+          return {
+            subscription: null,
+            issuances: [],
+            currentPeriodUsageUsd: null,
+            thresholds: null,
+          };
+        }
+
+        // Fetch all issuances with their items for this subscription
+        const issuanceRows = await db
+          .select({
+            issueMonth: kilo_pass_issuances.issue_month,
+            issuanceCreatedAt: kilo_pass_issuances.created_at,
+            itemKind: kilo_pass_issuance_items.kind,
+            itemAmountUsd: kilo_pass_issuance_items.amount_usd,
+            itemCreatedAt: kilo_pass_issuance_items.created_at,
+            bonusPercentApplied: kilo_pass_issuance_items.bonus_percent_applied,
+          })
+          .from(kilo_pass_issuances)
+          .innerJoin(
+            kilo_pass_issuance_items,
+            eq(kilo_pass_issuance_items.kilo_pass_issuance_id, kilo_pass_issuances.id)
+          )
+          .where(eq(kilo_pass_issuances.kilo_pass_subscription_id, subscription.subscriptionId))
+          .orderBy(desc(kilo_pass_issuances.issue_month), asc(kilo_pass_issuance_items.created_at));
+
+        // Find the most recent base credit issuance to compute usage since
+        const latestBaseIssuance = issuanceRows.find(
+          r => r.itemKind === KiloPassIssuanceItemKind.Base
+        );
+
+        let currentPeriodUsageUsd: number | null = null;
+        if (latestBaseIssuance) {
+          const result = await db
+            .select({
+              totalCost_mUsd: sql<unknown>`COALESCE(${sum(microdollar_usage.cost)}, 0)`,
+            })
+            .from(microdollar_usage)
+            .where(
+              and(
+                eq(microdollar_usage.kilo_user_id, input.userId),
+                isNull(microdollar_usage.organization_id),
+                sql`${microdollar_usage.created_at} >= ${latestBaseIssuance.itemCreatedAt}`,
+                sql`${microdollar_usage.created_at} < now()`
+              )
+            );
+          const raw = Number(result[0]?.totalCost_mUsd);
+          currentPeriodUsageUsd = isNaN(raw) ? 0 : Math.round(fromMicrodollars(raw) * 100) / 100;
+        }
+
+        const effectiveThreshold =
+          user.kilo_pass_threshold != null
+            ? Math.max(0, user.kilo_pass_threshold - 1_000_000)
+            : null;
+
+        return {
+          subscription: {
+            ...subscription,
+          },
+          issuances: issuanceRows.map(r => ({
+            issueMonth: r.issueMonth,
+            issuanceCreatedAt: r.issuanceCreatedAt,
+            itemKind: r.itemKind,
+            itemAmountUsd: r.itemAmountUsd,
+            itemCreatedAt: r.itemCreatedAt,
+            bonusPercentApplied: r.bonusPercentApplied,
+          })),
+          currentPeriodUsageUsd,
+          thresholds: {
+            kiloPassThreshold_mUsd: user.kilo_pass_threshold,
+            effectiveThreshold_mUsd: effectiveThreshold,
+            microdollarsUsed: user.microdollars_used,
+            totalMicrodollarsAcquired: user.total_microdollars_acquired,
+            bonusUnlocked: user.kilo_pass_threshold === null,
+          },
+        };
+      }),
+
+    getKiloClawState: adminProcedure.input(GetKiloClawStateSchema).query(async ({ input }) => {
+      const user = await db.query.kilocode_users.findFirst({
+        columns: { id: true, kiloclaw_early_access: true },
+        where: eq(kilocode_users.id, input.userId),
+      });
+
+      if (!user) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'User not found' });
+      }
+
+      const now = new Date();
+      const [allSubscriptions, earlybirdState, activeInstance, allInstances] = await Promise.all([
+        db
+          .select()
+          .from(kiloclaw_subscriptions)
+          .where(eq(kiloclaw_subscriptions.user_id, input.userId))
+          .orderBy(desc(kiloclaw_subscriptions.created_at)),
+        getKiloClawEarlybirdStateForUser(input.userId, now),
+        db.query.kiloclaw_instances.findFirst({
+          columns: { id: true },
+          where: and(
+            eq(kiloclaw_instances.user_id, input.userId),
+            isNull(kiloclaw_instances.destroyed_at)
+          ),
+        }),
+        db
+          .select({
+            id: kiloclaw_instances.id,
+            name: kiloclaw_instances.name,
+            sandbox_id: kiloclaw_instances.sandbox_id,
+            destroyed_at: kiloclaw_instances.destroyed_at,
+            organization_id: kiloclaw_instances.organization_id,
+            organization_name: organizations.name,
+          })
+          .from(kiloclaw_instances)
+          .leftJoin(organizations, eq(organizations.id, kiloclaw_instances.organization_id))
+          .where(eq(kiloclaw_instances.user_id, input.userId)),
+      ]);
+
+      let billingStateError: string | null = null;
+      let effectiveSub: KiloClawSubscription | null = null;
+      let accessReason = null as ReturnType<typeof getKiloClawSubscriptionAccessReason>;
+      try {
+        const currentPersonalSubscriptionState =
+          await getCurrentPersonalKiloClawSubscriptionForUser(input.userId, now);
+        effectiveSub = currentPersonalSubscriptionState.subscription;
+        accessReason = currentPersonalSubscriptionState.accessReason;
+      } catch (error) {
+        if (!(error instanceof CurrentPersonalSubscriptionResolutionError)) {
+          throw error;
+        }
+        billingStateError = error.message;
+      }
+
+      if (!effectiveSub || !accessReason) {
+        const detachedAccessSubscriptions = allSubscriptions.filter(subscription => {
+          if (subscription.instance_id !== null) return false;
+          const detachedAccessReason = getKiloClawSubscriptionAccessReason(subscription, now);
+          return detachedAccessReason !== null;
+        });
+        if (detachedAccessSubscriptions.length > 1) {
+          billingStateError = 'Multiple detached access-granting KiloClaw subscription rows exist.';
+        } else {
+          const detachedAccessSubscription = getEffectiveKiloClawSubscription(
+            detachedAccessSubscriptions,
+            now
+          );
+          const detachedAccessReason = getKiloClawSubscriptionAccessReason(
+            detachedAccessSubscription,
+            now
+          );
+          if (detachedAccessReason) {
+            effectiveSub = detachedAccessSubscription;
+            accessReason = detachedAccessReason;
+          }
+        }
+      }
+      const earlybirdDaysRemaining = earlybirdState.expiresAt
+        ? Math.ceil((new Date(earlybirdState.expiresAt).getTime() - Date.now()) / 86_400_000)
+        : 0;
+      const hasAccess = earlybirdState.hasAccess || accessReason !== null;
+      const effectiveAccessReason = earlybirdState.hasAccess ? 'earlybird' : accessReason;
+
+      // Build instance lookup for per-subscription context
+      const instancesById = new Map(allInstances.map(inst => [inst.id, inst]));
+
+      const subscriptions = allSubscriptions.map(sub => ({
+        ...sub,
+        instance: sub.instance_id ? (instancesById.get(sub.instance_id) ?? null) : null,
+      }));
+
+      return {
+        subscription: effectiveSub,
+        effectiveSubscriptionId: effectiveSub?.id ?? null,
+        subscriptions,
+        hasAccess,
+        accessReason: effectiveAccessReason,
+        earlybird: earlybirdState.purchased
+          ? {
+              purchased: true,
+              expiresAt: earlybirdState.expiresAt ?? KILOCLAW_EARLYBIRD_EXPIRY_DATE,
+              daysRemaining: earlybirdDaysRemaining,
+            }
+          : null,
+        activeInstanceId: activeInstance?.id ?? null,
+        kiloclawEarlyAccess: user.kiloclaw_early_access ?? false,
+        billingStateError,
+        needsSupportReview: billingStateError !== null,
+      };
+    }),
+
+    getKiloClawSubscriptionChangeLogs: adminProcedure
+      .input(GetKiloClawSubscriptionChangeLogsSchema)
+      .query(async ({ input }) => {
+        const subscription = await db.query.kiloclaw_subscriptions.findFirst({
+          columns: { id: true },
+          where: and(
+            eq(kiloclaw_subscriptions.id, input.subscriptionId),
+            eq(kiloclaw_subscriptions.user_id, input.userId)
+          ),
+        });
+
+        if (!subscription) {
+          throw new TRPCError({
+            code: 'NOT_FOUND',
+            message: 'Subscription not found or does not belong to this user',
+          });
+        }
+
+        const changeLogs = await db
+          .select()
+          .from(kiloclaw_subscription_change_log)
+          .where(eq(kiloclaw_subscription_change_log.subscription_id, input.subscriptionId))
+          .orderBy(
+            desc(kiloclaw_subscription_change_log.created_at),
+            desc(kiloclaw_subscription_change_log.id)
+          )
+          .limit(input.limit);
+
+        return { changeLogs };
+      }),
+
+    updateKiloClawTrialEndAt: adminProcedure
+      .input(UpdateKiloClawTrialEndAtSchema)
+      .mutation(async ({ input, ctx }) => {
+        const user = await db.query.kilocode_users.findFirst({
+          columns: { id: true },
+          where: eq(kilocode_users.id, input.userId),
+        });
+
+        if (!user) {
+          throw new TRPCError({ code: 'NOT_FOUND', message: 'User not found' });
+        }
+
+        let isReset = false;
+
+        await db.transaction(async tx => {
+          const subscription = await lockMutableKiloClawSubscription({
+            tx,
+            userId: input.userId,
+            subscriptionId: input.subscriptionId,
+            notFoundCode: 'BAD_REQUEST',
+            notFoundMessage: 'No KiloClaw subscription found for this user',
+          });
+
+          if (subscription.status !== 'trialing' && subscription.status !== 'canceled') {
+            throw new TRPCError({
+              code: 'BAD_REQUEST',
+              message:
+                'Only trialing or canceled KiloClaw subscriptions can have their trial end date edited',
+            });
+          }
+
+          isReset = subscription.status === 'canceled';
+          const previousTrialEndsAt = subscription.trial_ends_at;
+          if (isReset) {
+            // Reset canceled subscription to a new trial
+            const [updatedSubscription] = await tx
+              .update(kiloclaw_subscriptions)
+              .set({
+                status: 'trialing',
+                plan: 'trial',
+                trial_started_at: new Date().toISOString(),
+                trial_ends_at: input.trial_ends_at,
+                stripe_subscription_id: null,
+                stripe_schedule_id: null,
+                scheduled_plan: null,
+                scheduled_by: null,
+                cancel_at_period_end: false,
+                current_period_start: null,
+                current_period_end: null,
+                commit_ends_at: null,
+                past_due_since: null,
+                suspended_at: null,
+                destruction_deadline: null,
+              })
+              .where(
+                and(
+                  eq(kiloclaw_subscriptions.id, subscription.id),
+                  isNull(kiloclaw_subscriptions.transferred_to_subscription_id)
+                )
+              )
+              .returning();
+
+            if (!updatedSubscription) {
+              throw new TRPCError({
+                code: 'INTERNAL_SERVER_ERROR',
+                message: 'Failed to reset KiloClaw subscription trial',
+              });
+            }
+
+            await insertKiloClawSubscriptionChangeLog(tx, {
+              subscriptionId: subscription.id,
+              actor: adminSubscriptionActor(ctx.user),
+              action: 'reactivated',
+              reason: 'admin_reset_trial',
+              before: subscription,
+              after: updatedSubscription,
+            });
+
+            // Clear email logs so notifications can fire again for the new trial.
+            // Unlike autoResumeIfSuspended (which preserves trial warnings as one-time events),
+            // an admin reset creates a genuinely new trial, so trial warnings should repeat.
+            const emailTypesToClearOnTrialReset = [
+              'claw_trial_1d',
+              'claw_trial_5d',
+              'claw_suspended_trial',
+              'claw_suspended_subscription',
+              'claw_suspended_payment',
+              'claw_destruction_warning',
+              'claw_instance_destroyed',
+            ];
+            await tx
+              .delete(kiloclaw_email_log)
+              .where(
+                and(
+                  eq(kiloclaw_email_log.user_id, input.userId),
+                  subscription.instance_id
+                    ? eq(kiloclaw_email_log.instance_id, subscription.instance_id)
+                    : isNull(kiloclaw_email_log.instance_id),
+                  inArray(kiloclaw_email_log.email_type, emailTypesToClearOnTrialReset)
+                )
+              );
+          } else {
+            // Just update the trial end date for an active trial
+            const [updatedSubscription] = await tx
+              .update(kiloclaw_subscriptions)
+              .set({ trial_ends_at: input.trial_ends_at })
+              .where(
+                and(
+                  eq(kiloclaw_subscriptions.id, subscription.id),
+                  isNull(kiloclaw_subscriptions.transferred_to_subscription_id)
+                )
+              )
+              .returning();
+
+            if (!updatedSubscription) {
+              throw new TRPCError({
+                code: 'INTERNAL_SERVER_ERROR',
+                message: 'Failed to update KiloClaw trial end date',
+              });
+            }
+
+            await insertKiloClawSubscriptionChangeLog(tx, {
+              subscriptionId: subscription.id,
+              actor: adminSubscriptionActor(ctx.user),
+              action: 'admin_override',
+              reason: 'admin_update_trial_end',
+              before: subscription,
+              after: updatedSubscription,
+            });
+          }
+
+          await createKiloClawAdminAuditLog({
+            action: isReset
+              ? 'kiloclaw.subscription.reset_trial'
+              : 'kiloclaw.subscription.update_trial_end',
+            actor_id: ctx.user.id,
+            actor_email: ctx.user.google_user_email,
+            actor_name: ctx.user.google_user_name,
+            target_user_id: input.userId,
+            message: isReset
+              ? `KiloClaw subscription reset from canceled to trialing, trial ends ${input.trial_ends_at}`
+              : `KiloClaw trial end updated from ${previousTrialEndsAt ?? 'unset'} to ${input.trial_ends_at}`,
+            metadata: {
+              isReset,
+              previousStatus: subscription.status,
+              previousTrialEndsAt,
+              newTrialEndsAt: input.trial_ends_at,
+            },
+            tx,
+          });
+        });
+
+        // For resets, attempt to start the instance (best effort, outside transaction)
+        if (isReset) {
+          const [activeInstance] = await db
+            .select({
+              id: kiloclaw_instances.id,
+              sandbox_id: kiloclaw_instances.sandbox_id,
+            })
+            .from(kiloclaw_instances)
+            .where(
+              and(
+                eq(kiloclaw_instances.user_id, input.userId),
+                isNull(kiloclaw_instances.organization_id),
+                isNull(kiloclaw_instances.destroyed_at)
+              )
+            )
+            .limit(1);
+
+          if (activeInstance) {
+            try {
+              const client = new KiloClawInternalClient();
+              const startResult = await client.start(
+                input.userId,
+                workerInstanceId(activeInstance),
+                {
+                  reason: 'admin_request',
+                }
+              );
+              if (startResult.currentStatus === 'running') {
+                await clearTrialInactivityStopAfterStart({
+                  kiloUserId: input.userId,
+                  instanceId: activeInstance.id,
+                });
+              }
+            } catch {
+              // Best effort — instance will be startable by the user from the dashboard
+            }
+          }
+        }
+
+        return successResult();
+      }),
+
+    cancelKiloClawSubscription: adminProcedure
+      .input(CancelKiloClawSubscriptionSchema)
+      .mutation(async ({ input, ctx }) => {
+        const subscription = await db.transaction(tx =>
+          lockMutableKiloClawSubscription({
+            tx,
+            userId: input.userId,
+            subscriptionId: input.subscriptionId,
+            notFoundCode: 'NOT_FOUND',
+            notFoundMessage: 'Subscription not found or does not belong to this user',
+          })
+        );
+
+        const previousStatus = subscription.status;
+        let scheduleReleased = false;
+        let scheduleIdToRelease: string | null = null;
+
+        if (input.mode === 'period_end') {
+          if (subscription.status !== 'active') {
+            throw new TRPCError({
+              code: 'BAD_REQUEST',
+              message: 'Only active subscriptions can be canceled at period end',
+            });
+          }
+          if (subscription.cancel_at_period_end) {
+            throw new TRPCError({
+              code: 'BAD_REQUEST',
+              message: 'Subscription is already set to cancel at period end',
+            });
+          }
+
+          if (subscription.stripe_subscription_id) {
+            const liveSub = await stripeClient.subscriptions.retrieve(
+              subscription.stripe_subscription_id
+            );
+            const scheduleRef = liveSub.schedule;
+            scheduleIdToRelease =
+              subscription.stripe_schedule_id ??
+              (scheduleRef
+                ? typeof scheduleRef === 'string'
+                  ? scheduleRef
+                  : scheduleRef.id
+                : null);
+
+            if (scheduleIdToRelease) {
+              try {
+                await stripeClient.subscriptionSchedules.release(scheduleIdToRelease);
+                scheduleReleased = true;
+              } catch (error) {
+                const msg = error instanceof Error ? error.message : String(error);
+                const alreadyInactive =
+                  msg.includes('not active') ||
+                  msg.includes('released') ||
+                  msg.includes('canceled') ||
+                  msg.includes('completed');
+                if (!alreadyInactive) {
+                  throw new TRPCError({
+                    code: 'INTERNAL_SERVER_ERROR',
+                    message:
+                      'Unable to cancel: failed to release pending plan schedule. Please try again.',
+                  });
+                }
+                scheduleReleased = true;
+              }
+            }
+
+            await stripeClient.subscriptions.update(subscription.stripe_subscription_id, {
+              cancel_at_period_end: true,
+            });
+          }
+        } else {
+          if (
+            subscription.status !== 'active' &&
+            subscription.status !== 'past_due' &&
+            subscription.status !== 'trialing'
+          ) {
+            throw new TRPCError({
+              code: 'BAD_REQUEST',
+              message:
+                'Only active, past-due, or trialing subscriptions can be immediately canceled',
+            });
+          }
+
+          scheduleIdToRelease = subscription.stripe_schedule_id;
+          if (scheduleIdToRelease) {
+            try {
+              await stripeClient.subscriptionSchedules.release(scheduleIdToRelease);
+              scheduleReleased = true;
+            } catch (error) {
+              const msg = error instanceof Error ? error.message : String(error);
+              const alreadyInactive =
+                msg.includes('not active') ||
+                msg.includes('released') ||
+                msg.includes('canceled') ||
+                msg.includes('completed');
+              if (!alreadyInactive) {
+                throw new TRPCError({
+                  code: 'INTERNAL_SERVER_ERROR',
+                  message:
+                    'Unable to cancel: failed to release pending plan schedule. Please try again.',
+                });
+              }
+              scheduleReleased = true;
+            }
+          }
+
+          if (subscription.stripe_subscription_id) {
+            await stripeClient.subscriptions.cancel(subscription.stripe_subscription_id, {
+              prorate: false,
+              invoice_now: false,
+            });
+          }
+        }
+
+        const stripeMutationAttempted = Boolean(subscription.stripe_subscription_id);
+        const now = new Date().toISOString();
+        const reconciliationResult = await db.transaction(async tx => {
+          const localSubscription = await findKiloClawSubscriptionForUpdate({
+            tx,
+            userId: input.userId,
+            subscriptionId: input.subscriptionId,
+          });
+          const localStateAtReconcile = localKiloClawSubscriptionStateForAudit(localSubscription);
+          const baseMetadata = {
+            subscriptionId: subscription.id,
+            mode: input.mode,
+            previousStatus,
+            stripeMutationAttempted,
+            stripeSubscriptionId: subscription.stripe_subscription_id,
+            scheduleReleased,
+            scheduleIdToRelease,
+            localStateAtReconcile,
+          } satisfies Omit<KiloClawCancelAuditMetadata, 'reconciliationStatus'>;
+
+          if (!localSubscription || localSubscription.transferred_to_subscription_id) {
+            const metadata = {
+              ...baseMetadata,
+              reconciliationStatus: 'local_row_changed_after_stripe',
+            } satisfies KiloClawCancelAuditMetadata;
+            await createKiloClawAdminAuditLog({
+              action: 'kiloclaw.subscription.admin_cancel',
+              actor_id: ctx.user.id,
+              actor_email: ctx.user.google_user_email,
+              actor_name: ctx.user.google_user_name,
+              target_user_id: input.userId,
+              message: `Stripe cancel succeeded for KiloClaw subscription ${subscription.id}, but local row changed before reconciliation`,
+              metadata,
+              tx,
+            });
+            return { status: 'local_row_changed_after_stripe' as const };
+          }
+
+          if (input.mode === 'period_end' && localSubscription.status !== 'active') {
+            const metadata = {
+              ...baseMetadata,
+              reconciliationStatus: 'local_row_changed_after_stripe',
+            } satisfies KiloClawCancelAuditMetadata;
+            await createKiloClawAdminAuditLog({
+              action: 'kiloclaw.subscription.admin_cancel',
+              actor_id: ctx.user.id,
+              actor_email: ctx.user.google_user_email,
+              actor_name: ctx.user.google_user_name,
+              target_user_id: input.userId,
+              message: `Stripe period-end cancel succeeded for KiloClaw subscription ${subscription.id}, but local row was no longer active during reconciliation`,
+              metadata,
+              tx,
+            });
+            return { status: 'local_row_changed_after_stripe' as const };
+          }
+
+          if (isKiloClawCancelDesiredState({ subscription: localSubscription, mode: input.mode })) {
+            const metadata = {
+              ...baseMetadata,
+              reconciliationStatus: 'already_desired',
+            } satisfies KiloClawCancelAuditMetadata;
+            await createKiloClawAdminAuditLog({
+              action: 'kiloclaw.subscription.admin_cancel',
+              actor_id: ctx.user.id,
+              actor_email: ctx.user.google_user_email,
+              actor_name: ctx.user.google_user_name,
+              target_user_id: input.userId,
+              message: `Admin cancel reconciliation found KiloClaw subscription ${subscription.id} already in desired state`,
+              metadata,
+              tx,
+            });
+            return { status: 'already_desired' as const };
+          }
+
+          const [updatedSubscription] = await tx
+            .update(kiloclaw_subscriptions)
+            .set(
+              input.mode === 'period_end'
+                ? {
+                    cancel_at_period_end: true,
+                    stripe_schedule_id: null,
+                    scheduled_plan: null,
+                    scheduled_by: null,
+                  }
+                : {
+                    status: 'canceled',
+                    cancel_at_period_end: false,
+                    pending_conversion: false,
+                    stripe_schedule_id: null,
+                    scheduled_plan: null,
+                    scheduled_by: null,
+                    current_period_end: now,
+                    credit_renewal_at: now,
+                    ...(localSubscription.status === 'trialing' ? { trial_ends_at: now } : {}),
+                  }
+            )
+            .where(
+              and(
+                eq(kiloclaw_subscriptions.id, localSubscription.id),
+                isNull(kiloclaw_subscriptions.transferred_to_subscription_id)
+              )
+            )
+            .returning();
+
+          if (!updatedSubscription) {
+            const metadata = {
+              ...baseMetadata,
+              reconciliationStatus: 'local_row_changed_after_stripe',
+            } satisfies KiloClawCancelAuditMetadata;
+            await createKiloClawAdminAuditLog({
+              action: 'kiloclaw.subscription.admin_cancel',
+              actor_id: ctx.user.id,
+              actor_email: ctx.user.google_user_email,
+              actor_name: ctx.user.google_user_name,
+              target_user_id: input.userId,
+              message: `Stripe cancel succeeded for KiloClaw subscription ${subscription.id}, but local update failed during reconciliation`,
+              metadata,
+              tx,
+            });
+            return { status: 'local_row_changed_after_stripe' as const };
+          }
+
+          await insertKiloClawSubscriptionChangeLog(tx, {
+            subscriptionId: subscription.id,
+            actor: adminSubscriptionActor(ctx.user),
+            action: 'canceled',
+            reason:
+              input.mode === 'period_end' ? 'admin_cancel_at_period_end' : 'admin_cancel_immediate',
+            before: localSubscription,
+            after: updatedSubscription,
+          });
+
+          const metadata = {
+            ...baseMetadata,
+            reconciliationStatus: 'updated',
+          } satisfies KiloClawCancelAuditMetadata;
+          await createKiloClawAdminAuditLog({
+            action: 'kiloclaw.subscription.admin_cancel',
+            actor_id: ctx.user.id,
+            actor_email: ctx.user.google_user_email,
+            actor_name: ctx.user.google_user_name,
+            target_user_id: input.userId,
+            message: `Admin ${input.mode === 'immediate' ? 'immediately canceled' : 'set cancel-at-period-end on'} KiloClaw subscription ${subscription.id} (status was ${previousStatus}, stripe_sub=${subscription.stripe_subscription_id ?? 'none'})`,
+            metadata,
+            tx,
+          });
+          return { status: 'updated' as const };
+        });
+
+        if (reconciliationResult.status === 'local_row_changed_after_stripe') {
+          throw new TRPCError({
+            code: 'CONFLICT',
+            message:
+              'Stripe cancellation was applied, but the local KiloClaw subscription changed before reconciliation. Review the admin audit log and current subscription row before retrying.',
+          });
+        }
+
+        return successResult();
+      }),
+
+    getInvoices: adminProcedure.input(GetUserInvoicesSchema).query(async ({ input }) => {
+      const invoices = await getStripeInvoices(input.stripe_customer_id);
+      return { invoices };
+    }),
+
+    recomputeBalances: adminProcedure
+      .input(z.object({ userId: z.string(), dryRun: z.boolean().default(true) }))
+      .mutation(async ({ input }) => {
+        return assertNoError(await recomputeUserBalances(input));
+      }),
+
+    DEV_ONLY_messUpBalance: adminProcedure
+      .input(z.object({ userId: z.string() }))
+      .mutation(async ({ input }) => {
+        if (process.env.NODE_ENV !== 'development') {
+          throw new TRPCError({
+            code: 'FORBIDDEN',
+            message: 'This endpoint is only available in development mode',
+          });
+        }
+
+        // SQL expression for random jitter ±$1 (evaluated per-row)
+        const jitterSql = sql`(random() - 0.5) * 2000000`;
+
+        // Jitter user balance
+        await db
+          .update(kilocode_users)
+          .set({
+            microdollars_used: sql`${kilocode_users.microdollars_used} + ${jitterSql}`,
+            total_microdollars_acquired: sql`${kilocode_users.total_microdollars_acquired} + ${jitterSql}`,
+          })
+          .where(eq(kilocode_users.id, input.userId));
+
+        // Jitter all baselines for this user's personal credit transactions (each row gets different jitter)
+        await db
+          .update(credit_transactions)
+          .set({
+            original_baseline_microdollars_used: sql`${credit_transactions.original_baseline_microdollars_used} + ${jitterSql}`,
+            expiration_baseline_microdollars_used: sql`CASE WHEN ${credit_transactions.expiration_baseline_microdollars_used} IS NOT NULL THEN ${credit_transactions.expiration_baseline_microdollars_used} + ${jitterSql} ELSE NULL END`,
+          })
+          .where(
+            and(
+              eq(credit_transactions.kilo_user_id, input.userId),
+              isNull(credit_transactions.organization_id)
+            )
+          );
+
+        return { success: true };
+      }),
+
+    cancelAndRefundKiloPass: adminProcedure
+      .input(CancelAndRefundKiloPassSchema)
+      .mutation(async ({ input, ctx }) => {
+        const userExists = await db.query.kilocode_users.findFirst({
+          columns: { id: true },
+          where: eq(kilocode_users.id, input.userId),
+        });
+        if (!userExists) {
+          throw new TRPCError({ code: 'NOT_FOUND', message: 'User not found' });
+        }
+
+        const result = await cancelAndRefundKiloPassForUser({
+          db,
+          stripe: stripeClient,
+          userId: input.userId,
+          reason: input.reason,
+          adminKiloUserId: ctx.user.id,
+        });
+
+        if (result.status === 'skipped') {
+          if (result.reason.kind === 'no_subscription') {
+            throw new TRPCError({
+              code: 'BAD_REQUEST',
+              message: 'No Kilo Pass subscription found for this user',
+            });
+          }
+          if (result.reason.kind === 'store_managed_subscription') {
+            throw new TRPCError({
+              code: 'BAD_REQUEST',
+              message:
+                'Refund must be initiated via the App Store. The customer needs to contact Apple Support.',
+            });
+          }
+          throw new TRPCError({
+            code: 'BAD_REQUEST',
+            message: 'Kilo Pass subscription is already canceled',
+          });
+        }
+
+        return {
+          success: true,
+          refundedAmountCents: result.refundedAmountCents,
+          balanceResetAmountUsd: result.balanceResetAmountUsd,
+          alreadyBlocked: result.alreadyBlocked,
+        };
+      }),
+  }),
+
+  enrichmentData: createTRPCRouter({
+    upsert: adminProcedure.input(UpsertEnrichmentDataSchema).mutation(async ({ input }) => {
+      const { user_id, github_enrichment_data, linkedin_enrichment_data, clay_enrichment_data } =
+        input;
+
+      const user = await db.query.kilocode_users.findFirst({
+        where: eq(kilocode_users.id, user_id),
+      });
+
+      if (!user) {
+        throw new TRPCError({
+          code: 'NOT_FOUND',
+          message: 'User not found',
+        });
+      }
+
+      const existingData = await db.query.enrichment_data.findFirst({
+        where: eq(enrichment_data.user_id, user_id),
+      });
+
+      const updateData: {
+        github_enrichment_data?: unknown;
+        linkedin_enrichment_data?: unknown;
+        clay_enrichment_data?: unknown;
+      } = {};
+
+      if (github_enrichment_data !== undefined) {
+        updateData.github_enrichment_data = github_enrichment_data;
+      }
+      if (linkedin_enrichment_data !== undefined) {
+        updateData.linkedin_enrichment_data = linkedin_enrichment_data;
+      }
+      if (clay_enrichment_data !== undefined) {
+        updateData.clay_enrichment_data = clay_enrichment_data;
+      }
+
+      let result;
+
+      if (existingData) {
+        const updated = await db
+          .update(enrichment_data)
+          .set(updateData)
+          .where(eq(enrichment_data.user_id, user_id))
+          .returning();
+
+        result = updated[0];
+      } else {
+        const inserted = await db
+          .insert(enrichment_data)
+          .values({
+            user_id,
+            github_enrichment_data: github_enrichment_data ?? null,
+            linkedin_enrichment_data: linkedin_enrichment_data ?? null,
+            clay_enrichment_data: clay_enrichment_data ?? null,
+          })
+          .returning();
+
+        result = inserted[0];
+      }
+
+      return successResult({ data: result });
+    }),
+  }),
+
+  modelStats: createTRPCRouter({
+    list: adminProcedure.input(ModelStatsListSchema).query(async ({ input }) => {
+      const { page, limit, sortBy, sortOrder, search, isActive } = input;
+      const offset = (page - 1) * limit;
+
+      const conditions = [];
+
+      if (search) {
+        conditions.push(
+          or(
+            ilike(modelStats.name, `%${search}%`),
+            ilike(modelStats.openrouterId, `%${search}%`),
+            ilike(modelStats.slug, `%${search}%`)
+          )
+        );
+      }
+
+      if (isActive === 'true') {
+        conditions.push(eq(modelStats.isActive, true));
+      } else if (isActive === 'false') {
+        conditions.push(eq(modelStats.isActive, false));
+      }
+
+      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+      const sortByMap = {
+        name: modelStats.name,
+        openrouterId: modelStats.openrouterId,
+        createdAt: modelStats.createdAt,
+        isActive: modelStats.isActive,
+      };
+
+      const orderByColumn = sortByMap[sortBy];
+      const orderFn = sortOrder === 'asc' ? asc : desc;
+
+      const results = await db
+        .select({
+          id: modelStats.id,
+          isActive: modelStats.isActive,
+          isFeatured: modelStats.isFeatured,
+          isStealth: modelStats.isStealth,
+          openrouterId: modelStats.openrouterId,
+          slug: modelStats.slug,
+          aaSlug: modelStats.aaSlug,
+          name: modelStats.name,
+          description: modelStats.description,
+          modelCreator: modelStats.modelCreator,
+          creatorSlug: modelStats.creatorSlug,
+          releaseDate: modelStats.releaseDate,
+          priceInput: modelStats.priceInput,
+          priceOutput: modelStats.priceOutput,
+          codingIndex: modelStats.codingIndex,
+          speedTokensPerSec: modelStats.speedTokensPerSec,
+          contextLength: modelStats.contextLength,
+          maxOutputTokens: modelStats.maxOutputTokens,
+          inputModalities: modelStats.inputModalities,
+          openrouterData: modelStats.openrouterData,
+          benchmarks: modelStats.benchmarks,
+          chartData: modelStats.chartData,
+          createdAt: modelStats.createdAt,
+          updatedAt: modelStats.updatedAt,
+          total: sql<number>`count(*) OVER()::int`.as('total'),
+          mostRecentUpdate: sql<string>`MAX(${modelStats.updatedAt}) OVER()`.as(
+            'most_recent_update'
+          ),
+        })
+        .from(modelStats)
+        .where(whereClause)
+        .orderBy(orderFn(orderByColumn))
+        .limit(limit)
+        .offset(offset);
+
+      const total = results[0]?.total || 0;
+      const lastUpdated = results[0]?.mostRecentUpdate || null;
+
+      return {
+        models: results.map(({ total: _, mostRecentUpdate: __, ...model }) => model),
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+        lastUpdated,
+      };
+    }),
+
+    create: adminProcedure.input(CreateModelSchema).mutation(async ({ input }) => {
+      const [newModel] = await db
+        .insert(modelStats)
+        .values({
+          openrouterId: input.openrouterId,
+          name: input.name,
+          slug: input.slug || null,
+          aaSlug: input.aaSlug || null,
+          isActive: input.isActive,
+          openrouterData: sql`'{}'::jsonb`,
+        })
+        .returning();
+
+      revalidatePath('/api/models/stats');
+
+      return newModel;
+    }),
+
+    update: adminProcedure.input(UpdateModelSchema).mutation(async ({ input }) => {
+      const { id, ...data } = input;
+
+      const [updatedModel] = await db
+        .update(modelStats)
+        .set(data)
+        .where(eq(modelStats.id, id))
+        .returning();
+
+      if (!updatedModel) {
+        throw new TRPCError({
+          code: 'NOT_FOUND',
+          message: 'Model not found',
+        });
+      }
+
+      revalidatePath('/api/models/stats');
+
+      return updatedModel;
+    }),
+
+    triggerSync: adminProcedure.mutation(async (): Promise<SyncResponse> => {
+      const cronUrl = `${APP_URL}/api/cron/sync-model-stats`;
+      const response = await fetch(cronUrl, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${CRON_SECRET}`,
+        },
+      });
+
+      if (!response.ok) {
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: 'Failed to trigger stats update',
+        });
+      }
+
+      const text = await response.text();
+      const parsed = parseJsonSafe(text);
+      return SyncResponseSchema.parse(parsed);
+    }),
+
+    bustCache: adminProcedure.mutation(() => {
+      revalidatePath('/api/models/stats');
+      revalidatePath('/api/models/stats/[slug]', 'page');
+      return { success: true, message: 'Cache busted successfully' };
+    }),
+  }),
+
+  syncProviders: createTRPCRouter({
+    triggerSync: adminProcedure.mutation(async () => {
+      const result = await syncAndStoreProviders();
+      return result;
+    }),
+    getLastSync: adminProcedure.query(async () => {
+      const [latest] = await db
+        .select({ id: modelsByProvider.id, data: modelsByProvider.data })
+        .from(modelsByProvider)
+        .orderBy(desc(modelsByProvider.id))
+        .limit(1);
+      if (!latest) return null;
+      return {
+        id: latest.id,
+        generated_at: latest.data.generated_at,
+        total_providers: latest.data.total_providers,
+        total_models: latest.data.total_models,
+      };
+    }),
+  }),
+
+  apiRequestLog: createTRPCRouter({
+    getOldestEntry: adminProcedure.query(async () => {
+      const [oldest] = await db
+        .select({ created_at: api_request_log.created_at })
+        .from(api_request_log)
+        .orderBy(asc(api_request_log.created_at))
+        .limit(1);
+      return oldest ? { created_at: oldest.created_at } : null;
+    }),
+  }),
+
+  deployments: adminDeploymentsRouter,
+
+  alerting: adminAlertingRouter,
+
+  featureInterest: adminFeatureInterestRouter,
+
+  codeReviews: adminCodeReviewsRouter,
+
+  cloudAgentNext: adminCloudAgentNextRouter,
+
+  sessionTraces: createTRPCRouter({
+    resolveCloudAgentSession: adminProcedure
+      .input(z.object({ cloud_agent_session_id: z.string().startsWith('agent_') }))
+      .query(async ({ input }) => {
+        // Check v1 first
+        const [v1] = await db
+          .select({ session_id: cliSessions.session_id })
+          .from(cliSessions)
+          .where(eq(cliSessions.cloud_agent_session_id, input.cloud_agent_session_id))
+          .limit(1);
+
+        if (v1) {
+          return { session_id: v1.session_id };
+        }
+
+        // Then check v2
+        const [v2] = await db
+          .select({ session_id: cli_sessions_v2.session_id })
+          .from(cli_sessions_v2)
+          .where(eq(cli_sessions_v2.cloud_agent_session_id, input.cloud_agent_session_id))
+          .limit(1);
+
+        if (v2) {
+          return { session_id: v2.session_id };
+        }
+
+        throw new TRPCError({
+          code: 'NOT_FOUND',
+          message: 'No CLI session found for this cloud agent session ID',
+        });
+      }),
+
+    get: adminProcedure
+      .input(z.object({ session_id: sessionIdSchema }))
+      .query(async ({ input }) => {
+        if (isNewSession(input.session_id)) {
+          // V2 session — query cli_sessions_v2
+          const [session] = await db
+            .select()
+            .from(cli_sessions_v2)
+            .where(eq(cli_sessions_v2.session_id, input.session_id))
+            .limit(1);
+
+          if (!session) {
+            throw new TRPCError({
+              code: 'NOT_FOUND',
+              message: 'Session not found',
+            });
+          }
+
+          const user = await findUserById(session.kilo_user_id);
+
+          return {
+            ...session,
+            // Fields that don't exist in v2 — null them out so the UI can handle both shapes
+            last_mode: null,
+            last_model: null,
+            user: user
+              ? {
+                  id: user.id,
+                  email: user.google_user_email,
+                  name: user.google_user_name,
+                  image: user.google_user_image_url,
+                }
+              : null,
+          };
+        }
+
+        // V1 session — original logic
+        const [session] = await db
+          .select()
+          .from(cliSessions)
+          .where(eq(cliSessions.session_id, input.session_id))
+          .limit(1);
+
+        if (!session) {
+          throw new TRPCError({
+            code: 'NOT_FOUND',
+            message: 'Session not found',
+          });
+        }
+
+        const user = await findUserById(session.kilo_user_id);
+
+        return {
+          ...session,
+          // V1 doesn't have git_branch — null it out for a consistent shape
+          git_branch: null,
+          user: user
+            ? {
+                id: user.id,
+                email: user.google_user_email,
+                name: user.google_user_name,
+                image: user.google_user_image_url,
+              }
+            : null,
+        };
+      }),
+
+    getMessages: adminProcedure
+      .input(z.object({ session_id: sessionIdSchema }))
+      .query(async ({ input }) => {
+        if (isNewSession(input.session_id)) {
+          // V2 session — fetch messages from the session-ingest worker.
+          // We need the owner's kilo_user_id to generate a service token.
+          const [session] = await db
+            .select({ kilo_user_id: cli_sessions_v2.kilo_user_id })
+            .from(cli_sessions_v2)
+            .where(eq(cli_sessions_v2.session_id, input.session_id))
+            .limit(1);
+
+          if (!session) {
+            throw new TRPCError({
+              code: 'NOT_FOUND',
+              message: 'Session not found',
+            });
+          }
+
+          try {
+            const snapshot = await fetchSessionSnapshot(input.session_id, session.kilo_user_id);
+            return {
+              messages: snapshot?.messages ?? ([] satisfies SessionMessage[]),
+              format: 'v2' as const,
+            };
+          } catch (error) {
+            console.error('[SessionTraces] Failed to fetch v2 session snapshot', {
+              sessionId: input.session_id,
+              error,
+            });
+            return { messages: [], format: 'v2' as const };
+          }
+        }
+
+        // V1 session — original logic
+        const [session] = await db
+          .select({
+            ui_messages_blob_url: cliSessions.ui_messages_blob_url,
+          })
+          .from(cliSessions)
+          .where(eq(cliSessions.session_id, input.session_id))
+          .limit(1);
+
+        if (!session) {
+          throw new TRPCError({
+            code: 'NOT_FOUND',
+            message: 'Session not found',
+          });
+        }
+
+        if (!session.ui_messages_blob_url) {
+          return { messages: [], format: 'v1' as const };
+        }
+
+        try {
+          const messages = await getBlobContent(session.ui_messages_blob_url);
+          return { messages: (messages as unknown[]) ?? [], format: 'v1' as const };
+        } catch {
+          return { messages: [], format: 'v1' as const };
+        }
+      }),
+
+    getApiConversationHistory: adminProcedure
+      .input(z.object({ session_id: sessionIdSchema }))
+      .query(async ({ input }) => {
+        if (isNewSession(input.session_id)) {
+          // V2 sessions have no separate raw API conversation history
+          return { history: null };
+        }
+
+        // V1 session — original logic
+        const [session] = await db
+          .select({
+            api_conversation_history_blob_url: cliSessions.api_conversation_history_blob_url,
+          })
+          .from(cliSessions)
+          .where(eq(cliSessions.session_id, input.session_id))
+          .limit(1);
+
+        if (!session) {
+          throw new TRPCError({
+            code: 'NOT_FOUND',
+            message: 'Session not found',
+          });
+        }
+
+        if (!session.api_conversation_history_blob_url) {
+          return { history: null };
+        }
+
+        try {
+          const history = await getBlobContent(session.api_conversation_history_blob_url);
+          return { history: history ?? null };
+        } catch {
+          return { history: null };
+        }
+      }),
+  }),
+  appBuilder: adminAppBuilderRouter,
+  kiloclawInstances: adminKiloclawInstancesRouter,
+  kiloclawVersions: adminKiloclawVersionsRouter,
+  kiloclawRegions: adminKiloclawRegionsRouter,
+  kiloclawProviders: adminKiloclawProvidersRouter,
+  aiAttribution: adminAIAttributionRouter,
+  ossSponsorship: ossSponsorshipRouter,
+  contributorChampions: contributorChampionsRouter,
+  bulkUserCredits: bulkUserCreditsRouter,
+  creditCampaigns: creditCampaignsRouter,
+  emailTesting: emailTestingRouter,
+  botRequests: adminBotRequestsRouter,
+  gastown: adminGastownRouter,
+  extendClawTrial: extendClawTrialRouter,
+  customLlm: adminCustomLlmRouter,
+  modelExperiments: adminModelExperimentsRouter,
+  gatewayConfig: adminGatewayConfigRouter,
+  blacklistDomains: adminBlacklistDomainsRouter,
+  bulkBlock: adminBulkBlockRouter,
+  kiloPass: adminKiloPassRouter,
+  earlyFraudWarnings: adminStripeEarlyFraudWarningsRouter,
+  // Key kept as `securityAdvisorContent` for tRPC client compatibility —
+  // admin UI consumers reference `trpc.admin.securityAdvisorContent.*`.
+  // Backing router renamed to `adminShellSecurityContentRouter` as part of
+  // the shell-security rebrand; the key/symbol asymmetry is intentional.
+  securityAdvisorContent: adminShellSecurityContentRouter,
+  freeModelUsage: adminFreeModelUsageRouter,
+  modelEvalIngest: adminModelEvalIngestRouter,
+});

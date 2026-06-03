@@ -1,0 +1,1091 @@
+/**
+ * HTTP Server for the long-running wrapper.
+ *
+ * Exposes the wrapper's HTTP API for the Worker to interact with:
+ * - GET /health - Health check (includes sessionId)
+ * - GET /job/status - Current status
+ * - POST /job/prompt - Send a prompt (includes session binding)
+ * - POST /session/ready - Prepare workspace and Kilo runtime
+ * - POST /job/command - Send a command (includes session binding)
+ * - POST /job/answer-permission - Answer a permission request
+ * - POST /job/answer-question - Answer a question
+ * - POST /job/reject-question - Reject a question
+ * - POST /job/abort - Abort the current session
+ */
+
+import type { WrapperState, SessionContext } from './state.js';
+import type { WrapperKiloClient, WrapperPtySize } from './kilo-api.js';
+import type { PerTurnConfig } from './lifecycle.js';
+import { createLogUploader } from './log-uploader.js';
+import { configureCommitCoAuthorHook } from './commit-co-author-hook.js';
+import { logToFile } from './utils.js';
+import { materializePromptAttachments as defaultMaterializePromptAttachments } from './session-bootstrap.js';
+import {
+  isWrapperSessionReadyRequest,
+  type WrapperCommitCoAuthor,
+  type WrapperPromptAgent,
+  type WrapperPromptRequest,
+  type WrapperSessionReadyRequest,
+  type WrapperSessionReadyResponse,
+} from '../../src/shared/wrapper-bootstrap.js';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type ServerConfig = {
+  port: number;
+  workspacePath: string;
+  version: string;
+  /** The root kilo session ID, created at wrapper startup */
+  sessionId: string;
+  /** Stable Cloud Agent session ID, passed at wrapper startup */
+  agentSessionId: string;
+  /** Stable Cloud Agent user ID, passed at wrapper startup */
+  userId: string;
+  /** Stable physical wrapper identity, present after leased startup. */
+  wrapperInstanceId?: string;
+  wrapperInstanceGeneration?: number;
+  /** Product surface that created the session, e.g. code-review. */
+  platform?: string;
+};
+
+export type ServerDependencies = {
+  state: WrapperState;
+  kiloClient: WrapperKiloClient;
+  openConnection: () => Promise<void>;
+  /** Close existing connections (ingest WS + event subscription) */
+  closeConnection: () => Promise<void>;
+  /** Set the aborted flag to skip post-completion tasks */
+  setAborted: () => void;
+  /** Reset lifecycle state for a new execution */
+  resetLifecycle: () => void;
+  /** Mark a submitted message complete when the wrapper handles a synchronous session action. */
+  onMessageComplete?: (messageId: string) => void;
+  /** Compatibility hook for callers that still construct wrapper server test deps. */
+  setPerTurnConfig?: (config: PerTurnConfig) => void;
+  /** Workspace/Kilo readiness path */
+  readySession?: (request: WrapperSessionReadyRequest) => Promise<WrapperSessionReadyResponse>;
+  /** Apply refreshed runtime variables to the active Kilo runtime. */
+  updateRuntimeEnvironment?: (env: Record<string, string>) => Promise<void>;
+  /** Materialize signed prompt attachments into local file parts. */
+  materializePromptAttachments?: (prompt: WrapperPromptRequest) => Promise<WrapperPromptRequest>;
+  /** Apply Git commit attribution before Kilo may execute git commands. */
+  configureCommitCoAuthor?: (
+    workspacePath: string,
+    commitCoAuthor: WrapperCommitCoAuthor | undefined
+  ) => Promise<void>;
+};
+
+export type SessionBinding = {
+  ingestUrl: string;
+  ingestToken?: string;
+  workerAuthToken: string;
+  upstreamBranch?: string;
+  wrapperRunId: string;
+  wrapperGeneration: number;
+  wrapperConnectionId: string;
+};
+
+type PromptBody = WrapperPromptRequest;
+
+type CommandBody = {
+  command: string;
+  args?: string;
+  messageId?: string;
+  agent?: WrapperPromptAgent;
+  autoCommit?: boolean;
+  condenseOnComplete?: boolean;
+  commitCoAuthor?: WrapperCommitCoAuthor;
+  session?: SessionBinding;
+  execution?: SessionBinding;
+};
+
+type AnswerPermissionBody = {
+  permissionId: string;
+  response: 'always' | 'once' | 'reject';
+  message?: string;
+};
+
+type AnswerQuestionBody = {
+  questionId: string;
+  answers: string[][];
+};
+
+type RejectQuestionBody = {
+  questionId: string;
+};
+
+type PtyCreateBody = {
+  cols?: number;
+  rows?: number;
+};
+
+type PtyResizeBody = {
+  cols?: number;
+  rows?: number;
+  size?: {
+    cols?: number;
+    rows?: number;
+  };
+};
+
+// ---------------------------------------------------------------------------
+// Helper Functions
+// ---------------------------------------------------------------------------
+
+const PTY_ID_RE = /^[a-zA-Z0-9_-]+$/;
+const MIN_PTY_COLS = 2;
+const MAX_PTY_COLS = 500;
+const MIN_PTY_ROWS = 2;
+const MAX_PTY_ROWS = 200;
+const WORKSPACE_TERMINAL_ENV = {
+  // Shell startup files may replace inherited PS1, so reapply it before each prompt.
+  PROMPT_COMMAND: "PS1='\\n\\W\\n\\$ '",
+  PS1: '\\n\\W\\n\\$ ',
+} satisfies Record<string, string>;
+
+function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function errorResponse(error: string, message: string, status: number): Response {
+  return jsonResponse({ error, message }, status);
+}
+
+async function applyCommitAttribution(
+  workspacePath: string,
+  commitCoAuthor: WrapperCommitCoAuthor | undefined,
+  configureCommitCoAuthor: NonNullable<ServerDependencies['configureCommitCoAuthor']>
+): Promise<Response | null> {
+  try {
+    await configureCommitCoAuthor(workspacePath, commitCoAuthor);
+    return null;
+  } catch (error) {
+    logToFile(
+      `commit-co-author: failed to configure git hook: ${error instanceof Error ? error.message : String(error)}`
+    );
+    return errorResponse('SEND_ERROR', 'Failed to configure git commit attribution', 500);
+  }
+}
+
+async function readJsonBody<T>(req: Request, defaultValue: T): Promise<T> {
+  const text = await req.text();
+  if (!text.trim()) return defaultValue;
+  return JSON.parse(text) as T;
+}
+
+function validatePtyId(ptyId: string | undefined): string | null {
+  if (!ptyId || !PTY_ID_RE.test(ptyId)) return null;
+  return ptyId;
+}
+
+function parsePtySize(input: PtyCreateBody | PtyResizeBody): WrapperPtySize | null {
+  const rows = 'size' in input && input.size ? input.size.rows : input.rows;
+  const cols = 'size' in input && input.size ? input.size.cols : input.cols;
+
+  if (rows === undefined && cols === undefined) return null;
+
+  if (
+    typeof rows !== 'number' ||
+    typeof cols !== 'number' ||
+    !Number.isInteger(rows) ||
+    !Number.isInteger(cols) ||
+    rows < MIN_PTY_ROWS ||
+    rows > MAX_PTY_ROWS ||
+    cols < MIN_PTY_COLS ||
+    cols > MAX_PTY_COLS
+  ) {
+    throw new Error(
+      `PTY size must include integer cols ${MIN_PTY_COLS}-${MAX_PTY_COLS} and rows ${MIN_PTY_ROWS}-${MAX_PTY_ROWS}`
+    );
+  }
+
+  return { cols, rows };
+}
+
+function parsePtyPath(path: string): { ptyId: string; action?: 'connect' } | null {
+  const match = path.match(/^\/pty\/([^/]+)(?:\/(connect))?$/);
+  if (!match) return null;
+
+  const ptyId = validatePtyId(match[1]);
+  if (!ptyId) return null;
+
+  return {
+    ptyId,
+    action: match[2] === 'connect' ? 'connect' : undefined,
+  };
+}
+
+export async function bindSessionContext(
+  binding: SessionBinding | undefined,
+  config: ServerConfig,
+  deps: ServerDependencies
+): Promise<Response | null> {
+  const { state } = deps;
+
+  if (!binding) {
+    if (!state.hasSession) {
+      return errorResponse('NO_SESSION', 'No session context and no binding provided', 400);
+    }
+    return null;
+  }
+
+  const missingFields: string[] = [];
+  if (!binding.wrapperRunId) missingFields.push('wrapperRunId');
+  if (binding.wrapperGeneration === undefined || binding.wrapperGeneration === null) {
+    missingFields.push('wrapperGeneration');
+  }
+  if (!binding.wrapperConnectionId) missingFields.push('wrapperConnectionId');
+  if (missingFields.length > 0) {
+    return errorResponse(
+      'INVALID_REQUEST',
+      `Session binding missing required fields: ${missingFields.join(', ')}`,
+      400
+    );
+  }
+
+  let workerBaseUrl: string;
+  try {
+    const ingestOrigin = new URL(binding.ingestUrl);
+    ingestOrigin.protocol =
+      ingestOrigin.protocol === 'wss:' || ingestOrigin.protocol === 'https:' ? 'https:' : 'http:';
+    workerBaseUrl = ingestOrigin.origin;
+  } catch {
+    return errorResponse('INVALID_REQUEST', 'Invalid ingestUrl', 400);
+  }
+
+  const existingSession = state.currentSession;
+
+  if (!existingSession) {
+    if (state.isConnected) {
+      await deps.closeConnection();
+    }
+    deps.resetLifecycle();
+
+    const sessionContext: SessionContext = {
+      kiloSessionId: config.sessionId,
+      ingestUrl: binding.ingestUrl,
+      ingestToken: binding.ingestToken,
+      workerAuthToken: binding.workerAuthToken,
+      platform: config.platform,
+      wrapperRunId: binding.wrapperRunId,
+      wrapperGeneration: binding.wrapperGeneration,
+      wrapperConnectionId: binding.wrapperConnectionId,
+      agentSessionId: config.agentSessionId,
+    };
+    state.bindSession(sessionContext);
+
+    const cliLogDir = `/home/${config.agentSessionId}/.local/share/kilo/log`;
+    const wrapperLogPath = process.env.WRAPPER_LOG_PATH ?? '/tmp/kilocode-wrapper.log';
+    const logUploader = createLogUploader({
+      workerBaseUrl,
+      sessionId: config.agentSessionId,
+      executionId: 'session',
+      userId: config.userId,
+      workerAuthToken: binding.workerAuthToken,
+      cliLogDir,
+      wrapperLogPath,
+    });
+    state.setLogUploader(logUploader);
+    logUploader.start();
+    logToFile(`session bound: sessionId=${config.sessionId}`);
+    return null;
+  }
+
+  const sessionContext: SessionContext = {
+    kiloSessionId: config.sessionId,
+    ingestUrl: binding.ingestUrl,
+    ingestToken: binding.ingestToken,
+    workerAuthToken: binding.workerAuthToken,
+    platform: config.platform,
+    wrapperRunId: binding.wrapperRunId,
+    wrapperGeneration: binding.wrapperGeneration,
+    wrapperConnectionId: binding.wrapperConnectionId,
+    agentSessionId: config.agentSessionId,
+  };
+  const result = state.bindSession(sessionContext);
+  if (result.changed) {
+    logToFile(
+      `session binding refreshed: generation=${binding.wrapperGeneration ?? 'none'} connectionId=${binding.wrapperConnectionId ?? 'none'}`
+    );
+    if (state.isConnected) {
+      await deps.closeConnection();
+    }
+    deps.resetLifecycle();
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Route Handlers
+// ---------------------------------------------------------------------------
+
+function createHealthHandler(config: ServerConfig, state: WrapperState) {
+  return (): Response => {
+    return jsonResponse({
+      healthy: true,
+      state: state.isActive ? 'active' : 'idle',
+      version: config.version,
+      sessionId: config.sessionId,
+      ...(config.wrapperInstanceId ? { wrapperInstanceId: config.wrapperInstanceId } : {}),
+      ...(config.wrapperInstanceGeneration !== undefined
+        ? { wrapperInstanceGeneration: config.wrapperInstanceGeneration }
+        : {}),
+      pendingMessages: state.pendingMessageIds.length,
+    });
+  };
+}
+
+function createStatusHandler(state: WrapperState) {
+  return (): Response => {
+    return jsonResponse(state.getStatus());
+  };
+}
+
+export function createPromptHandler(config: ServerConfig, deps: ServerDependencies) {
+  return async (req: Request): Promise<Response> => {
+    const { state, kiloClient, openConnection } = deps;
+
+    let body: PromptBody;
+    try {
+      body = (await req.json()) as PromptBody;
+    } catch {
+      return errorResponse('INVALID_REQUEST', 'Invalid JSON body', 400);
+    }
+
+    if (!body.message?.id) {
+      return errorResponse('INVALID_REQUEST', 'message.id is required', 400);
+    }
+    if (!body.message.prompt && !body.message.parts) {
+      return errorResponse(
+        'INVALID_REQUEST',
+        'Either message.prompt or message.parts is required',
+        400
+      );
+    }
+
+    const binding = body.session;
+    const bindError = await bindSessionContext(binding, config, deps);
+    if (bindError) return bindError;
+
+    const session = state.currentSession;
+    if (!session) {
+      return errorResponse('NO_SESSION', 'No session context available', 400);
+    }
+    const messageId = body.message.id;
+
+    let prompt = body;
+    if (body.message.attachments?.length) {
+      try {
+        prompt = await (deps.materializePromptAttachments ?? defaultMaterializePromptAttachments)(
+          body
+        );
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        logToFile(`job/prompt: failed to materialize attachments: ${msg}`);
+        return errorResponse('SEND_ERROR', `Failed to materialize attachments: ${msg}`, 500);
+      }
+    }
+
+    const attributionError = await applyCommitAttribution(
+      config.workspacePath,
+      prompt.finalization?.commitCoAuthor,
+      deps.configureCommitCoAuthor ?? configureCommitCoAuthorHook
+    );
+    if (attributionError) return attributionError;
+
+    if (!state.isConnected) {
+      try {
+        await openConnection();
+        logToFile('job/prompt: subscription confirmed, connection opened');
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        logToFile(`job/prompt: failed to open connection: ${msg}`);
+        return errorResponse('CONNECTION_ERROR', `Failed to open connection: ${msg}`, 500);
+      }
+    }
+
+    state.acceptMessage(messageId, {
+      autoCommit: prompt.finalization?.autoCommit ?? false,
+      condenseOnComplete: prompt.finalization?.condenseOnComplete ?? false,
+      model: prompt.agent?.model?.modelID,
+      upstreamBranch: binding?.upstreamBranch,
+      ...(prompt.finalization?.commitCoAuthor
+        ? { commitCoAuthor: prompt.finalization.commitCoAuthor }
+        : {}),
+    });
+
+    try {
+      await kiloClient.sendPromptAsync({
+        sessionId: session.kiloSessionId,
+        messageId,
+        parts: prompt.message.parts,
+        prompt: prompt.message.prompt,
+        variant: prompt.agent?.variant,
+        agent: prompt.agent?.mode,
+        model: prompt.agent?.model,
+        system: prompt.agent?.system,
+        tools: prompt.agent?.tools,
+      });
+      logToFile(`job/prompt: sent messageId=${messageId}`);
+    } catch (error) {
+      state.removeMessage(messageId);
+      const msg = error instanceof Error ? error.message : String(error);
+      logToFile(`job/prompt: failed to send: ${msg}`);
+      return errorResponse('SEND_ERROR', `Failed to send prompt: ${msg}`, 500);
+    }
+
+    return jsonResponse({ status: 'sent', messageId });
+  };
+}
+
+export function createCommandHandler(config: ServerConfig, deps: ServerDependencies) {
+  return async (req: Request): Promise<Response> => {
+    const { state, kiloClient, openConnection } = deps;
+
+    let body: CommandBody;
+    try {
+      body = (await req.json()) as CommandBody;
+    } catch {
+      return errorResponse('INVALID_REQUEST', 'Invalid JSON body', 400);
+    }
+
+    const bindError = await bindSessionContext(body.session ?? body.execution, config, deps);
+    if (bindError) return bindError;
+
+    const session = state.currentSession;
+    if (!session) {
+      return errorResponse('NO_SESSION', 'No session context available', 400);
+    }
+
+    if (!body.command) {
+      return errorResponse('INVALID_REQUEST', 'command is required', 400);
+    }
+    const compactModel = body.command === 'compact' ? body.agent?.model : undefined;
+    if (body.command === 'compact' && !compactModel?.modelID) {
+      return errorResponse('INVALID_REQUEST', 'model is required for compact', 400);
+    }
+
+    const attributionError = await applyCommitAttribution(
+      config.workspacePath,
+      body.commitCoAuthor,
+      deps.configureCommitCoAuthor ?? configureCommitCoAuthorHook
+    );
+    if (attributionError) return attributionError;
+
+    const binding = body.session ?? body.execution;
+    const messageId = body.messageId;
+    if (messageId) {
+      state.acceptMessage(messageId, {
+        autoCommit: body.autoCommit ?? false,
+        condenseOnComplete: body.condenseOnComplete ?? false,
+        model: body.agent?.model?.modelID,
+        upstreamBranch: binding?.upstreamBranch,
+        ...(body.commitCoAuthor ? { commitCoAuthor: body.commitCoAuthor } : {}),
+      });
+    }
+
+    if (!state.isConnected) {
+      try {
+        await openConnection();
+        logToFile('job/command: subscription confirmed, connection opened');
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        logToFile(`job/command: failed to open connection: ${msg}`);
+        if (messageId) state.removeMessage(messageId);
+        return errorResponse('CONNECTION_ERROR', `Failed to open connection: ${msg}`, 500);
+      }
+    }
+
+    try {
+      let result: unknown;
+      if (compactModel) {
+        result = await kiloClient.summarizeSession({
+          sessionId: session.kiloSessionId,
+          model: compactModel,
+        });
+        if (messageId) {
+          state.sendToIngest({
+            streamEventType: 'cloud.message.completed',
+            data: {
+              messageId,
+              completionSource: 'manual_compact_summarize',
+            },
+            timestamp: new Date().toISOString(),
+          });
+          deps.onMessageComplete?.(messageId);
+        }
+      } else {
+        result = await kiloClient.sendCommand({
+          sessionId: session.kiloSessionId,
+          command: body.command,
+          args: body.args,
+          messageId,
+        });
+      }
+      state.updateActivity();
+      logToFile(`job/command: sent command=${body.command}`);
+      return jsonResponse({ status: 'sent', result });
+    } catch (error) {
+      if (messageId) state.removeMessage(messageId);
+      const msg = error instanceof Error ? error.message : String(error);
+      logToFile(`job/command: failed: ${msg}`);
+      return errorResponse('COMMAND_ERROR', `Failed to send command: ${msg}`, 500);
+    }
+  };
+}
+
+export function createAnswerPermissionHandler(deps: ServerDependencies) {
+  return async (req: Request): Promise<Response> => {
+    const { state, kiloClient } = deps;
+
+    if (!state.hasSession) {
+      return errorResponse('NO_SESSION', 'No session context', 400);
+    }
+
+    let body: AnswerPermissionBody;
+    try {
+      body = (await req.json()) as AnswerPermissionBody;
+    } catch {
+      return errorResponse('INVALID_REQUEST', 'Invalid JSON body', 400);
+    }
+
+    if (!body.permissionId || !body.response) {
+      return errorResponse('INVALID_REQUEST', 'permissionId and response are required', 400);
+    }
+
+    try {
+      const success =
+        body.message === undefined
+          ? await kiloClient.answerPermission(body.permissionId, body.response)
+          : await kiloClient.answerPermission(body.permissionId, body.response, body.message);
+      state.updateActivity();
+      logToFile(
+        `job/answer-permission: permissionId=${body.permissionId} response=${body.response}`
+      );
+      return jsonResponse({ status: 'answered', success });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logToFile(`job/answer-permission: failed: ${msg}`);
+      return errorResponse('PERMISSION_ERROR', `Failed to answer permission: ${msg}`, 500);
+    }
+  };
+}
+
+export function createAnswerQuestionHandler(deps: ServerDependencies) {
+  return async (req: Request): Promise<Response> => {
+    const { state, kiloClient } = deps;
+
+    if (!state.hasSession) {
+      return errorResponse('NO_SESSION', 'No session context', 400);
+    }
+
+    let body: AnswerQuestionBody;
+    try {
+      body = (await req.json()) as AnswerQuestionBody;
+    } catch {
+      return errorResponse('INVALID_REQUEST', 'Invalid JSON body', 400);
+    }
+
+    if (!body.questionId || !body.answers) {
+      return errorResponse('INVALID_REQUEST', 'questionId and answers are required', 400);
+    }
+
+    try {
+      const success = await kiloClient.answerQuestion(body.questionId, body.answers);
+      state.updateActivity();
+      logToFile(`job/answer-question: questionId=${body.questionId}`);
+      return jsonResponse({ status: 'answered', success });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logToFile(`job/answer-question: failed: ${msg}`);
+      return errorResponse('QUESTION_ERROR', `Failed to answer question: ${msg}`, 500);
+    }
+  };
+}
+
+export function createRejectQuestionHandler(deps: ServerDependencies) {
+  return async (req: Request): Promise<Response> => {
+    const { state, kiloClient } = deps;
+
+    if (!state.hasSession) {
+      return errorResponse('NO_SESSION', 'No session context', 400);
+    }
+
+    let body: RejectQuestionBody;
+    try {
+      body = (await req.json()) as RejectQuestionBody;
+    } catch {
+      return errorResponse('INVALID_REQUEST', 'Invalid JSON body', 400);
+    }
+
+    if (!body.questionId) {
+      return errorResponse('INVALID_REQUEST', 'questionId is required', 400);
+    }
+
+    try {
+      const success = await kiloClient.rejectQuestion(body.questionId);
+      state.updateActivity();
+      logToFile(`job/reject-question: questionId=${body.questionId}`);
+      return jsonResponse({ status: 'rejected', success });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logToFile(`job/reject-question: failed: ${msg}`);
+      return errorResponse('QUESTION_ERROR', `Failed to reject question: ${msg}`, 500);
+    }
+  };
+}
+
+export function createAbortHandler(deps: ServerDependencies, triggerDrainAndClose: () => void) {
+  return async (_req: Request): Promise<Response> => {
+    const { state, kiloClient, setAborted } = deps;
+
+    const session = state.currentSession;
+    if (!session) {
+      return errorResponse('NO_SESSION', 'No active session to abort', 400);
+    }
+
+    setAborted();
+
+    try {
+      await kiloClient.abortSession({ sessionId: session.kiloSessionId });
+      logToFile(`job/abort: aborted kilo session ${session.kiloSessionId}`);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logToFile(`job/abort: abort request failed (continuing): ${msg}`);
+    }
+
+    state.sendToIngest({
+      streamEventType: 'interrupted',
+      data: { reason: 'aborted via API' },
+      timestamp: new Date().toISOString(),
+    });
+
+    state.clearAllMessages();
+    triggerDrainAndClose();
+
+    return jsonResponse({ status: 'aborted' });
+  };
+}
+
+function createPtyCreateHandler(config: ServerConfig, deps: ServerDependencies) {
+  return async (req: Request): Promise<Response> => {
+    let body: PtyCreateBody;
+    try {
+      body = await readJsonBody<PtyCreateBody>(req, {});
+    } catch {
+      return errorResponse('INVALID_REQUEST', 'Invalid JSON body', 400);
+    }
+
+    let size: WrapperPtySize | null;
+    try {
+      size = parsePtySize(body);
+    } catch (error) {
+      return errorResponse(
+        'INVALID_REQUEST',
+        error instanceof Error ? error.message : String(error),
+        400
+      );
+    }
+
+    let createdPtyId: string | null = null;
+    try {
+      const pty = await deps.kiloClient.createPty({
+        cwd: config.workspacePath,
+        title: 'Workspace terminal',
+        env: WORKSPACE_TERMINAL_ENV,
+      });
+      createdPtyId = pty.id;
+      const sizedPty = size ? await deps.kiloClient.resizePty(pty.id, size) : pty;
+      logToFile(`pty/create: ptyId=${pty.id}`);
+      return jsonResponse(sizedPty);
+    } catch (error) {
+      if (createdPtyId) {
+        try {
+          await deps.kiloClient.deletePty(createdPtyId);
+          logToFile(`pty/create: cleaned up ptyId=${createdPtyId}`);
+        } catch (cleanupError) {
+          const cleanupMessage =
+            cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          logToFile(`pty/create: cleanup failed ptyId=${createdPtyId}: ${cleanupMessage}`);
+        }
+      }
+
+      const msg = error instanceof Error ? error.message : String(error);
+      logToFile(`pty/create: failed: ${msg}`);
+      return errorResponse('PTY_ERROR', `Failed to create PTY: ${msg}`, 500);
+    }
+  };
+}
+
+function createPtyResizeHandler(deps: ServerDependencies, ptyId: string) {
+  return async (req: Request): Promise<Response> => {
+    let body: PtyResizeBody;
+    try {
+      body = await readJsonBody<PtyResizeBody>(req, {});
+    } catch {
+      return errorResponse('INVALID_REQUEST', 'Invalid JSON body', 400);
+    }
+
+    let size: WrapperPtySize | null;
+    try {
+      size = parsePtySize(body);
+    } catch (error) {
+      return errorResponse(
+        'INVALID_REQUEST',
+        error instanceof Error ? error.message : String(error),
+        400
+      );
+    }
+
+    if (!size) {
+      return errorResponse('INVALID_REQUEST', 'PTY size is required', 400);
+    }
+
+    try {
+      const pty = await deps.kiloClient.resizePty(ptyId, size);
+      logToFile(`pty/resize: ptyId=${ptyId} cols=${size.cols} rows=${size.rows}`);
+      return jsonResponse(pty);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logToFile(`pty/resize: failed ptyId=${ptyId}: ${msg}`);
+      return errorResponse('PTY_ERROR', `Failed to resize PTY: ${msg}`, 500);
+    }
+  };
+}
+
+function createPtyDeleteHandler(deps: ServerDependencies, ptyId: string) {
+  return async (_req: Request): Promise<Response> => {
+    try {
+      const success = await deps.kiloClient.deletePty(ptyId);
+      logToFile(`pty/delete: ptyId=${ptyId}`);
+      return jsonResponse({ success });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logToFile(`pty/delete: failed ptyId=${ptyId}: ${msg}`);
+      return errorResponse('PTY_ERROR', `Failed to delete PTY: ${msg}`, 500);
+    }
+  };
+}
+
+function buildPtyUpstreamUrl(
+  config: ServerConfig,
+  deps: ServerDependencies,
+  ptyId: string
+): string {
+  const upstream = new URL(`/pty/${encodeURIComponent(ptyId)}/connect`, deps.kiloClient.serverUrl);
+  upstream.protocol = upstream.protocol === 'https:' ? 'wss:' : 'ws:';
+  upstream.searchParams.set('directory', config.workspacePath);
+  return upstream.toString();
+}
+
+type WrapperWebSocketData = {
+  ptyId?: string;
+};
+
+type PtyClientClose = {
+  code: number;
+  reason: string;
+};
+
+function isForwardableCloseCode(code: number): boolean {
+  return (
+    Number.isInteger(code) && code >= 1000 && code <= 4999 && ![1005, 1006, 1015].includes(code)
+  );
+}
+
+export function resolvePtyClientClose(event: { code: number; reason: string }): PtyClientClose {
+  if (event.code === 1000) {
+    return { code: 1000, reason: 'PTY session ended' };
+  }
+
+  if (isForwardableCloseCode(event.code)) {
+    return { code: event.code, reason: event.reason || 'PTY upstream closed' };
+  }
+
+  return { code: 1011, reason: event.reason || 'PTY upstream closed' };
+}
+
+type BunUpgradeServer = {
+  upgrade: (req: Request, options: { data: WrapperWebSocketData }) => boolean;
+};
+
+function createWebSocketHandlers(config: ServerConfig, deps: ServerDependencies) {
+  const ptyUpstreams = new WeakMap<object, WebSocket>();
+
+  return {
+    open(ws: Bun.ServerWebSocket<WrapperWebSocketData>) {
+      const ptyId = ws.data.ptyId;
+      if (!ptyId) {
+        ws.close(1011, 'Missing PTY');
+        return;
+      }
+
+      const upstream = new WebSocket(buildPtyUpstreamUrl(config, deps, ptyId));
+      upstream.binaryType = 'arraybuffer';
+      ptyUpstreams.set(ws, upstream);
+
+      upstream.onmessage = event => {
+        try {
+          ws.send(event.data instanceof ArrayBuffer ? event.data : String(event.data));
+        } catch {
+          // Client disconnected.
+        }
+      };
+      upstream.onclose = event => {
+        const close = resolvePtyClientClose({ code: event.code, reason: event.reason });
+        try {
+          ws.close(close.code, close.reason);
+        } catch {
+          // Already closed.
+        }
+      };
+      upstream.onerror = () => {
+        try {
+          ws.close(1011, 'PTY upstream error');
+        } catch {
+          // Already closed.
+        }
+      };
+    },
+    message(
+      ws: Bun.ServerWebSocket<WrapperWebSocketData>,
+      message: string | ArrayBuffer | Uint8Array
+    ) {
+      const upstream = ptyUpstreams.get(ws);
+      if (upstream?.readyState === WebSocket.OPEN) {
+        if (typeof message === 'string' || message instanceof ArrayBuffer) {
+          upstream.send(message);
+          return;
+        }
+        const copy = new Uint8Array(message.byteLength);
+        copy.set(message);
+        upstream.send(copy.buffer);
+      }
+    },
+    close(ws: Bun.ServerWebSocket<WrapperWebSocketData>) {
+      const upstream = ptyUpstreams.get(ws);
+      if (upstream) {
+        try {
+          upstream.close();
+        } catch {
+          // Already closed.
+        }
+        ptyUpstreams.delete(ws);
+      }
+    },
+  };
+}
+
+export function createSessionReadyHandler(deps: ServerDependencies) {
+  return async (req: Request): Promise<Response> => {
+    if (!deps.readySession) {
+      return errorResponse('NOT_READY', 'Wrapper readiness executor is not configured', 503);
+    }
+
+    let body: unknown;
+    try {
+      body = await req.json();
+    } catch {
+      return errorResponse('INVALID_REQUEST', 'Invalid JSON body', 400);
+    }
+
+    if (!isWrapperSessionReadyRequest(body)) {
+      return errorResponse('INVALID_REQUEST', 'Invalid session ready request', 400);
+    }
+
+    const result = await deps.readySession(body);
+    if (result.status === 'error') {
+      const status = result.error.code === 'INVALID_REQUEST' ? 400 : 503;
+      return jsonResponse(
+        {
+          error: result.error.code,
+          message: result.error.message,
+          ...(result.error.retryable !== undefined ? { retryable: result.error.retryable } : {}),
+        },
+        status
+      );
+    }
+
+    return jsonResponse(result);
+  };
+}
+
+export function createRuntimeEnvironmentHandler(deps: ServerDependencies) {
+  return async (req: Request): Promise<Response> => {
+    if (!deps.updateRuntimeEnvironment) {
+      return errorResponse('NOT_READY', 'Runtime environment updater is not configured', 503);
+    }
+
+    let body: unknown;
+    try {
+      body = await req.json();
+    } catch {
+      return errorResponse('INVALID_REQUEST', 'Invalid JSON body', 400);
+    }
+    if (
+      typeof body !== 'object' ||
+      body === null ||
+      !('env' in body) ||
+      typeof body.env !== 'object' ||
+      body.env === null ||
+      Array.isArray(body.env)
+    ) {
+      return errorResponse('INVALID_REQUEST', 'Invalid runtime environment request', 400);
+    }
+
+    const env: Record<string, string> = {};
+    for (const [name, value] of Object.entries(body.env)) {
+      if (typeof value !== 'string') {
+        return errorResponse('INVALID_REQUEST', 'Invalid runtime environment request', 400);
+      }
+      env[name] = value;
+    }
+
+    try {
+      await deps.updateRuntimeEnvironment(env);
+    } catch {
+      return errorResponse(
+        'RUNTIME_ENVIRONMENT_UPDATE_FAILED',
+        'Failed to update runtime environment',
+        500
+      );
+    }
+    return jsonResponse({ status: 'updated' });
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Server Creation
+// ---------------------------------------------------------------------------
+
+export type WrapperServer = {
+  server: ReturnType<typeof Bun.serve>;
+  stop: () => Promise<void>;
+};
+
+export function createFetchHandler(
+  config: ServerConfig,
+  deps: ServerDependencies,
+  triggerDrainAndClose: () => void
+): (req: Request, server?: BunUpgradeServer) => Response | Promise<Response> | undefined {
+  const { state } = deps;
+
+  // Create route handlers
+  const healthHandler = createHealthHandler(config, state);
+  const statusHandler = createStatusHandler(state);
+  const promptHandler = createPromptHandler(config, deps);
+  const commandHandler = createCommandHandler(config, deps);
+  const answerPermissionHandler = createAnswerPermissionHandler(deps);
+  const answerQuestionHandler = createAnswerQuestionHandler(deps);
+  const rejectQuestionHandler = createRejectQuestionHandler(deps);
+  const abortHandler = createAbortHandler(deps, triggerDrainAndClose);
+  const ptyCreateHandler = createPtyCreateHandler(config, deps);
+  const sessionReadyHandler = createSessionReadyHandler(deps);
+  const runtimeEnvironmentHandler = createRuntimeEnvironmentHandler(deps);
+
+  // Route table
+  type RouteHandler = (req: Request) => Response | Promise<Response>;
+  const routes: Record<string, Record<string, RouteHandler>> = {
+    GET: {
+      '/health': healthHandler,
+      '/job/status': statusHandler,
+    },
+    POST: {
+      '/job/prompt': promptHandler,
+      '/job/command': commandHandler,
+      '/job/answer-permission': answerPermissionHandler,
+      '/job/answer-question': answerQuestionHandler,
+      '/job/reject-question': rejectQuestionHandler,
+      '/job/abort': abortHandler,
+      '/pty': ptyCreateHandler,
+      '/session/ready': sessionReadyHandler,
+      '/session/environment': runtimeEnvironmentHandler,
+    },
+  };
+
+  return (req: Request, server?: BunUpgradeServer): Response | Promise<Response> | undefined => {
+    const url = new URL(req.url);
+    const method = req.method;
+    const path = url.pathname;
+
+    logToFile(`HTTP ${method} ${path}`);
+
+    const ptyPath = parsePtyPath(path);
+    if (ptyPath) {
+      if (ptyPath.action === 'connect') {
+        if (method !== 'GET') {
+          return errorResponse('METHOD_NOT_ALLOWED', `Method ${method} not allowed`, 405);
+        }
+        if (req.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
+          return errorResponse('UPGRADE_REQUIRED', 'Expected WebSocket upgrade', 426);
+        }
+        if (!server) {
+          return errorResponse('INTERNAL_ERROR', 'WebSocket server unavailable', 500);
+        }
+        const upgraded = server.upgrade(req, { data: { ptyId: ptyPath.ptyId } });
+        if (upgraded) return undefined;
+        return errorResponse('UPGRADE_FAILED', 'WebSocket upgrade failed', 400);
+      }
+
+      if (method === 'PUT') {
+        return createPtyResizeHandler(deps, ptyPath.ptyId)(req);
+      }
+      if (method === 'DELETE') {
+        return createPtyDeleteHandler(deps, ptyPath.ptyId)(req);
+      }
+    }
+
+    // Look up route
+    const methodRoutes = routes[method];
+    if (!methodRoutes) {
+      return errorResponse('METHOD_NOT_ALLOWED', `Method ${method} not allowed`, 405);
+    }
+
+    const handler = methodRoutes[path];
+    if (!handler) {
+      return errorResponse('NOT_FOUND', `Path ${path} not found`, 404);
+    }
+
+    try {
+      return Promise.resolve(handler(req)).catch(error => {
+        const msg = error instanceof Error ? error.message : String(error);
+        logToFile(`HTTP handler error: ${msg}`);
+        return errorResponse('INTERNAL_ERROR', msg, 500);
+      });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logToFile(`HTTP handler error: ${msg}`);
+      return errorResponse('INTERNAL_ERROR', msg, 500);
+    }
+  };
+}
+
+export function createServer(
+  config: ServerConfig,
+  deps: ServerDependencies,
+  triggerDrainAndClose: () => void
+): WrapperServer {
+  const fetchHandler = createFetchHandler(config, deps, triggerDrainAndClose);
+  const websocket = createWebSocketHandlers(config, deps);
+
+  const server = Bun.serve<WrapperWebSocketData>({
+    port: config.port,
+    fetch: fetchHandler,
+    websocket,
+  });
+
+  logToFile(`HTTP server listening on port ${config.port}`);
+
+  return {
+    server,
+    stop: async () => {
+      await server.stop();
+      logToFile('HTTP server stopped');
+    },
+  };
+}

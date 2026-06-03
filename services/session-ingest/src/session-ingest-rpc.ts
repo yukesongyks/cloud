@@ -1,0 +1,243 @@
+import { WorkerEntrypoint } from 'cloudflare:workers';
+import { z } from 'zod';
+import { eq, and } from 'drizzle-orm';
+import { getWorkerDb } from '@kilocode/db/client';
+import { cli_sessions_v2 } from '@kilocode/db/schema';
+
+import type { Env } from './env';
+import { getSessionIngestDO } from './dos/SessionIngestDO';
+import { getSessionAccessCacheDO } from './dos/SessionAccessCacheDO';
+import { withDORetry } from '@kilocode/worker-utils';
+import { app } from './app';
+import { mapSessionEventRow, notifyUserSessionEvent } from './session-events';
+
+const sessionIdSchema = z.string().startsWith('ses_').length(30);
+
+export class SessionIngestRPC extends WorkerEntrypoint<Env> {
+  // Delegate HTTP requests to the Hono app so callers using the service
+  // binding can `.fetch()` against this entrypoint (not just call RPC methods).
+  fetch(request: Request): Response | Promise<Response> {
+    return app.fetch(request, this.env, this.ctx);
+  }
+
+  /**
+   * RPC method: create a cli_sessions_v2 record for a cloud-agent-next session.
+   * Called via service binding from cloud-agent-next during session preparation.
+   *
+   * Uses ON CONFLICT DO UPDATE to set cloud_agent_session_id (and organization_id
+   * if provided), matching the behavior previously in the backend routers.
+   */
+  async createSessionForCloudAgent(params: {
+    sessionId: string;
+    kiloUserId: string;
+    cloudAgentSessionId: string;
+    organizationId?: string;
+    createdOnPlatform: string;
+    title?: string;
+  }): Promise<void> {
+    const parsed = z
+      .object({
+        sessionId: sessionIdSchema,
+        kiloUserId: z.string().min(1),
+        cloudAgentSessionId: z.string().min(1),
+        organizationId: z.string().optional(),
+        createdOnPlatform: z.string().min(1),
+        title: z.string().optional(),
+      })
+      .parse(params);
+
+    const db = getWorkerDb(this.env.HYPERDRIVE.connectionString);
+
+    const existingRows = await db
+      .select()
+      .from(cli_sessions_v2)
+      .where(
+        and(
+          eq(cli_sessions_v2.session_id, parsed.sessionId),
+          eq(cli_sessions_v2.kilo_user_id, parsed.kiloUserId)
+        )
+      )
+      .limit(1);
+    const existingRow = existingRows[0];
+
+    const hasMeaningfulChange = existingRow
+      ? existingRow.cloud_agent_session_id !== parsed.cloudAgentSessionId ||
+        (parsed.organizationId !== undefined &&
+          existingRow.organization_id !== parsed.organizationId)
+      : true;
+
+    const [persistedRow] = await db
+      .insert(cli_sessions_v2)
+      .values({
+        session_id: parsed.sessionId,
+        kilo_user_id: parsed.kiloUserId,
+        cloud_agent_session_id: parsed.cloudAgentSessionId,
+        organization_id: parsed.organizationId ?? null,
+        created_on_platform: parsed.createdOnPlatform,
+        ...(parsed.title !== undefined ? { title: parsed.title } : {}),
+        version: 0,
+      })
+      .onConflictDoUpdate({
+        target: [cli_sessions_v2.session_id, cli_sessions_v2.kilo_user_id],
+        set: {
+          cloud_agent_session_id: parsed.cloudAgentSessionId,
+          ...(parsed.organizationId !== undefined
+            ? { organization_id: parsed.organizationId }
+            : {}),
+        },
+      })
+      .returning();
+
+    if (hasMeaningfulChange && persistedRow) {
+      const session = mapSessionEventRow(persistedRow);
+      notifyUserSessionEvent(
+        this.env,
+        parsed.kiloUserId,
+        {
+          type: existingRow ? 'session.updated' : 'session.created',
+          data: { source: 'v2', session, changedAt: session.updatedAt },
+        },
+        this.ctx
+      );
+    }
+
+    // Warm the session cache so subsequent ingests can skip Postgres.
+    // Best-effort: cache miss is acceptable; don't fail the create if the DO is unavailable.
+    try {
+      await withDORetry(
+        () => getSessionAccessCacheDO(this.env, { kiloUserId: parsed.kiloUserId }),
+        sessionCache => sessionCache.add(parsed.sessionId),
+        'SessionAccessCacheDO.add'
+      );
+    } catch (cacheError) {
+      console.error('Failed to warm session cache after create (non-fatal)', {
+        sessionId: parsed.sessionId,
+        kiloUserId: parsed.kiloUserId,
+        error: cacheError instanceof Error ? cacheError.message : String(cacheError),
+      });
+    }
+  }
+
+  /**
+   * RPC method: delete a cli_sessions_v2 record for a cloud-agent-next session.
+   * Called via service binding from cloud-agent-next for rollback when DO prepare() fails.
+   *
+   * Scoped to the user (composite PK: session_id + kilo_user_id).
+   */
+  async deleteSessionForCloudAgent(params: {
+    sessionId: string;
+    kiloUserId: string;
+    onlyIfEmpty?: boolean;
+  }): Promise<void> {
+    const parsed = z
+      .object({
+        sessionId: sessionIdSchema,
+        kiloUserId: z.string().min(1),
+        onlyIfEmpty: z.boolean().optional(),
+      })
+      .parse(params);
+
+    // When onlyIfEmpty is set, atomically check emptiness and clear within a
+    // single DO request to prevent a TOCTOU race where ingest data arrives
+    // between an isEmpty() check and a subsequent clear() call.
+    if (parsed.onlyIfEmpty) {
+      const cleared = await withDORetry(
+        () =>
+          getSessionIngestDO(this.env, {
+            kiloUserId: parsed.kiloUserId,
+            sessionId: parsed.sessionId,
+          }),
+        stub => stub.clearIfEmpty(),
+        'SessionIngestDO.clearIfEmpty'
+      );
+      if (!cleared) {
+        return;
+      }
+    }
+
+    const db = getWorkerDb(this.env.HYPERDRIVE.connectionString);
+
+    const deletedRows = await db
+      .select()
+      .from(cli_sessions_v2)
+      .where(
+        and(
+          eq(cli_sessions_v2.session_id, parsed.sessionId),
+          eq(cli_sessions_v2.kilo_user_id, parsed.kiloUserId)
+        )
+      )
+      .limit(1);
+    const deletedRow = deletedRows[0];
+
+    await db
+      .delete(cli_sessions_v2)
+      .where(
+        and(
+          eq(cli_sessions_v2.session_id, parsed.sessionId),
+          eq(cli_sessions_v2.kilo_user_id, parsed.kiloUserId)
+        )
+      );
+
+    if (deletedRow) {
+      notifyUserSessionEvent(
+        this.env,
+        parsed.kiloUserId,
+        {
+          type: 'session.deleted',
+          data: {
+            source: 'v2',
+            sessionId: deletedRow.session_id,
+            parentSessionId: deletedRow.parent_session_id,
+            organizationId: deletedRow.organization_id,
+            gitUrl: deletedRow.git_url,
+            gitBranch: deletedRow.git_branch,
+            createdOnPlatform: deletedRow.created_on_platform,
+            deletedAt: new Date().toISOString(),
+          },
+        },
+        this.ctx
+      );
+    }
+
+    // Clear caches — best-effort; don't fail the delete if DOs are unavailable.
+    const cacheErrors: string[] = [];
+    try {
+      await withDORetry(
+        () => getSessionAccessCacheDO(this.env, { kiloUserId: parsed.kiloUserId }),
+        sessionCache => sessionCache.remove(parsed.sessionId),
+        'SessionAccessCacheDO.remove'
+      );
+    } catch (error) {
+      cacheErrors.push(
+        `SessionAccessCacheDO.remove: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+
+    // When onlyIfEmpty was set, the DO was already cleared atomically above.
+    if (!parsed.onlyIfEmpty) {
+      try {
+        await withDORetry(
+          () =>
+            getSessionIngestDO(this.env, {
+              kiloUserId: parsed.kiloUserId,
+              sessionId: parsed.sessionId,
+            }),
+          stub => stub.clear(),
+          'SessionIngestDO.clear'
+        );
+      } catch (error) {
+        cacheErrors.push(
+          `SessionIngestDO.clear: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+
+    if (cacheErrors.length > 0) {
+      console.error('Failed to clear caches after delete (non-fatal)', {
+        sessionId: parsed.sessionId,
+        kiloUserId: parsed.kiloUserId,
+        errors: cacheErrors,
+      });
+    }
+  }
+}

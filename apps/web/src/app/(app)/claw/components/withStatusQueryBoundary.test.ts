@@ -1,0 +1,113 @@
+import { describe, expect, test } from '@jest/globals';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import type { KiloClawDashboardStatus } from '@/lib/kiloclaw/types';
+import { withStatusQueryBoundary } from '@/app/(app)/claw/components';
+
+const baseStatus: KiloClawDashboardStatus = {
+  userId: 'user-1',
+  sandboxId: 'sandbox-1',
+  provider: 'fly',
+  runtimeId: 'machine-1',
+  storageId: 'vol-1',
+  region: 'iad',
+  name: null,
+  status: 'running',
+  provisionedAt: 1,
+  lastStartedAt: 2,
+  lastStoppedAt: 3,
+  envVarCount: 1,
+  secretCount: 2,
+  channelCount: 3,
+  flyAppName: null,
+  flyMachineId: null,
+  flyVolumeId: null,
+  flyRegion: null,
+  machineSize: null,
+  instanceType: null,
+  volumeSizeGb: null,
+  openclawVersion: null,
+  imageVariant: null,
+  trackedImageTag: null,
+  trackedImageDigest: null,
+  googleConnected: false,
+  googleOAuthConnected: false,
+  googleOAuthStatus: 'disconnected',
+  googleOAuthAccountEmail: null,
+  googleOAuthCapabilities: [],
+  gmailNotificationsEnabled: false,
+  execSecurity: null,
+  execAsk: null,
+  botName: null,
+  botNature: null,
+  botVibe: null,
+  botEmoji: null,
+  userLocation: null,
+  userTimezone: null,
+  workerUrl: 'https://claw.kilo.ai',
+  controllerCapabilitiesVersion: null,
+  instanceId: null,
+  inboundEmailAddress: 'amber-river-quiet-maple@kiloclaw.ai',
+  inboundEmailEnabled: true,
+  scheduledAction: null,
+};
+
+describe('withStatusQueryBoundary', () => {
+  test('renders loading state when query is loading', () => {
+    const Wrapped = withStatusQueryBoundary(
+      ({ status }: { status: KiloClawDashboardStatus | undefined }) =>
+        createElement('div', null, status?.status || 'none')
+    );
+
+    const html = renderToStaticMarkup(
+      createElement(Wrapped, {
+        statusQuery: {
+          data: undefined,
+          isLoading: true,
+          error: null,
+        },
+      })
+    );
+
+    expect(html).toContain('Loading...');
+  });
+
+  test('renders error state when query has an error', () => {
+    const Wrapped = withStatusQueryBoundary(
+      ({ status }: { status: KiloClawDashboardStatus | undefined }) =>
+        createElement('div', null, status?.status || 'none')
+    );
+
+    const html = renderToStaticMarkup(
+      createElement(Wrapped, {
+        statusQuery: {
+          data: undefined,
+          isLoading: false,
+          error: new Error('network issue'),
+        },
+      })
+    );
+
+    expect(html).toContain('Failed to load:');
+    expect(html).toContain('network issue');
+  });
+
+  test('renders wrapped component when query is resolved', () => {
+    const Wrapped = withStatusQueryBoundary(
+      ({ status }: { status: KiloClawDashboardStatus | undefined }) =>
+        createElement('div', null, `status:${status?.status || 'none'}`)
+    );
+
+    const html = renderToStaticMarkup(
+      createElement(Wrapped, {
+        statusQuery: {
+          data: baseStatus,
+          isLoading: false,
+          error: null,
+        },
+      })
+    );
+
+    expect(html).toContain('status:running');
+  });
+});

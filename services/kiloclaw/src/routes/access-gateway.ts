@@ -1,0 +1,507 @@
+import { type Context, Hono } from 'hono';
+import { getCookie, setCookie } from 'hono/cookie';
+import type { AppEnv } from '../types';
+import {
+  KILOCLAW_AUTH_COOKIE,
+  KILOCLAW_AUTH_COOKIE_MAX_AGE,
+  KILOCLAW_ACTIVE_INSTANCE_COOKIE,
+} from '../config';
+import { getWorkerDb, validateAndRedeemAccessCode, findPepperByUserId } from '../db';
+import { signKiloToken, validateKiloToken } from '../auth/jwt';
+import { deriveGatewayToken } from '../auth/gateway-token';
+import { sandboxIdFromUserId, userIdFromSandboxId } from '../auth/sandbox-id';
+import { parseInstanceHost, sandboxIdFromHostnameLabel } from '../auth/hostname-label';
+import {
+  isInstanceKeyedSandboxId,
+  instanceIdFromSandboxId,
+  sandboxIdFromInstanceId,
+  isValidInstanceId,
+} from '@kilocode/worker-utils/instance-id';
+import type { KiloClawEnv } from '../types';
+
+/**
+ * Access-gateway requests served on a per-instance virtual host (e.g.
+ * `i-<hex>.kiloclaw.ai`) don't need `KILOCLAW_ACTIVE_INSTANCE_COOKIE`:
+ * the host itself is the routing signal, and a cookie scoped to that
+ * host is self-referential. Returning true here suppresses both the
+ * positive set and the clear-cookie fallback so the host's cookie jar
+ * stays clean.
+ */
+function requestIsOnInstanceHost(c: Context<AppEnv>): boolean {
+  const host = new URL(c.req.raw.url).host;
+  return parseInstanceHost(host, c.env) !== null;
+}
+
+/**
+ * Access gateway routes — unauthenticated.
+ * Serves an HTML form for entering a one-time access code, then validates
+ * it via Hyperdrive, sets an auth cookie, and redirects to the OpenClaw UI.
+ *
+ * The gateway token (for OpenClaw websocket auth) is derived server-side
+ * from the userId after authentication, never passed through the URL or form.
+ */
+const accessGatewayRoutes = new Hono<AppEnv>();
+
+// Shared styles used by both the form page and the loading page
+const BASE_STYLES = /* css */ `
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+    background: #0a0a0a; color: #e0e0e0;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; padding: 1rem;
+  }
+  .card {
+    background: #161616; border: 1px solid #2a2a2a; border-radius: 12px;
+    padding: 2rem; max-width: 420px; width: 100%;
+  }
+  h1 { font-size: 1.25rem; margin-bottom: 0.25rem; color: #fff; }
+  .subtitle { font-size: 0.85rem; color: #888; margin-bottom: 1.5rem; }
+`;
+
+/**
+ * Verify that the given instanceId belongs to the given userId.
+ * Throws if the instance doesn't exist or belongs to a different user.
+ */
+async function assertInstanceOwnership(
+  env: KiloClawEnv,
+  userId: string,
+  instanceId: string
+): Promise<void> {
+  const stub = env.KILOCLAW_INSTANCE.get(env.KILOCLAW_INSTANCE.idFromName(instanceId));
+  const status = await stub.getStatus();
+  if (!status.userId || status.userId !== userId) {
+    throw new Error('Instance access denied');
+  }
+}
+
+/**
+ * Resolve the DO's authoritative sandboxId for gateway token derivation.
+ *
+ * When instanceId is provided (instance-keyed), go directly to the Instance DO.
+ * Otherwise fall back to the user registry (legacy personal instances).
+ *
+ * IMPORTANT: Callers must verify instance ownership via assertInstanceOwnership()
+ * before calling this function with a user-supplied instanceId.
+ */
+async function resolveSandboxId(
+  userId: string,
+  env: KiloClawEnv,
+  instanceId?: string
+): Promise<string> {
+  // Instance-keyed: go directly to the Instance DO — no registry lookup needed.
+  if (instanceId && isValidInstanceId(instanceId)) {
+    try {
+      const stub = env.KILOCLAW_INSTANCE.get(env.KILOCLAW_INSTANCE.idFromName(instanceId));
+      const status = await stub.getStatus();
+      // Belt-and-suspenders: reject even if the caller forgot to check ownership
+      if (status.userId && status.userId !== userId) {
+        console.error('[access-gateway] resolveSandboxId: ownership mismatch', {
+          userId,
+          instanceId,
+          instanceOwner: status.userId,
+        });
+        return sandboxIdFromUserId(userId);
+      }
+      if (status.sandboxId) return status.sandboxId;
+    } catch {
+      // DO unreachable — derive from instanceId directly
+    }
+    return sandboxIdFromInstanceId(instanceId);
+  }
+
+  // Legacy: resolve via user registry
+  try {
+    const registryKey = `user:${userId}`;
+    const registryStub = env.KILOCLAW_REGISTRY.get(env.KILOCLAW_REGISTRY.idFromName(registryKey));
+    const entries = await registryStub.listInstances(registryKey);
+    if (entries.length > 0) {
+      const entry = entries[0];
+      try {
+        const stub = env.KILOCLAW_INSTANCE.get(env.KILOCLAW_INSTANCE.idFromName(entry.doKey));
+        const status = await stub.getStatus();
+        if (status.sandboxId) return status.sandboxId;
+      } catch {
+        if (isValidInstanceId(entry.doKey)) {
+          return sandboxIdFromInstanceId(entry.doKey);
+        }
+      }
+    }
+  } catch {
+    // Registry unreachable — fall back to legacy derivation
+  }
+  return sandboxIdFromUserId(userId);
+}
+
+/**
+ * If the request host is a per-instance virtual host, return the sandboxId
+ * it encodes — after verifying the authenticated `userId` owns that host.
+ *
+ * For instance-keyed hosts (`i-{hex}`) ownership is checked via the Instance
+ * DO's `status.userId`. For legacy hosts (`u-{base32hex}`) the decoded userId
+ * must equal the authenticated userId (the label *is* the user's identity).
+ *
+ * Returns:
+ *   - sandboxId string on success
+ *   - `null` if the request is not on a per-instance host (caller should
+ *     fall back to the existing userId/instanceId resolution)
+ *   - throws `'Instance access denied'` if the host resolves to another
+ *     user's instance
+ */
+async function resolveHostSandboxId(c: Context<AppEnv>, userId: string): Promise<string | null> {
+  const host = new URL(c.req.raw.url).host;
+  const label = parseInstanceHost(host, c.env);
+  if (!label) return null;
+
+  const hostSandboxId = sandboxIdFromHostnameLabel(label);
+  if (!hostSandboxId) {
+    throw new Error('Instance access denied');
+  }
+
+  if (isInstanceKeyedSandboxId(hostSandboxId)) {
+    const instanceId = instanceIdFromSandboxId(hostSandboxId);
+    await assertInstanceOwnership(c.env, userId, instanceId);
+    return hostSandboxId;
+  }
+
+  // Legacy: sandboxId = base64url(userId). Verify the label is for the
+  // authenticated user.
+  if (userIdFromSandboxId(hostSandboxId) !== userId) {
+    throw new Error('Instance access denied');
+  }
+  return hostSandboxId;
+}
+
+/**
+ * Build the redirect URL after successful auth.
+ *
+ * Always redirects to /#token={token} — the catch-all proxy chooses the
+ * target instance from either the request's `Host` header (on per-instance
+ * virtual hosts) or the active-instance cookie (on legacy hosts). The
+ * /i/{instanceId} prefix must never appear in the redirect URL because the
+ * OpenClaw SPA would use it as the WebSocket base path.
+ *
+ * On per-instance virtual hosts the token is derived from the host-encoded
+ * sandboxId (verified to belong to `userId`). Any `instanceId` query param
+ * on such a host is ignored — the URL is the routing signal, and minting a
+ * token for a query-param instance on a differently-keyed host would hand
+ * the SPA a token for the wrong sandbox. On legacy hosts the token is
+ * derived from `instanceId` (when provided) or the user's default instance.
+ */
+async function buildRedirectUrl(
+  c: Context<AppEnv>,
+  userId: string,
+  instanceId?: string
+): Promise<string> {
+  if (!c.env.GATEWAY_TOKEN_SECRET) return '/';
+  const hostSandboxId = await resolveHostSandboxId(c, userId);
+  const sandboxId = hostSandboxId ?? (await resolveSandboxId(userId, c.env, instanceId));
+  const token = await deriveGatewayToken(sandboxId, c.env.GATEWAY_TOKEN_SECRET);
+  // Always redirect to '/' — the catch-all proxy routes via Host header
+  // (per-instance virtual hosts) or the active-instance cookie (legacy
+  // hosts). Exposing an /i/{instanceId}/ prefix would leak it to the
+  // OpenClaw SPA, which would then use it as the WebSocket target.
+  return `/#token=${token}`;
+}
+
+function renderPage(params: { userId: string; instanceId?: string; error?: string }) {
+  const { userId, instanceId, error } = params;
+  return /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>KiloClaw Access Gateway</title>
+  <style>
+    ${BASE_STYLES}
+    label { display: block; font-size: 0.8rem; color: #aaa; margin-bottom: 0.5rem; }
+    input[type="text"] {
+      width: 100%; padding: 0.75rem 1rem; font-size: 1.25rem; font-family: monospace;
+      letter-spacing: 0.15em; text-align: center; text-transform: uppercase;
+      background: #0a0a0a; border: 1px solid #333; border-radius: 8px; color: #fff;
+      outline: none; transition: border-color 0.15s;
+    }
+    input[type="text"]:focus { border-color: #666; }
+    input[type="text"]::placeholder { color: #444; letter-spacing: 0.1em; }
+    .error {
+      background: #2d1515; border: 1px solid #5c2020; border-radius: 6px;
+      padding: 0.6rem 0.8rem; font-size: 0.8rem; color: #f87171; margin-bottom: 1rem;
+    }
+    button {
+      width: 100%; padding: 0.75rem; margin-top: 1rem; font-size: 0.9rem;
+      font-weight: 600; background: #fff; color: #0a0a0a; border: none;
+      border-radius: 8px; cursor: pointer; transition: opacity 0.15s;
+    }
+    button:hover { opacity: 0.85; }
+    button:active { opacity: 0.7; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>KiloClaw Access</h1>
+    <p class="subtitle">Enter the access code from your dashboard</p>
+    ${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}
+    <form method="POST" action="/kilo-access-gateway">
+      <input type="hidden" name="userId" value="${escapeHtml(userId)}" />
+      ${instanceId ? `<input type="hidden" name="instanceId" value="${escapeHtml(instanceId)}" />` : ''}
+      <label for="code">Access Code</label>
+      <input type="text" id="code" name="code" placeholder="XXXXX-XXXXX"
+             maxlength="11" autocomplete="off" autofocus required />
+      <button type="submit">Authenticate</button>
+    </form>
+  </div>
+</body>
+</html>`;
+}
+
+function renderLoadingPage(redirectUrl: string) {
+  const safeUrl = escapeHtml(redirectUrl);
+  return /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="refresh" content="2;url=${safeUrl}" />
+  <title>Loading KiloClaw...</title>
+  <style>
+    ${BASE_STYLES}
+    .loading { text-align: center; }
+    .spinner {
+      display: inline-block; width: 24px; height: 24px;
+      border: 2px solid #333; border-top-color: #fff; border-radius: 50%;
+      animation: spin 0.8s linear infinite; margin-bottom: 1rem;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .status { font-size: 0.85rem; color: #aaa; }
+    a { color: #888; font-size: 0.8rem; margin-top: 1rem; display: inline-block; }
+  </style>
+</head>
+<body>
+  <div class="card loading">
+    <div class="spinner"></div>
+    <h1>Access code accepted</h1>
+    <p class="status">Loading KiloClaw Control UI...</p>
+    <noscript><a href="${safeUrl}">Click here to continue</a></noscript>
+  </div>
+  <script>setTimeout(function() { window.location.href = ${JSON.stringify(redirectUrl)}; }, 1000);</script>
+</body>
+</html>`;
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * Check if the user already has a valid auth cookie.
+ * Returns true if the cookie JWT is valid and the userId matches.
+ *
+ * Note: this only checks the JWT signature/expiry/version — it does NOT
+ * validate the pepper against the DB. If the pepper was rotated, authMiddleware
+ * will catch it on the next real request and return 401.
+ */
+async function hasValidCookie(
+  cookieValue: string | undefined,
+  userId: string,
+  secret: string,
+  workerEnv: string | undefined
+): Promise<boolean> {
+  if (!cookieValue) return false;
+  const result = await validateKiloToken(cookieValue, secret, workerEnv);
+  return result.success && result.userId === userId;
+}
+
+/**
+ * Validate an access code, set the auth cookie, and return the redirect URL.
+ * Returns an error object if validation fails (caller should show an error).
+ */
+async function redeemCodeAndSetCookie(
+  c: Context<AppEnv>,
+  code: string,
+  userId: string,
+  instanceId?: string
+): Promise<{ redirectUrl: string } | { error: string; status: 401 | 500 }> {
+  const connectionString = c.env.HYPERDRIVE?.connectionString;
+  if (!connectionString) {
+    console.error('[access-gateway] HYPERDRIVE not configured');
+    return { error: 'Server configuration error.', status: 500 };
+  }
+
+  const secret = c.env.NEXTAUTH_SECRET;
+  if (!secret) {
+    console.error('[access-gateway] NEXTAUTH_SECRET not configured');
+    return { error: 'Server configuration error.', status: 500 };
+  }
+
+  const db = getWorkerDb(connectionString);
+
+  const redeemedUserId = await validateAndRedeemAccessCode(db, code, userId);
+  if (!redeemedUserId) {
+    return {
+      error: 'Invalid or expired access code. Please generate a new one from your dashboard.',
+      status: 401,
+    };
+  }
+
+  const user = await findPepperByUserId(db, redeemedUserId);
+  if (!user) {
+    return { error: 'User not found.', status: 401 };
+  }
+
+  const token = await signKiloToken({
+    userId: redeemedUserId,
+    pepper: user.api_token_pepper,
+    secret,
+    env: c.env.WORKER_ENV,
+  });
+
+  // Verify instanceId ownership before minting a gateway token.
+  // On per-instance virtual hosts the Host header is the authoritative
+  // routing signal; `buildRedirectUrl` ignores the query-param instanceId
+  // and derives the sandbox from the host instead, so a stale/mismatched
+  // `?instanceId=` must not reject an otherwise-valid request here either.
+  if (!requestIsOnInstanceHost(c) && instanceId && isValidInstanceId(instanceId)) {
+    try {
+      await assertInstanceOwnership(c.env, redeemedUserId, instanceId);
+    } catch {
+      return { error: 'Access denied', status: 401 as const };
+    }
+  }
+
+  setCookie(c, KILOCLAW_AUTH_COOKIE, token, {
+    path: '/',
+    httpOnly: true,
+    secure: c.env.WORKER_ENV !== 'development',
+    sameSite: 'Lax',
+    maxAge: KILOCLAW_AUTH_COOKIE_MAX_AGE,
+  });
+
+  // Track which instance the user is accessing so the catch-all proxy
+  // routes WebSocket/HTTP traffic to the correct instance. The OpenClaw
+  // Control UI connects to `/` without the `/i/{instanceId}/` prefix.
+  //
+  // Skip on per-instance virtual hosts — the Host header carries the same
+  // routing signal, and a cookie scoped to `<label>.kiloclaw.ai` is
+  // self-referential.
+  if (!requestIsOnInstanceHost(c)) {
+    if (instanceId && isValidInstanceId(instanceId)) {
+      setCookie(c, KILOCLAW_ACTIVE_INSTANCE_COOKIE, instanceId, {
+        path: '/',
+        httpOnly: true,
+        secure: c.env.WORKER_ENV !== 'development',
+        sameSite: 'Lax',
+        maxAge: KILOCLAW_AUTH_COOKIE_MAX_AGE,
+      });
+    } else {
+      // Clear the cookie when opening a personal (non-instance-keyed) instance
+      setCookie(c, KILOCLAW_ACTIVE_INSTANCE_COOKIE, '', {
+        path: '/',
+        httpOnly: true,
+        secure: c.env.WORKER_ENV !== 'development',
+        sameSite: 'Lax',
+        maxAge: 0,
+      });
+    }
+  }
+
+  try {
+    const redirectUrl = await buildRedirectUrl(c, redeemedUserId, instanceId);
+    return { redirectUrl };
+  } catch {
+    return { error: 'Access denied', status: 401 as const };
+  }
+}
+
+accessGatewayRoutes.get('/kilo-access-gateway', async c => {
+  const userId = c.req.query('userId');
+  if (!userId) {
+    return c.text('Missing userId parameter', 400);
+  }
+  const instanceId = c.req.query('instanceId') || undefined;
+
+  // If the user already has a valid cookie, derive the gateway token and redirect
+  const secret = c.env.NEXTAUTH_SECRET;
+  if (secret) {
+    const cookie = getCookie(c, KILOCLAW_AUTH_COOKIE);
+    if (await hasValidCookie(cookie, userId, secret, c.env.WORKER_ENV)) {
+      const onInstanceHost = requestIsOnInstanceHost(c);
+      // Verify query-param instanceId ownership only on legacy hosts. On
+      // per-instance virtual hosts the Host is the routing signal and the
+      // query param is ignored by `buildRedirectUrl`, so a stale/mismatched
+      // value must not block an otherwise-valid request.
+      if (!onInstanceHost && instanceId && isValidInstanceId(instanceId)) {
+        try {
+          await assertInstanceOwnership(c.env, userId, instanceId);
+        } catch {
+          return c.text('Access denied', 403);
+        }
+        setCookie(c, KILOCLAW_ACTIVE_INSTANCE_COOKIE, instanceId, {
+          path: '/',
+          httpOnly: true,
+          secure: c.env.WORKER_ENV !== 'development',
+          sameSite: 'Lax',
+          maxAge: KILOCLAW_AUTH_COOKIE_MAX_AGE,
+        });
+      } else if (!onInstanceHost) {
+        setCookie(c, KILOCLAW_ACTIVE_INSTANCE_COOKIE, '', {
+          path: '/',
+          httpOnly: true,
+          secure: c.env.WORKER_ENV !== 'development',
+          sameSite: 'Lax',
+          maxAge: 0,
+        });
+      }
+      let redirectUrl: string;
+      try {
+        redirectUrl = await buildRedirectUrl(c, userId, instanceId);
+      } catch {
+        return c.text('Access denied', 403);
+      }
+      return c.redirect(redirectUrl);
+    }
+  }
+
+  // If an auth_code is provided in the URL, validate it directly (auto-auth flow).
+  // This lets the dashboard embed the code in the Open link so users skip manual entry.
+  const authCode = c.req.query('auth_code')?.trim().toUpperCase();
+  if (authCode) {
+    const result = await redeemCodeAndSetCookie(c, authCode, userId, instanceId);
+    if ('redirectUrl' in result) {
+      return c.html(renderLoadingPage(result.redirectUrl));
+    }
+    // Code was invalid/expired — fall through to the manual form with the error
+    return c.html(renderPage({ userId, instanceId, error: result.error }), result.status);
+  }
+
+  return c.html(renderPage({ userId, instanceId }));
+});
+
+accessGatewayRoutes.post('/kilo-access-gateway', async c => {
+  const body = await c.req.parseBody();
+  const code = typeof body.code === 'string' ? body.code.trim().toUpperCase() : '';
+  const userId = typeof body.userId === 'string' ? body.userId.trim() : '';
+  const instanceId =
+    typeof body.instanceId === 'string' && body.instanceId.trim()
+      ? body.instanceId.trim()
+      : undefined;
+
+  if (!code || !userId) {
+    return c.html(
+      renderPage({ userId, instanceId, error: 'Access code and user ID are required.' }),
+      400
+    );
+  }
+
+  const result = await redeemCodeAndSetCookie(c, code, userId, instanceId);
+  if ('redirectUrl' in result) {
+    return c.html(renderLoadingPage(result.redirectUrl));
+  }
+  return c.html(renderPage({ userId, instanceId, error: result.error }), result.status);
+});
+
+export { accessGatewayRoutes };

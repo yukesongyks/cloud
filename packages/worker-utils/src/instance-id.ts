@@ -1,0 +1,68 @@
+/**
+ * Instance identity helpers for multi-instance KiloClaw routing.
+ *
+ * instanceId = kiloclaw_instances.id UUID (the DB row primary key).
+ * sandboxId = `ki_{uuid-no-dashes}` (35 chars) — used for Fly machine
+ * naming, gateway token derivation, and metadata recovery.
+ *
+ * The `ki_` prefix distinguishes instance-keyed sandboxIds from legacy
+ * userId-derived ones (which are raw base64url).
+ */
+
+const MAX_SANDBOX_ID_LENGTH = 63;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** Validate that a string is a lowercase UUID with dashes. */
+export function isValidInstanceId(id: string): boolean {
+  return UUID_RE.test(id);
+}
+
+/**
+ * Derive a sandboxId from an instanceId (the DB row UUID).
+ * Strips dashes and prefixes `ki_` — result is `ki_{32-char-hex}` (35 chars).
+ */
+export function sandboxIdFromInstanceId(instanceId: string): string {
+  if (!isValidInstanceId(instanceId)) {
+    throw new Error('Invalid instanceId: must be a UUID');
+  }
+  const hex = instanceId.replace(/-/g, '');
+  const prefixed = `ki_${hex}`;
+  if (prefixed.length > MAX_SANDBOX_ID_LENGTH) {
+    throw new Error(
+      `instanceId too long: prefixed sandboxId would be ${prefixed.length} chars (max ${MAX_SANDBOX_ID_LENGTH})`
+    );
+  }
+  return prefixed;
+}
+
+/** Returns true if the sandboxId uses the `ki_` instance-keyed format. */
+export function isInstanceKeyedSandboxId(sandboxId: string): boolean {
+  return sandboxId.startsWith('ki_') && sandboxId.length === 35;
+}
+
+/**
+ * Recover the instanceId (UUID with dashes) from a `ki_`-prefixed sandboxId.
+ * Throws if the sandboxId is not in the expected format.
+ */
+export function instanceIdFromSandboxId(sandboxId: string): string {
+  if (!isInstanceKeyedSandboxId(sandboxId)) {
+    throw new Error('Not an instance-keyed sandboxId (expected ki_ prefix, 35 chars)');
+  }
+  const hex = sandboxId.slice(3); // strip "ki_"
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
+ * Return the subject used to bucket image-version rollouts.
+ *
+ * Legacy rows are user-keyed, so they bucket by userId. Instance-keyed rows
+ * bucket by the UUID encoded in the `ki_` sandboxId. This mirrors
+ * KiloClawInstance.restartMachine({ imageTag: 'latest' }).
+ */
+export function imageRolloutSubjectFromSandboxId(
+  sandboxId: string | null | undefined,
+  userId: string
+): string {
+  if (!sandboxId) return userId;
+  return isInstanceKeyedSandboxId(sandboxId) ? instanceIdFromSandboxId(sandboxId) : userId;
+}

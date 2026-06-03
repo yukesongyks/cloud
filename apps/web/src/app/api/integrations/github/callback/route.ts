@@ -1,0 +1,435 @@
+import type { NextRequest } from 'next/server';
+import { NextResponse } from 'next/server';
+import { getUserFromAuth } from '@/lib/user/server';
+import { Octokit } from '@octokit/rest';
+import { createAppAuth } from '@octokit/auth-app';
+import { exchangeGitHubOAuthCode } from '@/lib/integrations/platforms/github/adapter';
+import {
+  getGitHubAppTypeForOrganization,
+  getGitHubAppCredentials,
+} from '@/lib/integrations/platforms/github/app-selector';
+import { ensureOrganizationAccess } from '@/routers/organizations/utils';
+import {
+  createPendingIntegration,
+  findIntegrationByInstallationId,
+  findPendingInstallationByRequesterId,
+  upsertPlatformIntegrationForOwner,
+} from '@/lib/integrations/db/platform-integrations';
+import type {
+  PlatformRepository,
+  IntegrationPermissions,
+  Owner,
+} from '@/lib/integrations/core/types';
+import { parseStateReturn } from '@/lib/integrations/validate-return-path';
+import { captureException, captureMessage } from '@sentry/nextjs';
+import { verifyGitHubBotLinkState } from '@/lib/bot/github-link-state';
+import { linkKiloUser } from '@/lib/bot-identity';
+import { bot } from '@/lib/bot';
+import { isOrganizationMember } from '@/lib/organizations/organizations';
+import { PLATFORM } from '@/lib/integrations/core/constants';
+import { botPlatforms } from '@/lib/bot/platforms';
+import { APP_URL } from '@/lib/constants';
+
+const appendQueryParam = (path: string, queryParam: string): string =>
+  `${path}${path.includes('?') ? '&' : '?'}${queryParam}`;
+
+function htmlPage(title: string, message: string, status = 200): Response {
+  return new Response(
+    `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>${title}</title></head>
+<body style="font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="text-align:center">
+  <h1>${title}</h1>
+  <p>${message}</p>
+</div>
+</body></html>`,
+    { status, headers: { 'content-type': 'text/html; charset=utf-8' } }
+  );
+}
+
+async function handleGitHubBotLinkCallback(request: NextRequest, user: { id: string }) {
+  const searchParams = request.nextUrl.searchParams;
+  const code = searchParams.get('code');
+  const state = verifyGitHubBotLinkState(searchParams.get('state'));
+
+  if (!code || !state) {
+    return htmlPage(
+      'Link Failed',
+      'Invalid or expired GitHub link request. Please try again.',
+      400
+    );
+  }
+
+  if (state.userId !== user.id) {
+    return htmlPage(
+      'Link Failed',
+      'This GitHub link request was started by another Kilo user.',
+      403
+    );
+  }
+
+  const integration = await findIntegrationByInstallationId(PLATFORM.GITHUB, state.installationId);
+
+  if (!integration) {
+    return htmlPage('Link Failed', 'No matching GitHub integration was found.', 404);
+  }
+
+  if (!botPlatforms.require(PLATFORM.GITHUB).isEnabledForBot(integration)) {
+    return htmlPage('Link Unavailable', 'GitHub linking is not enabled for this integration.', 404);
+  }
+
+  if (integration.owned_by_organization_id) {
+    const isMember = await isOrganizationMember(integration.owned_by_organization_id, user.id);
+    if (!isMember) {
+      return htmlPage(
+        'Link Failed',
+        'You are not a member of the organization that owns this GitHub integration.',
+        403
+      );
+    }
+  } else if (integration.owned_by_user_id !== user.id) {
+    return htmlPage('Link Failed', 'You are not the owner of this GitHub integration.', 403);
+  }
+
+  const appType = integration.github_app_type ?? 'standard';
+  const githubUser = await exchangeGitHubOAuthCode(code, appType);
+
+  await bot.initialize();
+  await linkKiloUser(
+    bot.getState(),
+    {
+      platform: PLATFORM.GITHUB,
+      teamId: state.installationId,
+      userId: githubUser.id,
+    },
+    user.id
+  );
+
+  return htmlPage(
+    'GitHub account linked',
+    `GitHub account ${githubUser.login} has been linked to your Kilo account.<br>You can return to GitHub and mention Kilo again.`
+  );
+}
+
+/**
+ * GitHub App Installation Callback
+ *
+ * Called when user completes the GitHub App installation flow
+ */
+export async function GET(request: NextRequest) {
+  try {
+    // 1. Verify user authentication
+    const { user, authFailedResponse } = await getUserFromAuth({ adminOnly: false });
+    if (authFailedResponse) {
+      // If user is not authenticated (e.g., GitHub admin approving installation),
+      // redirect to homepage instead of showing "Unauthorized"
+      return NextResponse.redirect(new URL('/', APP_URL));
+    }
+
+    // 2. Extract parameters
+    const searchParams = request.nextUrl.searchParams;
+    const installationId = searchParams.get('installation_id') ?? '';
+    const setupAction = searchParams.get('setup_action');
+    const rawState = searchParams.get('state');
+
+    // 3. Bot-link callback hand-off — runs BEFORE owner parsing because
+    // bot-link state values do not start with `org_`/`user_` and have a
+    // different signature (verifyGitHubBotLinkState).
+    if (rawState && !rawState.startsWith('org_') && !rawState.startsWith('user_')) {
+      const botLinkState = verifyGitHubBotLinkState(rawState);
+      if (botLinkState) {
+        return await handleGitHubBotLinkCallback(request, user);
+      }
+    }
+
+    // 4. Parse owner from state (with optional |return=<path> suffix)
+    const { ownerToken, returnTo } = parseStateReturn(rawState);
+    let owner: Owner;
+    let ownerId: string;
+
+    if (ownerToken.startsWith('org_')) {
+      ownerId = ownerToken.slice(4);
+      owner = { type: 'org', id: ownerId };
+    } else if (ownerToken.startsWith('user_')) {
+      ownerId = ownerToken.slice(5);
+      owner = { type: 'user', id: ownerId };
+    } else {
+      captureMessage('GitHub callback missing or invalid owner in state', {
+        level: 'warning',
+        tags: { endpoint: 'github/callback', source: 'github_app_installation' },
+        extra: { installationId, rawState, allParams: Object.fromEntries(searchParams.entries()) },
+      });
+      return NextResponse.redirect(new URL('/', APP_URL));
+    }
+
+    // 4. Verify user has access to the owner
+    if (owner.type === 'org') {
+      await ensureOrganizationAccess({ user }, owner.id);
+    } else {
+      // For user-owned integrations, verify it's the same user
+      if (user.id !== owner.id) {
+        return NextResponse.redirect(new URL('/', APP_URL));
+      }
+    }
+
+    const integrationPath =
+      owner.type === 'org'
+        ? `/organizations/${owner.id}/integrations/github`
+        : `/integrations/github`;
+    const redirectPath = returnTo || integrationPath;
+
+    // 5. Determine which GitHub App to use based on organization settings
+    const appType = await getGitHubAppTypeForOrganization(owner.type === 'org' ? owner.id : null);
+    const credentials = getGitHubAppCredentials(appType);
+
+    // Handle uninstall/suspend actions
+    if (setupAction === 'delete' || setupAction === 'suspend') {
+      console.log(`GitHub App ${setupAction} action detected, skipping installation fetch`);
+
+      return NextResponse.redirect(
+        new URL(appendQueryParam(redirectPath, `github_action=${setupAction}`), APP_URL)
+      );
+    }
+
+    // Handle pending approval - store requester info for webhook matching
+    if (setupAction === 'request') {
+      const code = searchParams.get('code');
+
+      try {
+        let githubRequester: { id: string; login: string } | undefined;
+
+        // Exchange OAuth code for GitHub user identity
+        if (code) {
+          try {
+            githubRequester = await exchangeGitHubOAuthCode(code, appType);
+
+            console.log('GitHub user fetched', {
+              github_user_id: githubRequester.id,
+              github_user_login: githubRequester.login,
+            });
+          } catch (error) {
+            console.error('Error fetching GitHub user:', error);
+            captureException(error);
+            // Continue without GitHub user info
+          }
+        }
+
+        // Check for existing pending installation by this GitHub user
+        if (githubRequester) {
+          const existingPending = await findPendingInstallationByRequesterId(githubRequester.id);
+
+          if (existingPending) {
+            const existingOwnerId =
+              existingPending.owned_by_organization_id || existingPending.owned_by_user_id;
+
+            console.log('User already has a pending installation', {
+              existingPendingId: existingPending.id,
+              existingOwnerId,
+              githubRequesterId: githubRequester.id,
+            });
+
+            const queryParam =
+              owner.type === 'org'
+                ? `error=pending_installation_exists&org=${existingOwnerId}`
+                : 'error=pending_installation_exists';
+
+            return NextResponse.redirect(
+              new URL(appendQueryParam(redirectPath, queryParam), APP_URL)
+            );
+          }
+        }
+
+        // Create pending installation record with requester info
+        await createPendingIntegration({
+          organizationId: owner.type === 'org' ? owner.id : undefined,
+          userId: owner.type === 'user' ? owner.id : undefined,
+          requester: {
+            kilo_user_id: user.id,
+            kilo_user_email: user.google_user_email,
+            kilo_user_name: user.google_user_name,
+            requested_at: new Date().toISOString(),
+          },
+          githubRequester,
+          githubAppType: appType,
+        });
+
+        // Redirect back to integrations page with pending approval status
+        const queryParam = returnTo ? 'github_pending_approval=true' : 'pending_approval=true';
+
+        return NextResponse.redirect(new URL(appendQueryParam(redirectPath, queryParam), APP_URL));
+      } catch (error) {
+        console.error('Error creating pending installation:', error);
+        captureException(error);
+
+        return NextResponse.redirect(
+          new URL(appendQueryParam(redirectPath, 'error=pending_setup_failed'), APP_URL)
+        );
+      }
+    }
+
+    // Validate installation_id is present for normal install action
+    if (!installationId) {
+      captureMessage('GitHub callback missing installation_id', {
+        level: 'warning',
+        tags: { endpoint: 'github/callback', source: 'github_app_installation' },
+        extra: { setupAction, rawState, allParams: Object.fromEntries(searchParams.entries()) },
+      });
+
+      return NextResponse.redirect(
+        new URL(appendQueryParam(redirectPath, 'error=missing_installation_id'), APP_URL)
+      );
+    }
+
+    // 6. Fetch installation details from GitHub
+    // Create app authentication without installationId to get installation details
+    const auth = createAppAuth({
+      appId: credentials.appId,
+      privateKey: credentials.privateKey,
+    });
+
+    // Get app-level JWT token to fetch installation details
+    const appAuth = await auth({ type: 'app' });
+    const octokitApp = new Octokit({
+      auth: appAuth.token,
+    });
+
+    // Fetch installation details using app-level token
+    let installation;
+    try {
+      console.log('Fetching installation details for ID:', installationId);
+      const result = await octokitApp.apps.getInstallation({
+        installation_id: parseInt(installationId),
+      });
+      installation = result.data;
+    } catch (error) {
+      const err = error as { message?: string; status?: number };
+
+      // Capture to Sentry for monitoring
+      captureException(error, {
+        tags: {
+          endpoint: 'github/callback',
+          source: 'github_api_get_installation',
+          status: err.status?.toString() || 'unknown',
+        },
+        extra: {
+          installationId,
+          ownerId,
+          ownerType: owner.type,
+          setupAction,
+          errorStatus: err.status,
+          errorMessage: err.message,
+        },
+      });
+
+      // If installation not found, it might have been deleted or belongs to a different app
+      if (err.status === 404) {
+        const encodedInstallationId = encodeURIComponent(installationId);
+
+        return NextResponse.redirect(
+          new URL(
+            appendQueryParam(
+              redirectPath,
+              `error=installation_not_found&id=${encodedInstallationId}`
+            ),
+            APP_URL
+          )
+        );
+      }
+
+      throw error;
+    }
+
+    // 7. Get selected repositories
+    // For 'selected' repositories, we fetch the list. For 'all', we set it to null
+    let repositories: PlatformRepository[] | null = null;
+    if (installation.repository_selection === 'selected') {
+      // Need to use installation token (not app token) to list repos
+      console.log('Fetching repositories for installation:', installationId);
+      const installationAuth = await auth({
+        type: 'installation',
+        installationId: parseInt(installationId),
+      });
+      const octokitInstallation = new Octokit({
+        auth: installationAuth.token,
+      });
+
+      const { data: reposData } =
+        await octokitInstallation.apps.listReposAccessibleToInstallation();
+      repositories = reposData.repositories.map(repo => ({
+        id: repo.id,
+        name: repo.name,
+        full_name: repo.full_name,
+        private: repo.private,
+      }));
+    }
+
+    // 8. Store installation in database using new platform_integrations table
+    if (setupAction === 'install') {
+      // Handle null account and union type (User | Organization)
+      if (!installation.account) {
+        throw new Error('Installation account is missing');
+      }
+
+      const account = installation.account;
+      const accountId = account.id.toString();
+      const accountLogin =
+        'login' in account ? account.login : 'slug' in account ? account.slug : accountId;
+
+      await upsertPlatformIntegrationForOwner(owner, {
+        platform: 'github',
+        integrationType: 'app',
+        platformInstallationId: installationId,
+        platformAccountId: accountId,
+        platformAccountLogin: accountLogin,
+        permissions: installation.permissions as IntegrationPermissions,
+        scopes: installation.events || [],
+        repositoryAccess: installation.repository_selection,
+        repositories: repositories && repositories.length > 0 ? repositories : null,
+        installedAt: installation.created_at
+          ? new Date(installation.created_at).toISOString()
+          : new Date().toISOString(),
+        githubAppType: appType,
+      });
+    }
+
+    // 9. Redirect to success page
+    const successQueryParam = returnTo ? 'github_install=success' : 'success=installed';
+
+    return NextResponse.redirect(
+      new URL(appendQueryParam(redirectPath, successQueryParam), APP_URL)
+    );
+  } catch (error) {
+    console.error('Error handling GitHub App callback:', error);
+
+    // Capture error to Sentry with context for debugging
+    const searchParams = request.nextUrl.searchParams;
+    const rawState = searchParams.get('state');
+
+    captureException(error, {
+      tags: {
+        endpoint: 'github/callback',
+        source: 'github_app_installation',
+      },
+      extra: {
+        installationId: searchParams.get('installation_id'),
+        setupAction: searchParams.get('setup_action'),
+        rawState,
+      },
+    });
+
+    const { ownerToken: errorOwnerToken, returnTo } = parseStateReturn(rawState);
+
+    let redirectPath = returnTo || '/';
+
+    if (!returnTo && errorOwnerToken.startsWith('org_')) {
+      const orgId = errorOwnerToken.slice(4);
+      redirectPath = `/organizations/${orgId}/integrations/github`;
+    } else if (!returnTo && errorOwnerToken.startsWith('user_')) {
+      redirectPath = `/integrations/github`;
+    }
+
+    return NextResponse.redirect(
+      new URL(appendQueryParam(redirectPath, 'error=installation_failed'), APP_URL)
+    );
+  }
+}

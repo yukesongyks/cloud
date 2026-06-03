@@ -1,0 +1,252 @@
+import { describe, expect, it } from '@jest/globals';
+import {
+  appendCloudAgentNextLocalTestModel,
+  getDevcontainerEnabledStorageKey,
+  getLastUsedModelStorageKey,
+  getLastUsedRepoStorageKey,
+  getLastUsedVariantsStorageKey,
+  getPreferredInitialModel,
+  getPreferredInitialRepo,
+  getPreferredInitialVariant,
+  parseDevcontainerEnabled,
+  parseLastUsedRepo,
+} from './model-preferences';
+import type { ModelOption } from '@/components/shared/ModelCombobox';
+import type { RepositoryOption } from '@/components/shared/RepositoryCombobox';
+
+const modelOptions = [
+  { id: 'anthropic/claude-sonnet-4.5', name: 'Claude Sonnet 4.5' },
+  { id: 'openai/gpt-5.1', name: 'GPT 5.1' },
+] satisfies ModelOption[];
+
+describe('appendCloudAgentNextLocalTestModel', () => {
+  it('leaves the normal selector list unchanged when local model exposure is disabled', () => {
+    expect(appendCloudAgentNextLocalTestModel(modelOptions, false)).toEqual(modelOptions);
+  });
+
+  it('appends the deterministic local testing model without changing existing fallback defaults', () => {
+    const exposedModelOptions = appendCloudAgentNextLocalTestModel(modelOptions, true);
+
+    expect(exposedModelOptions).toEqual([
+      ...modelOptions,
+      { id: 'kilo/fake-deterministic', name: 'Deterministic test model' },
+    ]);
+    expect(
+      getPreferredInitialModel({
+        modelOptions: exposedModelOptions,
+        lastUsedModel: null,
+        defaultModel: 'blocked/model',
+      })
+    ).toBe('anthropic/claude-sonnet-4.5');
+  });
+
+  it('does not duplicate an already exposed deterministic local testing model', () => {
+    const existingTestModelOptions = [
+      ...modelOptions,
+      { id: 'kilo/fake-deterministic', name: 'Gateway-provided fake model' },
+    ] satisfies ModelOption[];
+
+    expect(appendCloudAgentNextLocalTestModel(existingTestModelOptions, true)).toEqual(
+      existingTestModelOptions
+    );
+  });
+});
+
+describe('getPreferredInitialModel', () => {
+  it('prefers the last used model when it is available', () => {
+    expect(
+      getPreferredInitialModel({
+        modelOptions,
+        lastUsedModel: 'openai/gpt-5.1',
+        defaultModel: 'anthropic/claude-sonnet-4.5',
+      })
+    ).toBe('openai/gpt-5.1');
+  });
+
+  it('falls back to the org default when the last used model is unavailable', () => {
+    expect(
+      getPreferredInitialModel({
+        modelOptions,
+        lastUsedModel: 'blocked/model',
+        defaultModel: 'anthropic/claude-sonnet-4.5',
+      })
+    ).toBe('anthropic/claude-sonnet-4.5');
+  });
+
+  it('falls back to the first available model when no preference is allowed', () => {
+    expect(
+      getPreferredInitialModel({
+        modelOptions,
+        lastUsedModel: null,
+        defaultModel: 'blocked/model',
+      })
+    ).toBe('anthropic/claude-sonnet-4.5');
+  });
+
+  it('returns undefined when no models are available', () => {
+    expect(
+      getPreferredInitialModel({
+        modelOptions: [],
+        lastUsedModel: 'openai/gpt-5.1',
+        defaultModel: 'anthropic/claude-sonnet-4.5',
+      })
+    ).toBeUndefined();
+  });
+});
+
+describe('getLastUsedModelStorageKey', () => {
+  it('uses separate keys for personal and organization contexts', () => {
+    expect(getLastUsedModelStorageKey()).toBe('cloud-agent:last-used-model:personal');
+    expect(getLastUsedModelStorageKey('org_123')).toBe(
+      'cloud-agent:last-used-model:organization:org_123'
+    );
+  });
+});
+
+describe('getLastUsedVariantsStorageKey', () => {
+  it('uses separate keys for personal and organization contexts', () => {
+    expect(getLastUsedVariantsStorageKey()).toBe('cloud-agent:last-used-variants:personal');
+    expect(getLastUsedVariantsStorageKey('org_123')).toBe(
+      'cloud-agent:last-used-variants:organization:org_123'
+    );
+  });
+});
+
+describe('repository preference', () => {
+  it('uses separate keys for personal and organization contexts', () => {
+    expect(getLastUsedRepoStorageKey()).toBe('cloud-agent:last-used-repo:personal');
+    expect(getLastUsedRepoStorageKey('org_123')).toBe(
+      'cloud-agent:last-used-repo:organization:org_123'
+    );
+  });
+
+  it('restores the repository full name and platform from stored data', () => {
+    expect(parseLastUsedRepo('{"fullName":"kilo/cloud","platform":"gitlab"}')).toEqual({
+      fullName: 'kilo/cloud',
+      platform: 'gitlab',
+    });
+  });
+
+  it('ignores malformed stored data', () => {
+    expect(parseLastUsedRepo('{"fullName":"kilo/cloud","platform":"invalid"}')).toBeNull();
+    expect(parseLastUsedRepo('{"platform":"github"}')).toBeNull();
+    expect(parseLastUsedRepo('not json')).toBeNull();
+    expect(parseLastUsedRepo(null)).toBeNull();
+  });
+
+  it('restores the matching provider when full names overlap', () => {
+    const githubRepo = {
+      id: 1,
+      fullName: 'kilo/cloud',
+      platform: 'github',
+    } satisfies RepositoryOption;
+    const gitlabRepo = {
+      id: 2,
+      fullName: 'kilo/cloud',
+      platform: 'gitlab',
+    } satisfies RepositoryOption;
+
+    expect(
+      getPreferredInitialRepo({
+        availableRepos: [githubRepo, gitlabRepo],
+        recentRepos: [githubRepo],
+        lastUsedRepo: { fullName: 'kilo/cloud', platform: 'gitlab' },
+        isLoadingGitHubRepos: false,
+        isLoadingGitLabRepos: false,
+      })
+    ).toEqual(gitlabRepo);
+  });
+
+  it('waits for the saved provider before falling back to a recent repository', () => {
+    const recentRepo = {
+      id: 1,
+      fullName: 'kilo/recent',
+      platform: 'github',
+    } satisfies RepositoryOption;
+    const lastUsedRepo = { fullName: 'kilo/saved', platform: 'gitlab' } as const;
+
+    expect(
+      getPreferredInitialRepo({
+        availableRepos: [recentRepo],
+        recentRepos: [recentRepo],
+        lastUsedRepo,
+        isLoadingGitHubRepos: false,
+        isLoadingGitLabRepos: true,
+      })
+    ).toBeUndefined();
+
+    expect(
+      getPreferredInitialRepo({
+        availableRepos: [recentRepo],
+        recentRepos: [recentRepo],
+        lastUsedRepo,
+        isLoadingGitHubRepos: false,
+        isLoadingGitLabRepos: false,
+      })
+    ).toEqual(recentRepo);
+  });
+});
+
+describe('devcontainer preference helpers', () => {
+  it('uses a stable storage key for the devcontainer preference', () => {
+    expect(getDevcontainerEnabledStorageKey()).toBe('cloud-agent:devcontainer-enabled');
+  });
+
+  it('parses only true as enabled', () => {
+    expect(parseDevcontainerEnabled('true')).toBe(true);
+    expect(parseDevcontainerEnabled('false')).toBe(false);
+    expect(parseDevcontainerEnabled('1')).toBe(false);
+    expect(parseDevcontainerEnabled(null)).toBe(false);
+  });
+});
+
+describe('getPreferredInitialVariant', () => {
+  it('prefers the last used variant when it is available', () => {
+    expect(
+      getPreferredInitialVariant({
+        availableVariants: ['none', 'low', 'medium', 'high'],
+        lastUsedVariant: 'high',
+        currentVariant: 'low',
+      })
+    ).toBe('high');
+  });
+
+  it('preserves the current variant when no last used is recorded', () => {
+    expect(
+      getPreferredInitialVariant({
+        availableVariants: ['none', 'low', 'medium', 'high'],
+        lastUsedVariant: null,
+        currentVariant: 'medium',
+      })
+    ).toBe('medium');
+  });
+
+  it('falls back to the first variant when the last used is unavailable and there is no current', () => {
+    expect(
+      getPreferredInitialVariant({
+        availableVariants: ['none', 'low'],
+        lastUsedVariant: 'max',
+      })
+    ).toBe('none');
+  });
+
+  it('ignores a current variant that is not available on the new model', () => {
+    expect(
+      getPreferredInitialVariant({
+        availableVariants: ['none'],
+        lastUsedVariant: null,
+        currentVariant: 'high',
+      })
+    ).toBe('none');
+  });
+
+  it('returns undefined when no variants are available', () => {
+    expect(
+      getPreferredInitialVariant({
+        availableVariants: [],
+        lastUsedVariant: 'high',
+        currentVariant: 'low',
+      })
+    ).toBeUndefined();
+  });
+});

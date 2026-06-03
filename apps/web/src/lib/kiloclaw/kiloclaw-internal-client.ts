@@ -1,0 +1,1283 @@
+import 'server-only';
+
+import type {
+  KiloclawDestroyReason,
+  KiloclawStartReason,
+  KiloclawStopReason,
+} from '@kilocode/worker-utils';
+import { INTERNAL_API_SECRET, KILOCLAW_API_URL } from '@/lib/config.server';
+import type {
+  ImageVersionEntry,
+  ProvisionInput,
+  PlatformStatusResponse,
+  PlatformDebugStatusResponse,
+  RegistryEntriesResponse,
+  KiloCodeConfigPatchInput,
+  KiloCodeConfigResponse,
+  WebSearchConfigPatchInput,
+  WebSearchConfigPatchResponse,
+  BotIdentityPatchInput,
+  BotIdentityPatchResponse,
+  ChannelsPatchInput,
+  ChannelsPatchResponse,
+  SecretsPatchInput,
+  SecretsPatchResponse,
+  PairingListResponse,
+  PairingApproveResponse,
+  DevicePairingListResponse,
+  DevicePairingApproveResponse,
+  VolumeSnapshotsResponse,
+  DoctorResponse,
+  DoctorControllerStartResponse,
+  DoctorControllerStatusResponse,
+  DoctorControllerCancelResponse,
+  OpenclawWorkspaceImportResponse,
+  KiloCliRunStartResponse,
+  KiloCliRunStatusResponse,
+  GatewayProcessStatusResponse,
+  GatewayProcessActionResponse,
+  ConfigRestoreResponse,
+  GatewayReadyResponse,
+  ControllerVersionResponse,
+  OpenclawConfigResponse,
+  MorningBriefingStatusResponse,
+  MorningBriefingActionResponse,
+  OnboardingBriefingResponse,
+  MorningBriefingInterestsResponse,
+  MorningBriefingUserLocationResponse,
+  MorningBriefingReadResponse,
+  GoogleCredentialsInput,
+  GoogleCredentialsResponse,
+  GoogleOAuthConnectionInput,
+  GoogleOAuthConnectionResponse,
+  GmailNotificationsResponse,
+  CandidateVolumesResponse,
+  ReassociateVolumeResponse,
+  OrphanVolumeScanResponse,
+  OrphanVolumeDestroyResponse,
+  ResizeMachineResponse,
+  SetAdminMachineSizeOverrideResponse,
+  ClearAdminMachineSizeOverrideResponse,
+  RestoreVolumeSnapshotResponse,
+  CleanupRecoveryPreviousVolumeResponse,
+  RegionsResponse,
+  UpdateRegionsResponse,
+  ProviderRolloutResponse,
+  UpdateProviderRolloutResponse,
+  ProviderRolloutConfig,
+} from './types';
+import type { InstanceTierKey } from '@kilocode/kiloclaw-instance-tiers';
+
+/** Keep in sync with: kiloclaw/controller/src/routes/files.ts, kiloclaw/src/.../gateway.ts (Zod) */
+export interface FileNode {
+  name: string;
+  path: string;
+  type: 'file' | 'directory';
+  children?: FileNode[];
+}
+
+export type OpenclawFileWriteValidation = 'warn-before-write' | 'allow-invalid';
+
+export type FileWriteResponse =
+  | { etag: string }
+  | {
+      outcome: 'openclaw-validation-warning';
+      valid: false;
+      reason: 'invalid' | 'validation-unavailable';
+      issues: Array<{ path: string; message: string; allowedValues?: string[] }>;
+    };
+
+/**
+ * Error thrown when the KiloClaw API returns a non-OK response.
+ * Preserves the HTTP status code and response body for structured
+ * error handling upstream.
+ */
+export class KiloClawApiError extends Error {
+  readonly statusCode: number;
+  readonly responseBody: string;
+
+  constructor(statusCode: number, responseBody = '') {
+    super(`KiloClaw API error (${statusCode})`);
+    this.name = 'KiloClawApiError';
+    this.statusCode = statusCode;
+    this.responseBody = responseBody;
+  }
+}
+
+type RequestContext = { userId: string };
+
+/**
+ * KiloClaw worker client for platform (internal) routes.
+ * Uses x-internal-api-key auth. Server-only.
+ */
+export class KiloClawInternalClient {
+  private baseUrl: string;
+  private apiSecret: string;
+
+  constructor() {
+    if (!KILOCLAW_API_URL) {
+      throw new Error('KILOCLAW_API_URL is not configured');
+    }
+    if (!INTERNAL_API_SECRET) {
+      throw new Error('INTERNAL_API_SECRET is not configured');
+    }
+    this.baseUrl = KILOCLAW_API_URL;
+    this.apiSecret = INTERNAL_API_SECRET;
+  }
+
+  private async request<T>(path: string, options?: RequestInit, ctx?: RequestContext): Promise<T> {
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      ...options,
+      headers: {
+        'x-internal-api-key': this.apiSecret,
+        'Content-Type': 'application/json',
+        ...options?.headers,
+      },
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(
+        `KiloClaw API error (${res.status}) ${options?.method ?? 'GET'} ${path}:`,
+        body,
+        ...(ctx ? [`userId=${ctx.userId}`] : [])
+      );
+      throw new KiloClawApiError(res.status, body);
+    }
+
+    return res.json() as Promise<T>;
+  }
+
+  async listVersions(): Promise<ImageVersionEntry[]> {
+    return this.request('/api/platform/versions');
+  }
+
+  async getLatestVersion(): Promise<ImageVersionEntry | null> {
+    return this.requestLatestVersion('/api/platform/versions/latest');
+  }
+
+  async getLatestVersionForInstance(opts: {
+    instanceId: string;
+    currentImageTag?: string | null;
+  }): Promise<ImageVersionEntry | null> {
+    const params = new URLSearchParams({
+      instanceId: opts.instanceId,
+    });
+    if (opts.currentImageTag) params.set('currentImageTag', opts.currentImageTag);
+    return this.requestLatestVersion(`/api/platform/versions/latest?${params.toString()}`);
+  }
+
+  private async requestLatestVersion(path: string): Promise<ImageVersionEntry | null> {
+    try {
+      return await this.request(path);
+    } catch (err) {
+      // 404 means "no latest version set" or "no upgrade available for this instance".
+      // Both collapse to null for callers (no banner, fall back to existing image).
+      if (err instanceof KiloClawApiError && err.statusCode === 404) {
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  async setRolloutPercent(
+    imageTag: string,
+    percent: number
+  ): Promise<{
+    ok: boolean;
+    imageTag: string;
+    variant: string;
+    rolloutPercent: number;
+    isLatest: boolean;
+  }> {
+    return this.request('/api/platform/versions/rollout', {
+      method: 'POST',
+      body: JSON.stringify({ imageTag, percent }),
+    });
+  }
+
+  async markImageAsLatest(
+    imageTag: string
+  ): Promise<{ ok: boolean; imageTag: string; variant: string }> {
+    return this.request('/api/platform/versions/mark-latest', {
+      method: 'POST',
+      body: JSON.stringify({ imageTag }),
+    });
+  }
+
+  async disableImageAndClearRollout(imageTag: string, updatedBy: string): Promise<{ ok: boolean }> {
+    return this.request('/api/platform/versions/disable-with-clear', {
+      method: 'POST',
+      body: JSON.stringify({ imageTag, updatedBy }),
+    });
+  }
+
+  /**
+   * Push a resolved admin pin (or clear) into the instance's DO state.
+   * Pass `imageTag = null` to clear the pin and reset to the current
+   * rollout target. Does not restart the machine.
+   */
+  async applyPinnedVersion(
+    userId: string,
+    instanceId: string,
+    imageTag: string | null
+  ): Promise<{
+    ok: boolean;
+    openclawVersion: string | null;
+    imageTag: string | null;
+    imageDigest: string | null;
+    variant: string | null;
+  }> {
+    return this.request(
+      '/api/platform/versions/apply-pin',
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, instanceId, imageTag }),
+      },
+      { userId }
+    );
+  }
+
+  /**
+   * Wake the target instance's DO so it re-arms its alarm after a new
+   * scheduled action has been persisted. Best-effort — failures are
+   * acceptable (the wedge in alarm() will eventually pick up the action
+   * the next time the DO ticks for any other reason). See
+   * services/kiloclaw/src/routes/platform.ts for the route comment
+   * explaining why this is required in dev and merely defensive in
+   * production.
+   */
+  async wakeScheduledAction(userId: string, instanceId: string): Promise<{ ok: true }> {
+    return this.request(
+      '/api/platform/scheduled-action/wake',
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, instanceId }),
+      },
+      { userId }
+    );
+  }
+
+  /**
+   * Synchronously runs the notification notice sweep that the cron
+   * normally drives. Used by the admin Scheduler tab "Run notice sweep
+   * now" button so admins can verify notice copy locally (where wrangler
+   * does not fire scheduled() on cadence) and on demand in production.
+   * No userId routing — sweep is fleet-wide.
+   */
+  async runScheduledActionNoticeSweep(): Promise<{
+    processed: number;
+    sent: number;
+    failed: number;
+    recovered: number;
+    voidedStale: number;
+  }> {
+    return this.request('/api/platform/scheduled-action/run-notice-sweep', {
+      method: 'POST',
+      body: '{}',
+    });
+  }
+
+  async setUserKiloclawEarlyAccess(
+    userId: string,
+    value: boolean
+  ): Promise<{ ok: boolean; userId: string; earlyAccess: boolean }> {
+    return this.request(`/api/platform/users/${encodeURIComponent(userId)}/kiloclaw-early-access`, {
+      method: 'POST',
+      body: JSON.stringify({ value }),
+    });
+  }
+
+  async provision(
+    userId: string,
+    config: ProvisionInput,
+    opts?: { instanceId?: string; orgId?: string; bootstrapSubscription?: boolean }
+  ): Promise<{ sandboxId: string; instanceId: string }> {
+    return this.request(
+      '/api/platform/provision',
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, ...config, ...opts }),
+      },
+      { userId }
+    );
+  }
+
+  async repairProvisionReservation(
+    userId: string,
+    instanceId: string,
+    orgId?: string
+  ): Promise<{ ok: true }> {
+    return this.request(
+      '/api/platform/provision/repair-reservation',
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, instanceId, orgId }),
+      },
+      { userId }
+    );
+  }
+
+  async start(
+    userId: string,
+    instanceId?: string,
+    options?: { skipCooldown?: boolean; reason?: KiloclawStartReason }
+  ): Promise<{
+    ok: true;
+    started: boolean;
+    previousStatus: string | null;
+    currentStatus: string | null;
+    startedAt: number | null;
+  }> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/start${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          userId,
+          ...(options?.skipCooldown ? { skipCooldown: true } : {}),
+          ...(options?.reason ? { reason: options.reason } : {}),
+        }),
+      },
+      { userId }
+    );
+  }
+
+  async startAsync(
+    userId: string,
+    instanceId?: string,
+    options?: { reason?: KiloclawStartReason }
+  ): Promise<{ ok: true }> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/start-async${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, ...(options?.reason ? { reason: options.reason } : {}) }),
+      },
+      { userId }
+    );
+  }
+
+  async stop(
+    userId: string,
+    instanceId?: string,
+    options?: { reason?: KiloclawStopReason }
+  ): Promise<{
+    ok: true;
+    stopped: boolean;
+    previousStatus: string | null;
+    currentStatus: string | null;
+    stoppedAt: number | null;
+  }> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/stop${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, ...(options?.reason ? { reason: options.reason } : {}) }),
+      },
+      { userId }
+    );
+  }
+
+  async destroy(
+    userId: string,
+    instanceId?: string,
+    options?: { reason?: KiloclawDestroyReason }
+  ): Promise<{ ok: true }> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/destroy${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, ...(options?.reason ? { reason: options.reason } : {}) }),
+      },
+      { userId }
+    );
+  }
+
+  async getStatus(userId: string, instanceId?: string): Promise<PlatformStatusResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/status?${params.toString()}`, undefined, {
+      userId,
+    });
+  }
+
+  async getMorningBriefingStatus(
+    userId: string,
+    instanceId?: string
+  ): Promise<MorningBriefingStatusResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/morning-briefing/status?${params.toString()}`, undefined, {
+      userId,
+    });
+  }
+
+  async enableMorningBriefing(
+    userId: string,
+    input?: { cron?: string; timezone?: string },
+    instanceId?: string
+  ): Promise<MorningBriefingActionResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/morning-briefing/enable${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, ...input }),
+      },
+      { userId }
+    );
+  }
+
+  async disableMorningBriefing(
+    userId: string,
+    instanceId?: string
+  ): Promise<MorningBriefingActionResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/morning-briefing/disable${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId }),
+      },
+      { userId }
+    );
+  }
+
+  async runMorningBriefing(
+    userId: string,
+    instanceId?: string
+  ): Promise<MorningBriefingActionResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/morning-briefing/run${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId }),
+      },
+      { userId }
+    );
+  }
+
+  async startOnboardingBriefing(
+    userId: string,
+    settingsHref: string,
+    instanceId?: string
+  ): Promise<OnboardingBriefingResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/morning-briefing/onboarding-briefing${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, settingsHref }),
+      },
+      { userId }
+    );
+  }
+
+  async updateBriefingInterests(
+    userId: string,
+    topics: string[],
+    instanceId?: string
+  ): Promise<MorningBriefingInterestsResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/morning-briefing/interests${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, topics }),
+      },
+      { userId }
+    );
+  }
+
+  async updateUserLocation(
+    userId: string,
+    userLocation: string | null,
+    instanceId?: string
+  ): Promise<MorningBriefingUserLocationResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/morning-briefing/user-location${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, userLocation }),
+      },
+      { userId }
+    );
+  }
+
+  async readMorningBriefing(
+    userId: string,
+    day: 'today' | 'yesterday',
+    instanceId?: string
+  ): Promise<MorningBriefingReadResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(
+      `/api/platform/morning-briefing/read/${day}?${params.toString()}`,
+      undefined,
+      { userId }
+    );
+  }
+
+  async getDebugStatus(userId: string, instanceId?: string): Promise<PlatformDebugStatusResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/debug-status?${params.toString()}`, undefined, { userId });
+  }
+
+  async getRegistryEntries(userId: string, orgId?: string): Promise<RegistryEntriesResponse> {
+    const params = new URLSearchParams({ userId });
+    if (orgId) params.set('orgId', orgId);
+    return this.request(`/api/platform/registry-entries?${params.toString()}`, undefined, {
+      userId,
+    });
+  }
+
+  async patchKiloCodeConfig(
+    userId: string,
+    patch: KiloCodeConfigPatchInput,
+    instanceId?: string
+  ): Promise<KiloCodeConfigResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/kilocode-config${params}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ userId, ...patch }),
+      },
+      { userId }
+    );
+  }
+
+  async patchWebSearchConfig(
+    userId: string,
+    patch: WebSearchConfigPatchInput,
+    instanceId?: string
+  ): Promise<WebSearchConfigPatchResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/web-search-config${params}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ userId, ...patch }),
+      },
+      { userId }
+    );
+  }
+
+  async patchChannels(
+    userId: string,
+    input: ChannelsPatchInput,
+    instanceId?: string
+  ): Promise<ChannelsPatchResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/channels${params}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ userId, ...input }),
+      },
+      { userId }
+    );
+  }
+
+  async patchExecPreset(
+    userId: string,
+    patch: { security?: string; ask?: string },
+    instanceId?: string
+  ): Promise<{ execSecurity: string | null; execAsk: string | null }> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/exec-preset${params}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ userId, ...patch }),
+      },
+      { userId }
+    );
+  }
+
+  async patchBotIdentity(
+    userId: string,
+    patch: BotIdentityPatchInput,
+    instanceId?: string
+  ): Promise<BotIdentityPatchResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/bot-identity${params}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ userId, ...patch }),
+      },
+      { userId }
+    );
+  }
+
+  async patchSecrets(
+    userId: string,
+    input: SecretsPatchInput,
+    instanceId?: string
+  ): Promise<SecretsPatchResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/secrets${params}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ userId, ...input }),
+      },
+      { userId }
+    );
+  }
+
+  async listVolumeSnapshots(userId: string, instanceId?: string): Promise<VolumeSnapshotsResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/volume-snapshots?${params.toString()}`, undefined, {
+      userId,
+    });
+  }
+
+  async listPairingRequests(
+    userId: string,
+    refresh = false,
+    instanceId?: string
+  ): Promise<PairingListResponse> {
+    const params = new URLSearchParams({ userId });
+    if (refresh) params.set('refresh', 'true');
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/pairing?${params.toString()}`, undefined, { userId });
+  }
+
+  async approvePairingRequest(
+    userId: string,
+    channel: string,
+    code: string,
+    instanceId?: string
+  ): Promise<PairingApproveResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/pairing/approve${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, channel, code }),
+      },
+      { userId }
+    );
+  }
+
+  async listDevicePairingRequests(
+    userId: string,
+    refresh = false,
+    instanceId?: string
+  ): Promise<DevicePairingListResponse> {
+    const params = new URLSearchParams({ userId });
+    if (refresh) params.set('refresh', 'true');
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/device-pairing?${params.toString()}`, undefined, { userId });
+  }
+
+  async approveDevicePairingRequest(
+    userId: string,
+    requestId: string,
+    instanceId?: string
+  ): Promise<DevicePairingApproveResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/device-pairing/approve${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, requestId }),
+      },
+      { userId }
+    );
+  }
+
+  async runDoctor(userId: string, instanceId?: string): Promise<DoctorResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/doctor${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId }),
+      },
+      { userId }
+    );
+  }
+
+  async startDoctorViaController(
+    userId: string,
+    fix: boolean,
+    instanceId?: string
+  ): Promise<DoctorControllerStartResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/doctor-controller/start${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, fix }),
+      },
+      { userId }
+    );
+  }
+
+  async getDoctorViaControllerStatus(
+    userId: string,
+    instanceId?: string
+  ): Promise<DoctorControllerStatusResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/doctor-controller/status?${params.toString()}`, undefined, {
+      userId,
+    });
+  }
+
+  async cancelDoctorViaController(
+    userId: string,
+    instanceId?: string
+  ): Promise<DoctorControllerCancelResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/doctor-controller/cancel${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId }),
+      },
+      { userId }
+    );
+  }
+
+  async startKiloCliRun(
+    userId: string,
+    prompt: string,
+    instanceId?: string
+  ): Promise<KiloCliRunStartResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/kilo-cli-run/start${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, prompt }),
+      },
+      { userId }
+    );
+  }
+
+  async getKiloCliRunStatus(
+    userId: string,
+    instanceId?: string
+  ): Promise<KiloCliRunStatusResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/kilo-cli-run/status?${params.toString()}`, undefined, {
+      userId,
+    });
+  }
+
+  async cancelKiloCliRun(userId: string, instanceId?: string): Promise<{ ok: boolean }> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/kilo-cli-run/cancel${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId }),
+      },
+      { userId }
+    );
+  }
+
+  async getGatewayStatus(
+    userId: string,
+    instanceId?: string
+  ): Promise<GatewayProcessStatusResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/gateway/status?${params.toString()}`, undefined, { userId });
+  }
+
+  async getGatewayReady(userId: string, instanceId?: string): Promise<GatewayReadyResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/gateway/ready?${params.toString()}`, undefined, { userId });
+  }
+
+  async getControllerVersion(
+    userId: string,
+    instanceId?: string
+  ): Promise<ControllerVersionResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/controller-version?${params.toString()}`, undefined, {
+      userId,
+    });
+  }
+
+  async startGateway(userId: string, instanceId?: string): Promise<GatewayProcessActionResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/gateway/start${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId }),
+      },
+      { userId }
+    );
+  }
+
+  async stopGateway(userId: string, instanceId?: string): Promise<GatewayProcessActionResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/gateway/stop${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId }),
+      },
+      { userId }
+    );
+  }
+
+  async restartGatewayProcess(
+    userId: string,
+    instanceId?: string
+  ): Promise<GatewayProcessActionResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/gateway/restart${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId }),
+      },
+      { userId }
+    );
+  }
+
+  async restoreConfig(
+    userId: string,
+    version = 'base',
+    instanceId?: string
+  ): Promise<ConfigRestoreResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/config/restore${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, version }),
+      },
+      { userId }
+    );
+  }
+
+  async getOpenclawConfig(userId: string, instanceId?: string): Promise<OpenclawConfigResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/openclaw-config?${params.toString()}`, undefined, {
+      userId,
+    });
+  }
+
+  async replaceOpenclawConfig(
+    userId: string,
+    config: Record<string, unknown>,
+    etag?: string,
+    instanceId?: string
+  ): Promise<{ ok: true }> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/openclaw-config${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, config, ...(etag !== undefined && { etag }) }),
+      },
+      { userId }
+    );
+  }
+
+  async patchOpenclawConfig(
+    userId: string,
+    patch: Record<string, unknown>,
+    instanceId?: string
+  ): Promise<{ ok: boolean }> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/openclaw-config${params}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ userId, patch }),
+      },
+      { userId }
+    );
+  }
+
+  async getFileTree(userId: string, instanceId?: string): Promise<{ tree: FileNode[] }> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/files/tree?${params.toString()}`);
+  }
+
+  async readFile(
+    userId: string,
+    filePath: string,
+    instanceId?: string
+  ): Promise<{ content: string; etag: string }> {
+    const params = new URLSearchParams({ userId, path: filePath });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/files/read?${params.toString()}`);
+  }
+
+  async writeFile(
+    userId: string,
+    filePath: string,
+    content: string,
+    etag?: string,
+    instanceId?: string
+  ): Promise<{ etag: string }> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(`/api/platform/files/write${params}`, {
+      method: 'POST',
+      body: JSON.stringify({ userId, path: filePath, content, etag }),
+    });
+  }
+
+  async writeOpenclawConfigFile(
+    userId: string,
+    content: string,
+    etag: string | undefined,
+    instanceId: string | undefined,
+    mode: OpenclawFileWriteValidation
+  ): Promise<FileWriteResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(`/api/platform/files/write-openclaw-config${params}`, {
+      method: 'POST',
+      body: JSON.stringify({ userId, content, etag, mode }),
+    });
+  }
+
+  async importOpenclawWorkspace(
+    userId: string,
+    files: Array<{ path: string; content: string }>,
+    instanceId?: string
+  ): Promise<OpenclawWorkspaceImportResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(`/api/platform/files/import-openclaw-workspace${params}`, {
+      method: 'POST',
+      body: JSON.stringify({ userId, files }),
+    });
+  }
+
+  async updateGoogleCredentials(
+    userId: string,
+    input: GoogleCredentialsInput,
+    instanceId?: string
+  ): Promise<GoogleCredentialsResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/google-credentials${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, ...input }),
+      },
+      { userId }
+    );
+  }
+
+  async clearGoogleCredentials(
+    userId: string,
+    instanceId?: string
+  ): Promise<GoogleCredentialsResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(
+      `/api/platform/google-credentials?${params.toString()}`,
+      {
+        method: 'DELETE',
+      },
+      { userId }
+    );
+  }
+
+  async updateGoogleOAuthConnection(
+    userId: string,
+    input: GoogleOAuthConnectionInput,
+    instanceId?: string
+  ): Promise<GoogleOAuthConnectionResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/google-oauth-connection${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, ...input }),
+      },
+      { userId }
+    );
+  }
+
+  async clearGoogleOAuthConnection(
+    userId: string,
+    instanceId?: string
+  ): Promise<GoogleOAuthConnectionResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(
+      `/api/platform/google-oauth-connection?${params.toString()}`,
+      {
+        method: 'DELETE',
+      },
+      { userId }
+    );
+  }
+
+  async enableGmailNotifications(
+    userId: string,
+    instanceId?: string
+  ): Promise<GmailNotificationsResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/gmail-notifications${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId }),
+      },
+      { userId }
+    );
+  }
+
+  async disableGmailNotifications(
+    userId: string,
+    instanceId?: string
+  ): Promise<GmailNotificationsResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(
+      `/api/platform/gmail-notifications?${params.toString()}`,
+      {
+        method: 'DELETE',
+      },
+      { userId }
+    );
+  }
+
+  async forceRetryRecovery(userId: string, instanceId?: string): Promise<{ ok: true }> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/force-retry-recovery${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId }),
+      },
+      { userId }
+    );
+  }
+
+  async cleanupRecoveryPreviousVolume(
+    userId: string,
+    instanceId?: string
+  ): Promise<CleanupRecoveryPreviousVolumeResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/cleanup-recovery-previous-volume${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId }),
+      },
+      { userId }
+    );
+  }
+
+  async listCandidateVolumes(
+    userId: string,
+    instanceId?: string
+  ): Promise<CandidateVolumesResponse> {
+    const params = new URLSearchParams({ userId });
+    if (instanceId) params.set('instanceId', instanceId);
+    return this.request(`/api/platform/candidate-volumes?${params.toString()}`, undefined, {
+      userId,
+    });
+  }
+
+  /**
+   * Scan a destroyed instance's Fly app for orphaned volumes. Read-only.
+   * The worker derives the Fly app + expected volume name from the instance
+   * identity, so callers never compute Fly resource names themselves.
+   */
+  async scanOrphanVolumes(
+    userId: string,
+    instanceId: string,
+    sandboxId: string
+  ): Promise<OrphanVolumeScanResponse> {
+    const params = new URLSearchParams({ userId, instanceId, sandboxId });
+    return this.request(`/api/platform/admin/orphan-volume-scan?${params.toString()}`, undefined, {
+      userId,
+    });
+  }
+
+  /**
+   * Destroy a single orphaned Fly volume. The worker re-verifies every
+   * Fly/DO-side invariant before deleting — see the route for the guards.
+   */
+  async destroyOrphanVolume(
+    userId: string,
+    instanceId: string,
+    sandboxId: string,
+    volumeId: string
+  ): Promise<OrphanVolumeDestroyResponse> {
+    return this.request(
+      '/api/platform/admin/orphan-volume-destroy',
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, instanceId, sandboxId, volumeId }),
+      },
+      { userId }
+    );
+  }
+
+  async reassociateVolume(
+    userId: string,
+    newVolumeId: string,
+    reason: string,
+    instanceId?: string
+  ): Promise<ReassociateVolumeResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/reassociate-volume${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, newVolumeId, reason }),
+      },
+      { userId }
+    );
+  }
+
+  async resizeMachine(
+    userId: string,
+    instanceType: InstanceTierKey,
+    actor: { actorId: string; actorEmail: string },
+    instanceId?: string
+  ): Promise<ResizeMachineResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/resize-machine${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, instanceType, ...actor }),
+      },
+      { userId }
+    );
+  }
+
+  async setAdminMachineSizeOverride(
+    userId: string,
+    payload: {
+      size: { cpus: number; memory_mb: number; cpu_kind?: 'shared' | 'performance' };
+      reason: string;
+      actorId: string;
+      actorEmail: string;
+    },
+    instanceId?: string
+  ): Promise<SetAdminMachineSizeOverrideResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/admin-size-override/set${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, ...payload }),
+      },
+      { userId }
+    );
+  }
+
+  async clearAdminMachineSizeOverride(
+    userId: string,
+    payload: { reason: string; actorId: string; actorEmail: string },
+    instanceId?: string
+  ): Promise<ClearAdminMachineSizeOverrideResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/admin-size-override/clear${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, ...payload }),
+      },
+      { userId }
+    );
+  }
+
+  async restoreVolumeFromSnapshot(
+    userId: string,
+    snapshotId: string,
+    instanceId?: string
+  ): Promise<RestoreVolumeSnapshotResponse> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/restore-volume-snapshot${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, snapshotId }),
+      },
+      { userId }
+    );
+  }
+
+  async destroyFlyMachine(
+    userId: string,
+    appName: string,
+    machineId: string,
+    instanceId?: string
+  ): Promise<{ ok: true }> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/destroy-fly-machine${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, appName, machineId }),
+      },
+      { userId }
+    );
+  }
+
+  async extendVolume(
+    userId: string,
+    appName: string,
+    volumeId: string,
+    targetSizeGb: number,
+    instanceId?: string
+  ): Promise<{ ok: true; needsRestart: boolean }> {
+    const params = instanceId ? `?instanceId=${encodeURIComponent(instanceId)}` : '';
+    return this.request(
+      `/api/platform/extend-volume${params}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, appName, volumeId, targetSizeGb }),
+      },
+      { userId }
+    );
+  }
+
+  async getRegions(): Promise<RegionsResponse> {
+    return this.request('/api/platform/regions');
+  }
+
+  async updateRegions(regions: string[]): Promise<UpdateRegionsResponse> {
+    return this.request('/api/platform/regions', {
+      method: 'PUT',
+      body: JSON.stringify({ regions }),
+    });
+  }
+
+  async getProviderRollout(): Promise<ProviderRolloutResponse> {
+    return this.request('/api/platform/providers/rollout');
+  }
+
+  async updateProviderRollout(
+    config: ProviderRolloutConfig
+  ): Promise<UpdateProviderRolloutResponse> {
+    return this.request('/api/platform/providers/rollout', {
+      method: 'PUT',
+      body: JSON.stringify(config),
+    });
+  }
+}
