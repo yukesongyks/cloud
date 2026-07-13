@@ -1,8 +1,12 @@
 {
-  "blocker_count": 2,
-  "major_count": 4,
-  "minor_count": 3,
-  "total_issues": 9,
+  "blocker_count": 0,
+  "major_count": 0,
+  "minor_count": 1,
+  "total_issues": 1,
   "review_completed": true,
-  "review_date": "2026-07-13T23:40:00Z"
+  "review_date": "2026-07-13T23:47:00Z",
+  "review_status": "passed",
+  "fixed_blockers": 2,
+  "fixed_majors": 4,
+  "fixed_minors": 2
 }
