@@ -7138,3 +7138,50 @@ export const model_experiment_request = pgTable(
 
 export type ModelExperimentRequest = typeof model_experiment_request.$inferSelect;
 export type NewModelExperimentRequest = typeof model_experiment_request.$inferInsert;
+
+// Personnel table for staff information management
+export const personnel = pgTable('personnel', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  
+  // Basic info
+  name: text('name').notNull(),
+  
+  // Enum fields
+  position: text('position', {
+    enum: ['developer', 'designer', 'product_manager', 'tester', 'operations', 'other']
+  }).notNull(),
+  
+  level: text('level', {
+    enum: ['junior', 'intermediate', 'senior', 'expert', 'architect']
+  }).notNull(),
+  
+  status: text('status', {
+    enum: ['active', 'resigned', 'on_leave', 'probation']
+  }).notNull().default('active'),
+  
+  // Numeric fields
+  age: integer('age').notNull(),
+  
+  // Text fields
+  baseLocation: text('base_location').notNull(),
+  
+  // Metadata
+  organizationId: uuid('organization_id')
+    .notNull()
+    .references(() => organizations.id, { onDelete: 'cascade' }),
+  createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' })
+    .defaultNow()
+    .notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'string' })
+    .defaultNow()
+    .notNull()
+    .$onUpdateFn(() => sql`now()`),
+}, (table) => [
+  index('personnel_org_idx').on(table.organizationId),
+  index('personnel_position_idx').on(table.position),
+  index('personnel_level_idx').on(table.level),
+  index('personnel_status_idx').on(table.status),
+]);
+
+export type Personnel = typeof personnel.$inferSelect;
+export type NewPersonnel = typeof personnel.$inferInsert;
