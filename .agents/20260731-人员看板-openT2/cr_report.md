@@ -1,8 +1,8 @@
-# Code Review Report (Re-Review · 修复后复审)
+# Code Review Report (Re-Review · 第3轮复审)
 
 > **Change** `人员看板-openT2` · **分支/Commit** `AI/task-DEV-966dcd0a-...` / `gt/toast/510a132b` · **日期** `2026-07-31` · **审查者** AI
 >
-> **复审轮次**：第 2 轮（首轮 6 P0 / 7 P1 / 4 P2 → 本轮复审修复结果）
+> **复审轮次**：第 3 轮（第2轮 1 P0 / 2 P1 / 3 P2 → 本轮复审修复结果）
 >
 > **AI**：等级 **P0 / P1 / P2**；G/S 以 checklist 行内定义为准。本次变更为 **TypeScript**（tRPC Router + Drizzle ORM + Zod），非 Java，`scan-all-rules.sh` 不适用，以 LLM 逐文件按 G/S 检查清单完成。
 
@@ -12,171 +12,151 @@
 
 | 项 | 值 |
 |----|-----|
-| `.ts` 文件数 | `7`（修复后复审范围） |
-| 复审文件 | staff-service / cost-budget-service / whitelist-service / import-service / dashboard-service / staff-router / cost-budget-router |
+| `.ts` 文件数 | `2`（本轮修复后复审范围） |
+| 复审文件 | `import-service.ts` / `cost-budget-service.ts` |
 
 ---
 
 ## 2. 问题计数
 
-| | 首轮 | 本轮 |
-|---|----|----|
-| P0 | 6 | **1** |
-| P1 | 7 | **2** |
-| P2 | 4 | **3** |
+| | 第1轮 | 第2轮 | **第3轮** |
+|---|----|----|----|
+| P0 | 6 | 1 | **0** |
+| P1 | 7 | 2 | **0** |
+| P2 | 4 | 3 | **2** |
 
 ---
 
-## 3. 首轮 P0 修复验证
+## 3. 第2轮问题修复验证
 
-| 首轮 ID | 位置 | 修复内容 | 验证结果 |
+### P0 修复验证
+
+| 第2轮 ID | 位置 | 修复内容 | 验证结果 |
 |---------|------|----------|----------|
-| P0-S2-1 | `staff-service.ts:216-275` | `UpdateStaffInput` 增加 `orgId`，existence check（:234）和 update WHERE（:264-265）均加 `eq(org_id, orgId)`，router 传 `organizationId` | ✅ 已修复 |
-| P0-S2-2 | `staff-service.ts:277-336` | existence check（:288）、关联检查（:305,316）、软删 WHERE（:331）均加 `eq(org_id, orgId)` | ✅ 已修复 |
-| P0-S2-3 | `cost-budget-service.ts:183-231` | `UpdateBudgetInput` 增加 `orgId`，existence check（:197）和 update WHERE（:221）均加 `eq(org_id, orgId)`，router 传 `organizationId` | ✅ 已修复 |
-| P0-G1.1-1 | `staff-service.ts:135-161` | insert 包裹 try-catch，捕获 PostgreSQL `23505` 转 `STAFF_001` | ✅ 已修复 |
-| P0-G1.1-2 | `whitelist-service.ts:101-122` | insert 包裹 try-catch，捕获 `23505` 转 `WL_002` | ✅ 已修复 |
-| P0-G1.1-3 | `cost-budget-service.ts:110-131` | insert 包裹 try-catch，捕获 `23505` 转 `BUDGET_002` | ✅ 已修复 |
+| NEW-P0-TDZ | `import-service.ts:508-531`（旧） | 将 `dedupedRows` 的声明和填充循环（L509-552）移到 `uniqueNos` 批量查询（L554-556）之前，消除 TDZ 违规 | ✅ 已修复 |
 
-**首轮 6 个 P0 全部修复 ✅**
+**验证详情**：
 
----
+修复后代码顺序为：
+1. L506: `const allFails: FailItem[] = [];`
+2. L507: `let successCount = 0;`
+3. L509-510: 注释 "Deduplicate within file ... Must run before the batch-fetch below"
+4. L511: `const seenPairs = new Set<string>();`
+5. **L512: `const dedupedRows: ... = [];`** ← 声明
+6. L514-552: `for` 循环填充 `dedupedRows`
+7. L554-556: 注释 "Batch-fetch ..." + `const uniqueNos = [...new Set(dedupedRows.map(...))]` ← 引用
 
-## 4. 首轮 P1/P2 修复验证
+`dedupedRows`（L512）声明在前，`uniqueNos`（L556）引用在后，顺序正确，TDZ ReferenceError 已消除。白名单批量导入功能恢复可用。✅
 
-| 首轮 ID | 位置 | 修复内容 | 验证结果 |
+### P1 修复验证
+
+| 第2轮 ID | 位置 | 修复内容 | 验证结果 |
 |---------|------|----------|----------|
-| P1 expireOverdueWhitelists | `whitelist-service.ts:206-216` | 移除 `or(isNull(expire_date))`，仅保留 `lte(expire_date, now)`，注释说明 NULL 语义 | ✅ 已修复 |
-| P1 导入失败行号丢失 | `import-service.ts:266` | `mapAndValidateRows(rawRows, 1)`；dedup 循环追踪 `csvRowNumber = idx+2`（:277）；batchFails 用 `rowNumbers[]`（:302,326） | ✅ 已修复 |
-| P1 catch 吞异常无堆栈 | `import-service.ts:324,605` | 非 UpstreamApiError 异常 reason 改为 `` `写入失败: ${err.message}` `` | ⚠️ 部分修复（见 §5 P1） |
-| P1 全量预取员工 | `import-service.ts:508-527` | 改为按 CSV employeeNo 集合 `inArray` 批量查询 | ❌ 引入新 P0（见 §5 P0） |
-| P1 task 卡 Processing | `import-service.ts:296-357,574-635` | 增加 `try...finally`，finally 块更新 task 状态 | ✅ 已修复 |
-| P1 email 无格式校验 | `staff-router.ts:29,92` | `z.string().max(128).email().optional()` | ✅ 已修复 |
-| P2 时区偏差 | `dashboard-service.ts:40-43` | 改用 `getUTCFullYear()` / `getUTCMonth()` | ✅ 已修复 |
-| P2 dedupFails 行号 | `import-service.ts:277-280` | dedup 循环追踪 `csvRowNumber` | ✅ 已修复 |
-| P2 offset 深分页 | 各 list 查询 | 仍使用 offset 分页 | ⚠️ 保留 P2（可接受后续优化） |
+| P1-catch | `import-service.ts:324,605`（旧） | catch 块增加 `console.error` 记录原始异常堆栈 | ✅ 已修复 |
+
+**验证详情**：
+
+- `batchImportStaff` catch 块（L318-331）：L325 `console.error('[import] staff row failed', csvRowNumber, err);` — 记录行号和完整异常对象 ✅
+- `batchImportWhitelist` catch 块（L601-614）：L608 `console.error('[import] whitelist row failed', rowNumber, err);` — 记录行号和完整异常对象 ✅
+
+两个 catch 块均已增加 `console.error` 记录原始异常（含堆栈），排障时可通过日志获取完整调用栈。✅
+
+### P2 修复验证
+
+| 第2轮 ID | 位置 | 修复内容 | 验证结果 |
+|---------|------|----------|----------|
+| P2-deleteCostBudget-org | `cost-budget-service.ts:256`（旧） | `deleteCostBudget` 软删 WHERE 增加 `eq(org_id, orgId)` | ✅ 已修复 |
+
+**验证详情**：
+
+修复后代码（L253-258 区域）：
+```typescript
+await db
+  .update(staff_cost_budgets)
+  .set({ is_deleted: true, gmt_modified: sql`now()` })
+  .where(
+    and(
+      eq(staff_cost_budgets.id, id),
+      eq(staff_cost_budgets.org_id, orgId)
+    )
+  );
+
+return { id, deleted: true };
+```
+
+软删 WHERE 现含 `eq(id, id)` + `eq(org_id, orgId)` 双条件，与 existence check（L243 `eq(org_id, orgId)`）保持一致。✅
 
 ---
 
-## 5. 本轮新发现问题
+## 4. 第3轮新发现问题
 
 ### P0（阻断合并）
 
-| ID | 等级 | 命中位置 | 说明 |
-|----|------|----------|------|
-| NEW-P0-TDZ | **P0** | `import-service.ts:510 vs 531` | **batchImportWhitelist 使用 dedupedRows 在声明前引用（TDZ 违规）**：第 510 行 `const uniqueNos = [...new Set(dedupedRows.map(r => r.data.employeeNo))]` 引用了 `dedupedRows`，但 `dedupedRows` 在第 531 行才通过 `const` 声明。JavaScript `const` 存在 Temporal Dead Zone，运行时会抛出 `ReferenceError: Cannot access 'dedupedRows' before initialization`。**白名单批量导入功能完全不可用**。这是修复 P1-5（全量预取→inArray 批量查询）时引入的回归。修复方案：将 `dedupedRows` 的声明和填充循环（第 529-571 行）移到 `uniqueNos` 查询（第 510 行）之前。 |
+无。✅
 
 ### P1
 
-| ID | 等级 | 命中位置 | 说明 |
-|----|------|----------|------|
-| P1-catch | **P1** | `import-service.ts:324,605` | catch 块异常处理有改进（从笼统"写入失败"改为包含 `err.message`），但仍无完整堆栈记录（`console.error` / logger）。排障时仅有单行 message，丢失调用栈。建议增加 `console.error(\`[import] row ${csvRowNumber} failed\`, err)` 或接入 logger。降级为 P2 亦可接受。 |
+无。✅
 
-### P2
+### P2（可选改进）
 
 | ID | 等级 | 命中位置 | 说明 |
 |----|------|----------|------|
 | P2-offset | **P2** | 各 list 查询 | 列表查询仍使用 offset 分页，深分页性能下降。当前 pageSize≤100 可控，建议后续迁移游标分页。 |
-| P2-catch-stack | **P2** | `import-service.ts:324,605` | catch 块无完整堆栈记录（见 P1-catch，可降级为 P2） |
-| P2-deleteCostBudget-org | **P2** | `cost-budget-service.ts:256` | `deleteCostBudget` 软删 WHERE 仅 `eq(id)` 缺 `org_id`（existence check 已含 org_id :243，故安全，但建议 WHERE 也加 org_id 保持一致性） |
+| P2-rowNumber-off-by-one | **P2** | `import-service.ts:516` | `batchImportWhitelist` 中 `const rowNumber = i;`（i 从1开始，header行索引为0），实际 CSV 行号为 `i`（header=0, 第1行数据=1），导出 fail 报告中行号需 +1 才匹配用户 CSV 行号（header 不算数据行时为 `i`，算 header 时为 `i+1`）。当前 `i` 从1起即跳过 header，`rowNumber=1` 对应 CSV 第2行（首行数据）。语义上可接受（导出报告以"数据行号"展示），但建议统一为 CSV 物理行号（`i+1`）以避免与 `batchImportStaff` 的 `csvRowNumber` 语义不一致。当前不阻断合并。 |
+
+---
+
+## 5. 回归检查
+
+本次修复涉及 `import-service.ts` 的 `batchImportWhitelist` 方法和 `cost-budget-service.ts` 的 `deleteCostBudget` 方法。对修改区域进行回归扫描：
+
+| 检查项 | 结果 |
+|--------|------|
+| `dedupedRows` 声明/引用顺序（TDZ） | ✅ 无回归 |
+| `uniqueNos` 批量查询逻辑（inArray + org_id + isNull） | ✅ 无回归 |
+| `empMap` 填充与使用 | ✅ 无回归 |
+| `addWhitelist` 调用参数完整性 | ✅ 无回归 |
+| `try...finally` task 状态更新（G3.2） | ✅ 无回归 |
+| `console.error` 不影响控制流（仅在 catch 内） | ✅ 无回归 |
+| `deleteCostBudget` WHERE 双条件不破坏正常删除 | ✅ 无回归 |
+
+**结论：本次修复未引入新回归。**
 
 ---
 
 ## 6. 结论
 
-- **合并建议**：**阻止合并**
-- **阻断原因**：首轮 6 个 P0 已全部修复 ✅，但修复 P1-5（全量预取员工）时引入了 **1 个新 P0 回归**（`batchImportWhitelist` TDZ 违规），导致白名单批量导入功能完全不可用。
-- **P0**：
-  1. `NEW-P0-TDZ` `import-service.ts:510` — `dedupedRows` 在声明前被引用，白名单批量导入运行即抛 ReferenceError
-- **P1**：
-  1. `P1-catch` `import-service.ts:324,605` — catch 块异常处理有改进但无完整堆栈
+- **合并建议**：**允许合并** ✅
+- **阻断原因**：无（第2轮的 1 个 P0 TDZ 回归 + 1 个 P1 catch 堆栈 + 1 个 P2 软删 WHERE 已全部修复）
+- **P0**：无
+- **P1**：无
 - **P2**：
-  1. `P2-offset` 各 list 查询 — offset 深分页
-  2. `P2-catch-stack` — 同 P1-catch，可降级
-  3. `P2-deleteCostBudget-org` `cost-budget-service.ts:256` — 软删 WHERE 缺 org_id（existence check 已含，安全但不一致）
-- **一句话**：首轮安全漏洞全部修复，但修复引入了白名单导入 TDZ 回归（P0），须修复后方可合并。
+  1. `P2-offset` 各 list 查询 — offset 深分页（可接受，后续优化）
+  2. `P2-rowNumber-off-by-one` `import-service.ts:516` — 行号语义建议统一（不阻断）
+- **一句话**：历经3轮评审，首轮6个P0安全漏洞 + 第2轮1个P0 TDZ回归已全部修复验证通过，剩余2个P2均为可接受的可选改进项，代码可合并。
 
 ---
 
-## 7. 问题片段
-
-### NEW-P0: batchImportWhitelist TDZ 违规
-
-- **P0** `apps/web/src/lib/staff/import-service.ts:508-531` — `dedupedRows` 在第 510 行被引用，但第 531 行才声明。
-
-片段范围：`apps/web/src/lib/staff/import-service.ts:505-535`
-
-```typescript
-L505|   const allFails: FailItem[] = [];
-L506|   let successCount = 0;
-L507|
-L508|   // Batch-fetch only the employees referenced in this import file (by employeeNo),
-L509|   // instead of loading the entire org's employee table — avoids OOM for large orgs.
-L510|   const uniqueNos = [...new Set(dedupedRows.map(r => r.data.employeeNo))];
-            // 问题：dedupedRows 在此引用，但下方第 531 行才声明
-L511|   const empMap = new Map<string, number>();
-L512|   for (let i = 0; i < uniqueNos.length; i += BATCH_SIZE) {
-...
-L527|   }
-L528|
-L529|   // Deduplicate within file — keep first occurrence of each (employeeNo, wlType) pair
-L530|   const seenPairs = new Set<string>();
-L531|   const dedupedRows: { rowNumber: number; data: WhitelistImportRow }[] = [];
-            // 声明在此，但上方第 510 行已引用 → TDZ ReferenceError
-```
-
-### P1: catch 块异常处理（改进但有残留）
-
-- **P1** `apps/web/src/lib/staff/import-service.ts:318-330` — 非 UpstreamApiError 异常 reason 含 `err.message` 但无堆栈记录。
-
-片段范围：`apps/web/src/lib/staff/import-service.ts:318-330`
-
-```typescript
-L318|       } catch (err) {
-L319|         const reason =
-L320|           err instanceof UpstreamApiError
-L321|             ? err.upstreamCode === 'STAFF_001'
-L322|               ? '工号已存在'
-L323|               : err.upstreamCode
-L324|             : `写入失败: ${err instanceof Error ? err.message : String(err)}`;
-            // 改进：含 err.message；残留：无 console.error / logger 记录堆栈
-L325|         batchFails.push({
-L326|           row: csvRowNumber,
-L327|           reason,
-L328|           data: `${row.employeeNo},${row.name}`,
-L329|         });
-L330|       }
-```
-
-### P2: deleteCostBudget 软删 WHERE 缺 org_id
-
-- **P2** `apps/web/src/lib/staff/cost-budget-service.ts:253-256` — existence check（:243）已含 org_id，安全；但软删 WHERE 仅 `eq(id)`。
-
-片段范围：`apps/web/src/lib/staff/cost-budget-service.ts:253-258`
-
-```typescript
-L253|   await db
-L254|     .update(staff_cost_budgets)
-L255|     .set({ is_deleted: true, gmt_modified: sql`now()` })
-L256|     .where(eq(staff_cost_budgets.id, id));
-            // 建议加 eq(org_id, orgId) 保持与 existence check 一致
-L257|
-L258|   return { id, deleted: true };
-```
-
----
-
-## 8. 修复任务列表（本轮）
+## 7. 修复任务列表（第3轮 — 已全部完成）
 
 ### P0（必须修复）
 
-- [ ] **P0** `apps/web/src/lib/staff/import-service.ts:508-531` — 将 `dedupedRows` 的声明和填充循环（第 529-571 行）移到 `uniqueNos` 查询（第 510 行）之前，消除 TDZ 违规，使白名单批量导入可用
+- [x] ~~**P0** `import-service.ts:508-531` — 将 `dedupedRows` 的声明和填充循环移到 `uniqueNos` 查询之前，消除 TDZ 违规~~ ✅ 已修复
+- [x] ~~**P1** `import-service.ts:318,599` — catch 块增加 `console.error` 记录原始异常堆栈~~ ✅ 已修复
+- [x] ~~**P2** `cost-budget-service.ts:256` — `deleteCostBudget` 软删 WHERE 增加 `eq(org_id, orgId)` 保持一致性~~ ✅ 已修复
 
-### P1
+### P2（可选 — 后续迭代）
 
-- [ ] **P1** `apps/web/src/lib/staff/import-service.ts:318,599` — catch 块增加 `console.error` 或 logger 记录原始异常堆栈（至少 `console.error('[import] row failed', csvRowNumber, err)`）
-
-### P2（可选）
-
-- [ ] **P2** `apps/web/src/lib/staff/cost-budget-service.ts:256` — `deleteCostBudget` 软删 WHERE 增加 `eq(org_id, orgId)` 保持一致性
 - [ ] **P2** 各 list 查询 — 后续迁移游标分页
+- [ ] **P2** `import-service.ts:516` — 行号语义建议统一为 CSV 物理行号（`i+1`）
+
+---
+
+## 8. 评审历史摘要
+
+| 轮次 | P0 | P1 | P2 | 合并建议 | 关键问题 |
+|------|----|----|----|----------|----------|
+| 第1轮 | 6 | 7 | 4 | 阻止合并 | org_id 隔离缺失(3)、唯一约束异常未捕获(3)、导入行号丢失、task卡Processing、email无校验、时区偏差等 |
+| 第2轮 | 1 | 2 | 3 | 阻止合并 | 首轮6P0全修复✅，但修复P1-5引入TDZ回归(NEW-P0-TDZ)；catch堆栈部分修复 |
+| **第3轮** | **0** | **0** | **2** | **允许合并** | **第2轮问题全修复✅，无新回归，仅余2个可接受P2** |

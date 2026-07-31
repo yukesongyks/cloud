@@ -1,21 +1,16 @@
 {
-  "blocker_count": 1,
-  "blocker_details": [
-    {
-      "id": "NEW-P0-TDZ",
-      "severity": "P0",
-      "rule": "G-Regression",
-      "location": "apps/web/src/lib/staff/import-service.ts:510 vs 531",
-      "summary": "batchImportWhitelist 中 dedupedRows 在第 510 行被引用（uniqueNos 查询），但第 531 行才通过 const 声明，存在 Temporal Dead Zone 违规，运行时抛 ReferenceError，白名单批量导入功能完全不可用。修复 P1-5（全量预取员工→inArray 批量查询）时引入的回归"
-    }
-  ],
+  "blocker_count": 0,
+  "blocker_details": [],
   "first_round_p0_count": 6,
   "first_round_p0_resolved": 6,
   "first_round_p0_status": "all_resolved",
-  "p1_count": 1,
-  "p2_count": 3,
-  "merge_recommendation": "阻止合并",
-  "review_round": 2,
-  "review_summary": "首轮 6 个 P0 安全漏洞（3 处 S2 越权 + 3 处 G1.1 先查后插无锁）全部修复验证通过；但修复 P1-5（全量预取员工内存风险）时引入 1 个新 P0 回归：batchImportWhitelist 中 dedupedRows TDZ 违规，导致白名单导入功能不可用。须修复后方可合并。",
+  "second_round_p0_count": 1,
+  "second_round_p0_resolved": 1,
+  "second_round_p0_status": "all_resolved",
+  "p1_count": 0,
+  "p2_count": 2,
+  "merge_recommendation": "允许合并",
+  "review_round": 3,
+  "review_summary": "第3轮复审：第2轮的1个P0(TDZ回归)、1个P1(catch堆栈)、1个P2(软删WHERE缺org_id)已全部修复验证通过，无新回归，仅余2个可接受P2(offset分页、行号语义)，代码可合并。",
   "report_path": ".agents/20260731-人员看板-openT2/cr_report.md"
 }
