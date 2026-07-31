@@ -25,6 +25,7 @@ export interface CreateBudgetInput {
 
 export interface UpdateBudgetInput {
   id: number;
+  orgId: string;
   amount?: string;
   remark?: string;
   modifierId?: string;
@@ -106,19 +107,28 @@ export async function createCostBudget(input: CreateBudgetInput): Promise<{ id: 
     throw new UpstreamApiError('BUDGET_002');
   }
 
-  const [created] = await db
-    .insert(staff_cost_budgets)
-    .values({
-      org_id: input.orgId,
-      employee_id: input.employeeId,
-      budget_type: input.budgetType,
-      period: input.period,
-      amount: input.amount,
-      currency: input.currency ?? 'CNY',
-      remark: input.remark ?? null,
-      creator_id: input.creatorId ?? null,
-    })
-    .returning({ id: staff_cost_budgets.id });
+  let created: { id: number } | undefined;
+  try {
+    [created] = await db
+      .insert(staff_cost_budgets)
+      .values({
+        org_id: input.orgId,
+        employee_id: input.employeeId,
+        budget_type: input.budgetType,
+        period: input.period,
+        amount: input.amount,
+        currency: input.currency ?? 'CNY',
+        remark: input.remark ?? null,
+        creator_id: input.creatorId ?? null,
+      })
+      .returning({ id: staff_cost_budgets.id });
+  } catch (err) {
+    // G1.1: DB unique constraint violation (uk_staff_budget_emp_period) — concurrent TOCTOU race
+    if (err && typeof err === 'object' && 'code' in err && (err as { code: string }).code === '23505') {
+      throw new UpstreamApiError('BUDGET_002');
+    }
+    throw err;
+  }
 
   if (!created) {
     throw new UpstreamApiError('BUDGET_006');
@@ -182,7 +192,11 @@ export async function updateCostBudget(input: UpdateBudgetInput): Promise<{
     .select({ id: staff_cost_budgets.id })
     .from(staff_cost_budgets)
     .where(
-      and(eq(staff_cost_budgets.id, input.id), isNull(staff_cost_budgets.is_deleted))
+      and(
+        eq(staff_cost_budgets.id, input.id),
+        eq(staff_cost_budgets.org_id, input.orgId),
+        isNull(staff_cost_budgets.is_deleted)
+      )
     )
     .limit(1);
 
@@ -201,7 +215,12 @@ export async function updateCostBudget(input: UpdateBudgetInput): Promise<{
   const [updated] = await db
     .update(staff_cost_budgets)
     .set(updateFields)
-    .where(eq(staff_cost_budgets.id, input.id))
+    .where(
+      and(
+        eq(staff_cost_budgets.id, input.id),
+        eq(staff_cost_budgets.org_id, input.orgId)
+      )
+    )
     .returning({ gmt_modified: staff_cost_budgets.gmt_modified });
 
   if (!updated) {

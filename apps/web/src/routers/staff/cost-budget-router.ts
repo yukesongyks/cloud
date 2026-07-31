@@ -85,6 +85,7 @@ export const costBudgetRouter = createTRPCRouter({
       ]);
       return updateCostBudget({
         id: input.id,
+        orgId: input.organizationId,
         amount: input.amount,
         remark: input.remark,
         modifierId: ctx.user.id,

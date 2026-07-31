@@ -1,6 +1,6 @@
 import { db } from '@/lib/drizzle';
 import { UpstreamApiError } from '@/lib/trpc/init';
-import { and, count, eq, isNull, sql } from 'drizzle-orm';
+import { and, count, eq, inArray, isNull, sql } from 'drizzle-orm';
 import {
   staff_employees,
   staff_import_tasks,
@@ -263,17 +263,21 @@ export async function batchImportStaff(input: {
     throw new UpstreamApiError('IMPORT_005');
   }
 
-  const { mapped, fails } = mapAndValidateRows(rawRows, 0);
+  const { mapped, fails } = mapAndValidateRows(rawRows, 1);
 
   // Deduplicate within file — keep first occurrence of each employeeNo
+  // Track original CSV row number (1-based data rows start at line 2 in the file, header is line 1).
   const seenNos = new Set<string>();
   const deduped: ImportRow[] = [];
   const dedupFails: FailItem[] = [];
+  const rowNumbers: number[] = [];
 
-  for (const row of mapped) {
+  for (let idx = 0; idx < mapped.length; idx++) {
+    const row = mapped[idx];
+    const csvRowNumber = idx + 2; // header=1, first data row=2
     if (seenNos.has(row.employeeNo)) {
       dedupFails.push({
-        row: 0,
+        row: csvRowNumber,
         reason: '文件内工号重复，已跳过',
         data: `${row.employeeNo},${row.name}`,
       });
@@ -281,71 +285,78 @@ export async function batchImportStaff(input: {
     }
     seenNos.add(row.employeeNo);
     deduped.push(row);
+    rowNumbers.push(csvRowNumber);
   }
 
   let successCount = 0;
   const allFails: FailItem[] = [...fails, ...dedupFails];
 
   // Insert in batches
-  for (let i = 0; i < deduped.length; i += BATCH_SIZE) {
-    const batch = deduped.slice(i, i + BATCH_SIZE);
-    const batchFails: FailItem[] = [];
+  let rowIdx = 0;
+  try {
+    for (let i = 0; i < deduped.length; i += BATCH_SIZE) {
+      const batch = deduped.slice(i, i + BATCH_SIZE);
+      const batchFails: FailItem[] = [];
 
-    for (const row of batch) {
-      try {
-        await createStaff({
-          orgId,
-          employeeNo: row.employeeNo,
-          name: row.name,
-          department: row.department,
-          position: row.position,
-          phone: row.phone,
-          email: row.email,
-          status: parseStatus(row.status),
-          entryDate: row.entryDate,
-          remark: row.remark,
-          creatorId,
-        });
-        successCount++;
-      } catch (err) {
-        const reason =
-          err instanceof UpstreamApiError
-            ? err.upstreamCode === 'STAFF_001'
-              ? '工号已存在'
-              : err.upstreamCode
-            : '写入失败';
-        batchFails.push({
-          row: 0,
-          reason,
-          data: `${row.employeeNo},${row.name}`,
-        });
+      for (const row of batch) {
+        const csvRowNumber = rowNumbers[rowIdx++];
+        try {
+          await createStaff({
+            orgId,
+            employeeNo: row.employeeNo,
+            name: row.name,
+            department: row.department,
+            position: row.position,
+            phone: row.phone,
+            email: row.email,
+            status: parseStatus(row.status),
+            entryDate: row.entryDate,
+            remark: row.remark,
+            creatorId,
+          });
+          successCount++;
+        } catch (err) {
+          const reason =
+            err instanceof UpstreamApiError
+              ? err.upstreamCode === 'STAFF_001'
+                ? '工号已存在'
+                : err.upstreamCode
+              : `写入失败: ${err instanceof Error ? err.message : String(err)}`;
+          batchFails.push({
+            row: csvRowNumber,
+            reason,
+            data: `${row.employeeNo},${row.name}`,
+          });
+        }
       }
-    }
 
-    allFails.push(...batchFails);
+      allFails.push(...batchFails);
+    }
+  } finally {
+    // G3.2: Ensure task status is updated even if the process crashes mid-import.
+    const failCount = allFails.length;
+    const finalStatus =
+      failCount === 0
+        ? ImportTaskStatus.Success
+        : successCount > 0
+          ? ImportTaskStatus.PartialFail
+          : ImportTaskStatus.Fail;
+
+    const failDetailJson = JSON.stringify(allFails.slice(0, 200));
+
+    await db
+      .update(staff_import_tasks)
+      .set({
+        success_count: successCount,
+        fail_count: failCount,
+        status: finalStatus,
+        fail_detail: failDetailJson,
+        gmt_modified: sql`now()`,
+      })
+      .where(eq(staff_import_tasks.id, task.id));
   }
 
   const failCount = allFails.length;
-  const finalStatus =
-    failCount === 0
-      ? ImportTaskStatus.Success
-      : successCount > 0
-        ? ImportTaskStatus.PartialFail
-        : ImportTaskStatus.Fail;
-
-  // Truncate fail_detail to avoid oversized text — keep up to 200 entries
-  const failDetailJson = JSON.stringify(allFails.slice(0, 200));
-
-  await db
-    .update(staff_import_tasks)
-    .set({
-      success_count: successCount,
-      fail_count: failCount,
-      status: finalStatus,
-      fail_detail: failDetailJson,
-      gmt_modified: sql`now()`,
-    })
-    .where(eq(staff_import_tasks.id, task.id));
 
   return {
     taskId: task.id,
@@ -494,19 +505,25 @@ export async function batchImportWhitelist(input: {
   const allFails: FailItem[] = [];
   let successCount = 0;
 
-  // Pre-fetch all employees in this org for employeeNo → id lookup
-  const allEmployees = await db
-    .select({ id: staff_employees.id, employee_no: staff_employees.employee_no })
-    .from(staff_employees)
-    .where(
-      and(
-        eq(staff_employees.org_id, orgId),
-        isNull(staff_employees.is_deleted)
-      )
-    );
+  // Batch-fetch only the employees referenced in this import file (by employeeNo),
+  // instead of loading the entire org's employee table — avoids OOM for large orgs.
+  const uniqueNos = [...new Set(dedupedRows.map(r => r.data.employeeNo))];
   const empMap = new Map<string, number>();
-  for (const emp of allEmployees) {
-    empMap.set(emp.employee_no, emp.id);
+  for (let i = 0; i < uniqueNos.length; i += BATCH_SIZE) {
+    const batchNos = uniqueNos.slice(i, i + BATCH_SIZE);
+    const batchEmployees = await db
+      .select({ id: staff_employees.id, employee_no: staff_employees.employee_no })
+      .from(staff_employees)
+      .where(
+        and(
+          eq(staff_employees.org_id, orgId),
+          inArray(staff_employees.employee_no, batchNos),
+          isNull(staff_employees.is_deleted)
+        )
+      );
+    for (const emp of batchEmployees) {
+      empMap.set(emp.employee_no, emp.id);
+    }
   }
 
   // Deduplicate within file — keep first occurrence of each (employeeNo, wlType) pair
@@ -554,65 +571,70 @@ export async function batchImportWhitelist(input: {
   }
 
   // Process each row — call addWhitelist which validates employee existence, uniqueness, and date validity
-  for (const { rowNumber, data } of dedupedRows) {
-    try {
-      const employeeId = empMap.get(data.employeeNo);
-      if (!employeeId) {
+  try {
+    for (const { rowNumber, data } of dedupedRows) {
+      try {
+        const employeeId = empMap.get(data.employeeNo);
+        if (!employeeId) {
+          allFails.push({
+            row: rowNumber,
+            reason: 'WL_001 员工不存在',
+            data: data.employeeNo,
+          });
+          continue;
+        }
+
+        const wlType = parseWhitelistType(data.wlType);
+
+        await addWhitelist({
+          orgId,
+          employeeId,
+          wlType,
+          effectiveDate: data.effectiveDate,
+          expireDate: data.expireDate,
+          remark: data.remark,
+          creatorId,
+        });
+        successCount++;
+      } catch (err) {
+        const reason =
+          err instanceof UpstreamApiError
+            ? err.upstreamCode === 'WL_002'
+              ? '同员工同类型已有生效记录'
+              : err.upstreamCode
+            : `写入失败: ${err instanceof Error ? err.message : String(err)}`;
         allFails.push({
           row: rowNumber,
-          reason: 'WL_001 员工不存在',
-          data: data.employeeNo,
+          reason,
+          data: `${data.employeeNo},${data.wlType}`,
         });
-        continue;
       }
-
-      const wlType = parseWhitelistType(data.wlType);
-
-      await addWhitelist({
-        orgId,
-        employeeId,
-        wlType,
-        effectiveDate: data.effectiveDate,
-        expireDate: data.expireDate,
-        remark: data.remark,
-        creatorId,
-      });
-      successCount++;
-    } catch (err) {
-      const reason =
-        err instanceof UpstreamApiError
-          ? err.upstreamCode === 'WL_002'
-            ? '同员工同类型已有生效记录'
-            : err.upstreamCode
-          : '写入失败';
-      allFails.push({
-        row: rowNumber,
-        reason,
-        data: `${data.employeeNo},${data.wlType}`,
-      });
     }
+  } finally {
+    // G3.2: Ensure task status is updated even if the process crashes mid-import.
+    const failCount = allFails.length;
+    const finalStatus =
+      failCount === 0
+        ? ImportTaskStatus.Success
+        : successCount > 0
+          ? ImportTaskStatus.PartialFail
+          : ImportTaskStatus.Fail;
+
+    const failDetailJson = JSON.stringify(allFails.slice(0, 200));
+
+    await db
+      .update(staff_import_tasks)
+      .set({
+        success_count: successCount,
+        fail_count: failCount,
+        status: finalStatus,
+        fail_detail: failDetailJson,
+        gmt_modified: sql`now()`,
+      })
+      .where(eq(staff_import_tasks.id, task.id));
   }
 
   const failCount = allFails.length;
-  const finalStatus =
-    failCount === 0
-      ? ImportTaskStatus.Success
-      : successCount > 0
-        ? ImportTaskStatus.PartialFail
-        : ImportTaskStatus.Fail;
-
-  const failDetailJson = JSON.stringify(allFails.slice(0, 200));
-
-  await db
-    .update(staff_import_tasks)
-    .set({
-      success_count: successCount,
-      fail_count: failCount,
-      status: finalStatus,
-      fail_detail: failDetailJson,
-      gmt_modified: sql`now()`,
-    })
-    .where(eq(staff_import_tasks.id, task.id));
 
   return {
     taskId: task.id,

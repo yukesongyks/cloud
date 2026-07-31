@@ -33,11 +33,13 @@ export interface DeptStat {
 // ---------------------------------------------------------------------------
 
 /**
- * Get the current month period string (YYYY-MM).
+ * Get the current month period string (YYYY-MM) in UTC.
+ * Using UTC avoids timezone drift when the server runs in a different
+ * timezone than expected for monthly budget statistics.
  */
 function getCurrentPeriod(): string {
   const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
 export async function getDashboardSummary(

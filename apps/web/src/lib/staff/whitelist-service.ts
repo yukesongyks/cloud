@@ -1,6 +1,6 @@
 import { db } from '@/lib/drizzle';
 import { UpstreamApiError } from '@/lib/trpc/init';
-import { and, count, eq, isNull, lte, or, sql } from 'drizzle-orm';
+import { and, count, eq, isNull, lte, sql } from 'drizzle-orm';
 import {
   staff_employees,
   staff_whitelists,
@@ -98,19 +98,28 @@ export async function addWhitelist(input: AddWhitelistInput): Promise<{ id: numb
     throw new UpstreamApiError('WL_002');
   }
 
-  const [created] = await db
-    .insert(staff_whitelists)
-    .values({
-      org_id: input.orgId,
-      employee_id: input.employeeId,
-      wl_type: input.wlType,
-      status: WhitelistStatus.Active,
-      effective_date: input.effectiveDate,
-      expire_date: input.expireDate ?? null,
-      remark: input.remark ?? null,
-      creator_id: input.creatorId ?? null,
-    })
-    .returning({ id: staff_whitelists.id });
+  let created: { id: number } | undefined;
+  try {
+    [created] = await db
+      .insert(staff_whitelists)
+      .values({
+        org_id: input.orgId,
+        employee_id: input.employeeId,
+        wl_type: input.wlType,
+        status: WhitelistStatus.Active,
+        effective_date: input.effectiveDate,
+        expire_date: input.expireDate ?? null,
+        remark: input.remark ?? null,
+        creator_id: input.creatorId ?? null,
+      })
+      .returning({ id: staff_whitelists.id });
+  } catch (err) {
+    // G1.1: DB unique constraint violation (uk_staff_wl_emp_type) — concurrent TOCTOU race
+    if (err && typeof err === 'object' && 'code' in err && (err as { code: string }).code === '23505') {
+      throw new UpstreamApiError('WL_002');
+    }
+    throw err;
+  }
 
   if (!created) {
     throw new UpstreamApiError('WL_006');
@@ -200,7 +209,10 @@ export async function expireOverdueWhitelists(orgId?: string): Promise<number> {
   const conditions = [
     eq(staff_whitelists.status, WhitelistStatus.Active),
     isNull(staff_whitelists.is_deleted),
-    or(isNull(staff_whitelists.expire_date), lte(staff_whitelists.expire_date, now)),
+    // P1 fix: only expire records whose expire_date has passed.
+    // expire_date IS NULL means "never expires" — SQL `NULL <= now` yields NULL (not true),
+    // so those records are naturally excluded and must NOT be marked as Expired.
+    lte(staff_whitelists.expire_date, now),
   ];
 
   if (orgId) {

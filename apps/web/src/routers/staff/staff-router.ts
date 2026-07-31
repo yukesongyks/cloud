@@ -26,7 +26,7 @@ export const staffRouter = createTRPCRouter({
         department: z.string().max(128).optional(),
         position: z.string().max(128).optional(),
         phone: z.string().max(32).optional(),
-        email: z.string().max(128).optional(),
+        email: z.string().max(128).email().optional(),
         idCardNo: z.string().max(128).optional(),
         status: employeeStatusSchema.optional(),
         entryDate: z.string().optional(),
@@ -89,7 +89,7 @@ export const staffRouter = createTRPCRouter({
         department: z.string().max(128).optional(),
         position: z.string().max(128).optional(),
         phone: z.string().max(32).optional(),
-        email: z.string().max(128).optional(),
+        email: z.string().max(128).email().optional(),
         status: employeeStatusSchema.optional(),
         entryDate: z.string().optional(),
         leaveDate: z.string().optional(),
@@ -104,6 +104,7 @@ export const staffRouter = createTRPCRouter({
       ]);
       return updateStaff({
         id: input.id,
+        orgId: input.organizationId,
         name: input.name,
         department: input.department,
         position: input.position,

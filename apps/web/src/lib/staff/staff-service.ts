@@ -24,12 +24,14 @@ export interface CreateStaffInput {
   idCardNo?: string;
   status?: number;
   entryDate?: string;
+  leaveDate?: string;
   remark?: string;
   creatorId?: string;
 }
 
 export interface UpdateStaffInput {
   id: number;
+  orgId: string;
   name?: string;
   department?: string;
   position?: string;
@@ -130,24 +132,33 @@ export async function createStaff(input: CreateStaffInput): Promise<{
     throw new UpstreamApiError('STAFF_001');
   }
 
-  const [created] = await db
-    .insert(staff_employees)
-    .values({
-      org_id: input.orgId,
-      employee_no: input.employeeNo,
-      name: input.name,
-      department: input.department ?? null,
-      position: input.position ?? null,
-      phone: input.phone ?? null,
-      email: input.email ?? null,
-      id_card_no: input.idCardNo ?? null,
-      status: (input.status ?? EmployeeStatus.Active) as EmployeeStatus,
-      entry_date: input.entryDate ?? null,
-      leave_date: input.leaveDate ?? null,
-      remark: input.remark ?? null,
-      creator_id: input.creatorId ?? null,
-    })
-    .returning({ id: staff_employees.id });
+  let created: { id: number } | undefined;
+  try {
+    [created] = await db
+      .insert(staff_employees)
+      .values({
+        org_id: input.orgId,
+        employee_no: input.employeeNo,
+        name: input.name,
+        department: input.department ?? null,
+        position: input.position ?? null,
+        phone: input.phone ?? null,
+        email: input.email ?? null,
+        id_card_no: input.idCardNo ?? null,
+        status: (input.status ?? EmployeeStatus.Active) as EmployeeStatus,
+        entry_date: input.entryDate ?? null,
+        leave_date: input.leaveDate ?? null,
+        remark: input.remark ?? null,
+        creator_id: input.creatorId ?? null,
+      })
+      .returning({ id: staff_employees.id });
+  } catch (err) {
+    // G1.1: DB unique constraint violation (uk_staff_employee_org_no) — concurrent TOCTOU race
+    if (err && typeof err === 'object' && 'code' in err && (err as { code: string }).code === '23505') {
+      throw new UpstreamApiError('STAFF_001');
+    }
+    throw err;
+  }
 
   if (!created) {
     throw new UpstreamApiError('STAFF_009');
@@ -220,6 +231,7 @@ export async function updateStaff(input: UpdateStaffInput): Promise<{
     .where(
       and(
         eq(staff_employees.id, input.id),
+        eq(staff_employees.org_id, input.orgId),
         isNull(staff_employees.is_deleted)
       )
     )
@@ -247,7 +259,12 @@ export async function updateStaff(input: UpdateStaffInput): Promise<{
   const [updated] = await db
     .update(staff_employees)
     .set(updateFields)
-    .where(eq(staff_employees.id, input.id))
+    .where(
+      and(
+        eq(staff_employees.id, input.id),
+        eq(staff_employees.org_id, input.orgId)
+      )
+    )
     .returning({ gmt_modified: staff_employees.gmt_modified });
 
   if (!updated) {
@@ -266,7 +283,11 @@ export async function deleteStaff(
     .select({ id: staff_employees.id })
     .from(staff_employees)
     .where(
-      and(eq(staff_employees.id, id), isNull(staff_employees.is_deleted))
+      and(
+        eq(staff_employees.id, id),
+        eq(staff_employees.org_id, orgId),
+        isNull(staff_employees.is_deleted)
+      )
     )
     .limit(1);
 
@@ -281,6 +302,7 @@ export async function deleteStaff(
     .where(
       and(
         eq(staff_cost_budgets.employee_id, id),
+        eq(staff_cost_budgets.org_id, orgId),
         isNull(staff_cost_budgets.is_deleted)
       )
     );
@@ -291,6 +313,7 @@ export async function deleteStaff(
     .where(
       and(
         eq(staff_whitelists.employee_id, id),
+        eq(staff_whitelists.org_id, orgId),
         isNull(staff_whitelists.is_deleted)
       )
     );
@@ -302,7 +325,12 @@ export async function deleteStaff(
   await db
     .update(staff_employees)
     .set({ is_deleted: true, gmt_modified: sql`now()` })
-    .where(eq(staff_employees.id, id));
+    .where(
+      and(
+        eq(staff_employees.id, id),
+        eq(staff_employees.org_id, orgId)
+      )
+    );
 
   return { id, deleted: true };
 }
