@@ -513,7 +513,8 @@ export async function batchImportWhitelist(input: {
 
   for (let i = 1; i < rawRows.length; i++) {
     const row = rawRows[i];
-    const rowNumber = i;
+    // CSV physical row number (header=1, first data row=2) — aligns with batchImportStaff's csvRowNumber
+    const rowNumber = i + 1;
 
     const employeeNo = row[colIndex['employeeno']]?.trim() ?? '';
     const wlTypeStr = row[colIndex['wltype']]?.trim() ?? '';
