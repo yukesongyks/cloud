@@ -253,7 +253,12 @@ export async function deleteCostBudget(
   await db
     .update(staff_cost_budgets)
     .set({ is_deleted: true, gmt_modified: sql`now()` })
-    .where(eq(staff_cost_budgets.id, id));
+    .where(
+      and(
+        eq(staff_cost_budgets.id, id),
+        eq(staff_cost_budgets.org_id, orgId)
+      )
+    );
 
   return { id, deleted: true };
 }

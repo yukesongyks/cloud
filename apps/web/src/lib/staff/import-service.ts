@@ -322,6 +322,7 @@ export async function batchImportStaff(input: {
                 ? '工号已存在'
                 : err.upstreamCode
               : `写入失败: ${err instanceof Error ? err.message : String(err)}`;
+          console.error('[import] staff row failed', csvRowNumber, err);
           batchFails.push({
             row: csvRowNumber,
             reason,
@@ -505,28 +506,8 @@ export async function batchImportWhitelist(input: {
   const allFails: FailItem[] = [];
   let successCount = 0;
 
-  // Batch-fetch only the employees referenced in this import file (by employeeNo),
-  // instead of loading the entire org's employee table — avoids OOM for large orgs.
-  const uniqueNos = [...new Set(dedupedRows.map(r => r.data.employeeNo))];
-  const empMap = new Map<string, number>();
-  for (let i = 0; i < uniqueNos.length; i += BATCH_SIZE) {
-    const batchNos = uniqueNos.slice(i, i + BATCH_SIZE);
-    const batchEmployees = await db
-      .select({ id: staff_employees.id, employee_no: staff_employees.employee_no })
-      .from(staff_employees)
-      .where(
-        and(
-          eq(staff_employees.org_id, orgId),
-          inArray(staff_employees.employee_no, batchNos),
-          isNull(staff_employees.is_deleted)
-        )
-      );
-    for (const emp of batchEmployees) {
-      empMap.set(emp.employee_no, emp.id);
-    }
-  }
-
-  // Deduplicate within file — keep first occurrence of each (employeeNo, wlType) pair
+  // Deduplicate within file — keep first occurrence of each (employeeNo, wlType) pair.
+  // Must run before the batch-fetch below, which references dedupedRows.
   const seenPairs = new Set<string>();
   const dedupedRows: { rowNumber: number; data: WhitelistImportRow }[] = [];
 
@@ -570,6 +551,27 @@ export async function batchImportWhitelist(input: {
     });
   }
 
+  // Batch-fetch only the employees referenced in this import file (by employeeNo),
+  // instead of loading the entire org's employee table — avoids OOM for large orgs.
+  const uniqueNos = [...new Set(dedupedRows.map(r => r.data.employeeNo))];
+  const empMap = new Map<string, number>();
+  for (let i = 0; i < uniqueNos.length; i += BATCH_SIZE) {
+    const batchNos = uniqueNos.slice(i, i + BATCH_SIZE);
+    const batchEmployees = await db
+      .select({ id: staff_employees.id, employee_no: staff_employees.employee_no })
+      .from(staff_employees)
+      .where(
+        and(
+          eq(staff_employees.org_id, orgId),
+          inArray(staff_employees.employee_no, batchNos),
+          isNull(staff_employees.is_deleted)
+        )
+      );
+    for (const emp of batchEmployees) {
+      empMap.set(emp.employee_no, emp.id);
+    }
+  }
+
   // Process each row — call addWhitelist which validates employee existence, uniqueness, and date validity
   try {
     for (const { rowNumber, data } of dedupedRows) {
@@ -603,6 +605,7 @@ export async function batchImportWhitelist(input: {
               ? '同员工同类型已有生效记录'
               : err.upstreamCode
             : `写入失败: ${err instanceof Error ? err.message : String(err)}`;
+        console.error('[import] whitelist row failed', rowNumber, err);
         allFails.push({
           row: rowNumber,
           reason,
