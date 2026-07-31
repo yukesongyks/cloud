@@ -1,0 +1,16 @@
+{
+  "blocker_count": 0,
+  "blocker_details": [],
+  "first_round_p0_count": 6,
+  "first_round_p0_resolved": 6,
+  "first_round_p0_status": "all_resolved",
+  "second_round_p0_count": 1,
+  "second_round_p0_resolved": 1,
+  "second_round_p0_status": "all_resolved",
+  "p1_count": 0,
+  "p2_count": 2,
+  "merge_recommendation": "允许合并",
+  "review_round": 3,
+  "review_summary": "第3轮复审：第2轮的1个P0(TDZ回归)、1个P1(catch堆栈)、1个P2(软删WHERE缺org_id)已全部修复验证通过，无新回归，仅余2个可接受P2(offset分页、行号语义)，代码可合并。",
+  "report_path": ".agents/20260731-人员看板-openT2/cr_report.md"
+}
