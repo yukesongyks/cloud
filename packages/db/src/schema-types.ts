@@ -1358,3 +1358,87 @@ export const CODE_REVIEW_BENIGN_TERMINAL_REASONS = [
 ] as const satisfies readonly CodeReviewTerminalReason[];
 
 export type CodeReviewBenignTerminalReason = (typeof CODE_REVIEW_BENIGN_TERMINAL_REASONS)[number];
+
+// =============================================================================
+// Staff Dashboard (人员看板) enums
+// =============================================================================
+
+// --- Employee status ---
+
+export enum EmployeeStatus {
+  Active = 1,
+  Probation = 2,
+  Resigned = 3,
+}
+
+export const employeeStatuses = [
+  EmployeeStatus.Active,
+  EmployeeStatus.Probation,
+  EmployeeStatus.Resigned,
+] as const satisfies readonly EmployeeStatus[];
+
+// --- Cost budget type ---
+
+export enum BudgetType {
+  LaborCost = 1,
+  ProjectBudget = 2,
+  Other = 3,
+}
+
+export const budgetTypes = [
+  BudgetType.LaborCost,
+  BudgetType.ProjectBudget,
+  BudgetType.Other,
+] as const satisfies readonly BudgetType[];
+
+// --- Whitelist type ---
+
+export enum WhitelistType {
+  Access = 1,
+  Benefit = 2,
+}
+
+export const whitelistTypes = [
+  WhitelistType.Access,
+  WhitelistType.Benefit,
+] as const satisfies readonly WhitelistType[];
+
+// --- Whitelist status ---
+
+export enum WhitelistStatus {
+  Active = 1,
+  Expired = 2,
+}
+
+export const whitelistStatuses = [
+  WhitelistStatus.Active,
+  WhitelistStatus.Expired,
+] as const satisfies readonly WhitelistStatus[];
+
+// --- Import task type ---
+
+export enum ImportTaskType {
+  StaffImport = 1,
+  WhitelistImport = 2,
+}
+
+export const importTaskTypes = [
+  ImportTaskType.StaffImport,
+  ImportTaskType.WhitelistImport,
+] as const satisfies readonly ImportTaskType[];
+
+// --- Import task status ---
+
+export enum ImportTaskStatus {
+  Processing = 1,
+  Success = 2,
+  PartialFail = 3,
+  Fail = 4,
+}
+
+export const importTaskStatuses = [
+  ImportTaskStatus.Processing,
+  ImportTaskStatus.Success,
+  ImportTaskStatus.PartialFail,
+  ImportTaskStatus.Fail,
+] as const satisfies readonly ImportTaskStatus[];

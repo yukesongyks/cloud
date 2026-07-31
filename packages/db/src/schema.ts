@@ -77,6 +77,12 @@ import {
   CodingPlanCredentialStatus,
   CodingPlanSubscriptionStatus,
   CodingPlanTermKind,
+  EmployeeStatus,
+  BudgetType,
+  WhitelistType,
+  WhitelistStatus,
+  ImportTaskType,
+  ImportTaskStatus,
 } from './schema-types';
 import type {
   CustomLlmDefinition,
@@ -7138,3 +7144,143 @@ export const model_experiment_request = pgTable(
 
 export type ModelExperimentRequest = typeof model_experiment_request.$inferSelect;
 export type NewModelExperimentRequest = typeof model_experiment_request.$inferInsert;
+
+// =============================================================================
+// Staff Dashboard (人员看板) tables
+// =============================================================================
+
+// --- Employee ---
+
+export const staff_employees = pgTable(
+  'staff_employees',
+  {
+    id: bigserial({ mode: 'number' }).primaryKey(),
+    org_id: uuid().notNull(),
+    employee_no: text().notNull(),
+    name: text().notNull(),
+    department: text(),
+    position: text(),
+    phone: text(),
+    email: text(),
+    id_card_no: text(),
+    status: integer().notNull().default(EmployeeStatus.Active),
+    entry_date: date(),
+    leave_date: date(),
+    remark: text(),
+    is_deleted: boolean().notNull().default(false),
+    gmt_create: timestamp({ withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+    gmt_modified: timestamp({ withTimezone: true, mode: 'string' })
+      .defaultNow()
+      .notNull()
+      .$onUpdateFn(() => sql`now()`),
+    creator_id: text(),
+    modifier_id: text(),
+  },
+  table => [
+    uniqueIndex('uk_staff_employee_org_no')
+      .on(table.org_id, table.employee_no)
+      .where(isNull(table.is_deleted)),
+    index('idx_staff_employee_org_status').on(table.org_id, table.status),
+    index('idx_staff_employee_org_department').on(table.org_id, table.department),
+    index('idx_staff_employee_org_name').on(table.org_id, table.name),
+  ]
+);
+
+export type StaffEmployee = typeof staff_employees.$inferSelect;
+export type NewStaffEmployee = typeof staff_employees.$inferInsert;
+
+// --- Cost budget ---
+
+export const staff_cost_budgets = pgTable(
+  'staff_cost_budgets',
+  {
+    id: bigserial({ mode: 'number' }).primaryKey(),
+    org_id: uuid().notNull(),
+    employee_id: bigint({ mode: 'number' }).notNull(),
+    budget_type: integer().notNull().default(BudgetType.LaborCost),
+    period: text().notNull(),
+    amount: decimal({ precision: 14, scale: 2 }).notNull(),
+    currency: text().notNull().default('CNY'),
+    remark: text(),
+    is_deleted: boolean().notNull().default(false),
+    gmt_create: timestamp({ withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+    gmt_modified: timestamp({ withTimezone: true, mode: 'string' })
+      .defaultNow()
+      .notNull()
+      .$onUpdateFn(() => sql`now()`),
+    creator_id: text(),
+    modifier_id: text(),
+  },
+  table => [
+    uniqueIndex('uk_staff_budget_emp_period')
+      .on(table.employee_id, table.budget_type, table.period)
+      .where(isNull(table.is_deleted)),
+    index('idx_staff_budget_org_period').on(table.org_id, table.period),
+    index('idx_staff_budget_emp').on(table.employee_id, table.is_deleted),
+  ]
+);
+
+export type StaffCostBudget = typeof staff_cost_budgets.$inferSelect;
+export type NewStaffCostBudget = typeof staff_cost_budgets.$inferInsert;
+
+// --- Whitelist ---
+
+export const staff_whitelists = pgTable(
+  'staff_whitelists',
+  {
+    id: bigserial({ mode: 'number' }).primaryKey(),
+    org_id: uuid().notNull(),
+    employee_id: bigint({ mode: 'number' }).notNull(),
+    wl_type: integer().notNull().default(WhitelistType.Access),
+    status: integer().notNull().default(WhitelistStatus.Active),
+    effective_date: date().notNull(),
+    expire_date: date(),
+    remark: text(),
+    is_deleted: boolean().notNull().default(false),
+    gmt_create: timestamp({ withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+    gmt_modified: timestamp({ withTimezone: true, mode: 'string' })
+      .defaultNow()
+      .notNull()
+      .$onUpdateFn(() => sql`now()`),
+    creator_id: text(),
+    modifier_id: text(),
+  },
+  table => [
+    uniqueIndex('uk_staff_wl_emp_type')
+      .on(table.employee_id, table.wl_type, table.is_deleted)
+      .where(isNull(table.is_deleted)),
+    index('idx_staff_wl_org_status').on(table.org_id, table.status),
+    index('idx_staff_wl_emp').on(table.employee_id, table.status),
+  ]
+);
+
+export type StaffWhitelist = typeof staff_whitelists.$inferSelect;
+export type NewStaffWhitelist = typeof staff_whitelists.$inferInsert;
+
+// --- Import task ---
+
+export const staff_import_tasks = pgTable(
+  'staff_import_tasks',
+  {
+    id: bigserial({ mode: 'number' }).primaryKey(),
+    org_id: uuid().notNull(),
+    task_type: integer().notNull().default(ImportTaskType.StaffImport),
+    file_name: text().notNull(),
+    total_count: integer().notNull().default(0),
+    success_count: integer().notNull().default(0),
+    fail_count: integer().notNull().default(0),
+    status: integer().notNull().default(ImportTaskStatus.Processing),
+    fail_detail: text(),
+    is_deleted: boolean().notNull().default(false),
+    gmt_create: timestamp({ withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+    gmt_modified: timestamp({ withTimezone: true, mode: 'string' })
+      .defaultNow()
+      .notNull()
+      .$onUpdateFn(() => sql`now()`),
+    creator_id: text(),
+  },
+  table => [index('idx_staff_import_org_create').on(table.org_id, table.gmt_create)]
+);
+
+export type StaffImportTask = typeof staff_import_tasks.$inferSelect;
+export type NewStaffImportTask = typeof staff_import_tasks.$inferInsert;

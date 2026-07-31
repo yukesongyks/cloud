@@ -42,6 +42,11 @@ import { codingPlansRouter } from '@/routers/coding-plans-router';
 import { unifiedSessionsRouter } from '@/routers/unified-sessions-router';
 import { activeSessionsRouter } from '@/routers/active-sessions-router';
 import { usageAnalyticsRouter } from '@/routers/usage-analytics-router';
+import { staffRouter } from '@/routers/staff/staff-router';
+import { costBudgetRouter } from '@/routers/staff/cost-budget-router';
+import { whitelistRouter } from '@/routers/staff/whitelist-router';
+import { staffImportRouter } from '@/routers/staff/import-router';
+import { staffDashboardRouter } from '@/routers/staff/dashboard-router';
 export const rootRouter = createTRPCRouter({
   test: testRouter,
   organizations: organizationsRouter,
@@ -85,6 +90,11 @@ export const rootRouter = createTRPCRouter({
   unifiedSessions: unifiedSessionsRouter,
   activeSessions: activeSessionsRouter,
   usageAnalytics: usageAnalyticsRouter,
+  staff: staffRouter,
+  costBudget: costBudgetRouter,
+  whitelist: whitelistRouter,
+  staffImport: staffImportRouter,
+  staffDashboard: staffDashboardRouter,
 });
 // export type definition of API
 export type RootRouter = typeof rootRouter;
