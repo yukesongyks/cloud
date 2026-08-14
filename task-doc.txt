@@ -1,0 +1,8 @@
+=== cloud 仓库任务文档 ===
+
+生成时间: 2025-07-15
+任务节点: 编码实现 (coding)
+关联仓库: ranxitest, cloud
+技能: dtazziboot-java-coding-standards
+
+本文件为跨仓库协同开发任务的标记文档，用于验证 cloud 仓库的产物生成能力。
