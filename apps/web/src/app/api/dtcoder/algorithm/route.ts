@@ -22,6 +22,14 @@ function bubbleSort(arr: number[]): number[] {
 }
 
 export async function POST(request: Request) {
+  // CSRF: verify Origin/Referer (Next.js middleware should handle CSRF tokens globally)
+  const origin = request.headers.get('origin');
+  const referer = request.headers.get('referer');
+  const host = request.headers.get('host');
+  if (origin && host && !origin.endsWith(host) && !referer?.includes(host)) {
+    return NextResponse.json({ error: 'CSRF 校验失败' }, { status: 403 });
+  }
+
   try {
     const body = (await request.json()) as AlgorithmRequest;
     const { kind, input } = body;
@@ -35,6 +43,13 @@ export async function POST(request: Request) {
         break;
       case 'hash': {
         const hashInput = input || 'Hello, DTCoder!';
+        // Server-side input length validation
+        if (hashInput.length > 10000) {
+          return NextResponse.json(
+            { error: '输入长度不能超过 10000 个字符' },
+            { status: 400 },
+          );
+        }
         output = crypto.createHash('sha256').update(hashInput).digest('hex');
         break;
       }
@@ -46,6 +61,13 @@ export async function POST(request: Request) {
           .filter(n => !isNaN(n));
         if (nums.length === 0) {
           return NextResponse.json({ error: '无效的输入: 需要逗号分隔的整数' }, { status: 400 });
+        }
+        // Server-side array length validation
+        if (nums.length > 1000) {
+          return NextResponse.json(
+            { error: '数组长度不能超过 1000' },
+            { status: 400 },
+          );
         }
         const sorted = bubbleSort(nums);
         output = sorted.join(', ');
@@ -66,6 +88,7 @@ export async function POST(request: Request) {
       timestamp: new Date().toISOString(),
     });
   } catch (e) {
+    console.error('Algorithm execution failed:', e);
     return NextResponse.json(
       { error: e instanceof Error ? e.message : '执行失败' },
       { status: 500 },

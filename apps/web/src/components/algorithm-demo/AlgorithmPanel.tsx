@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { Play } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { TextIconButton } from './TextIconButton';
@@ -12,31 +12,39 @@ type AlgorithmPanelProps = {
   onResult?: (result: AlgorithmResult) => void;
 };
 
+const DEFAULT_INPUTS: Record<AlgorithmKind, string> = {
+  helloworld: '',
+  hash: 'Hello, DTCoder!',
+  bubblesort: '5,3,8,1,9,2,7,4,6',
+};
+
+const PLACEHOLDER_TEXTS: Record<AlgorithmKind, string> = {
+  helloworld: '无需输入',
+  hash: '输入要哈希的字符串',
+  bubblesort: '输入逗号分隔的整数，如: 5,3,8,1,9',
+};
+
 export function AlgorithmPanel({ kind, onResult }: AlgorithmPanelProps) {
   const [input, setInput] = useState('');
   const [result, setResult] = useState<AlgorithmResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const defaultInputs: Record<AlgorithmKind, string> = {
-    helloworld: '',
-    hash: 'Hello, DTCoder!',
-    bubblesort: '5,3,8,1,9,2,7,4,6',
-  };
-
-  const placeholderTexts: Record<AlgorithmKind, string> = {
-    helloworld: '无需输入',
-    hash: '输入要哈希的字符串',
-    bubblesort: '输入逗号分隔的整数，如: 5,3,8,1,9',
-  };
+  const abortRef = useRef<AbortController | null>(null);
 
   const execute = useCallback(async () => {
+    // Cancel previous request
+    if (abortRef.current) {
+      abortRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true);
     setError(null);
 
     // Client-side input validation
     if (kind === 'hash') {
-      const hashInput = input || defaultInputs[kind];
+      const hashInput = input || DEFAULT_INPUTS[kind];
       if (!hashInput.trim()) {
         setError('输入不能为空');
         setLoading(false);
@@ -49,7 +57,7 @@ export function AlgorithmPanel({ kind, onResult }: AlgorithmPanelProps) {
       }
     }
     if (kind === 'bubblesort') {
-      const rawInput = input || defaultInputs[kind];
+      const rawInput = input || DEFAULT_INPUTS[kind];
       if (!rawInput.trim()) {
         setError('输入不能为空');
         setLoading(false);
@@ -74,13 +82,14 @@ export function AlgorithmPanel({ kind, onResult }: AlgorithmPanelProps) {
     try {
       const body: Record<string, unknown> = { kind };
       if (kind !== 'helloworld') {
-        body.input = input || defaultInputs[kind];
+        body.input = input || DEFAULT_INPUTS[kind];
       }
 
       const res = await fetch('/api/dtcoder/algorithm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
 
       if (!res.ok) {
@@ -92,11 +101,14 @@ export function AlgorithmPanel({ kind, onResult }: AlgorithmPanelProps) {
       setResult(data);
       onResult?.(data);
     } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') {
+        return;
+      }
       setError(e instanceof Error ? e.message : '执行失败');
     } finally {
       setLoading(false);
     }
-  }, [kind, input, onResult, defaultInputs]);
+  }, [kind, input, onResult]);
 
   const showInput = kind !== 'helloworld';
 
@@ -116,7 +128,7 @@ export function AlgorithmPanel({ kind, onResult }: AlgorithmPanelProps) {
               type="text"
               value={input}
               onChange={e => setInput(e.target.value)}
-              placeholder={placeholderTexts[kind]}
+              placeholder={PLACEHOLDER_TEXTS[kind]}
               className="flex h-9 w-full rounded-md border border-border bg-input-bg px-3 py-1 text-sm text-foreground placeholder:text-foreground-subtle focus:outline-none focus:ring-1 focus:ring-border-strong"
             />
           </div>
