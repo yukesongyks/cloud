@@ -24,6 +24,9 @@ export default function AlgorithmDemoPage() {
   const [statsError, setStatsError] = useState<string | null>(null);
   const [statsFilter, setStatsFilter] = useState<StatsFilter>({});
   const abortRef = useRef<AbortController | null>(null);
+  // Ref to avoid fetchStats depending on statsFilter, preventing redundant effect triggers
+  const statsFilterRef = useRef(statsFilter);
+  statsFilterRef.current = statsFilter;
 
   const handleResult = useCallback((result: AlgorithmResult) => {
     setResults(prev => [result, ...prev].slice(0, 20));
@@ -40,10 +43,11 @@ export default function AlgorithmDemoPage() {
     setStatsLoading(true);
     setStatsError(null);
     try {
+      const filter = statsFilterRef.current;
       const params = new URLSearchParams();
-      if (statsFilter.personnelType) params.set('personnelType', statsFilter.personnelType);
-      if (statsFilter.level) params.set('level', statsFilter.level);
-      if (statsFilter.department) params.set('department', statsFilter.department);
+      if (filter.personnelType) params.set('personnelType', filter.personnelType);
+      if (filter.level) params.set('level', filter.level);
+      if (filter.department) params.set('department', filter.department);
       const queryString = params.toString();
       const url = queryString ? `/api/dtcoder/stats?${queryString}` : '/api/dtcoder/stats';
       const res = await fetch(url, { signal: controller.signal });
@@ -62,7 +66,7 @@ export default function AlgorithmDemoPage() {
     } finally {
       setStatsLoading(false);
     }
-  }, [statsFilter]);
+  }, []); // stable — reads latest statsFilter via ref
 
   const handleToggleStats = useCallback(() => {
     const next = !showStats;
@@ -76,7 +80,7 @@ export default function AlgorithmDemoPage() {
     if (showStats) {
       fetchStats();
     }
-  }, [statsFilter, showStats, fetchStats]);
+  }, [statsFilter, showStats]); // fetchStats is stable, removed from deps
 
   const tabContent = ALGORITHM_TABS.map(tab => ({
     value: tab.value,

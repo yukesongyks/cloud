@@ -21,13 +21,40 @@ function bubbleSort(arr: number[]): number[] {
   return result;
 }
 
+// ─── Simple in-memory rate limiter ────────────────────────────────────────────
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+
+function checkRateLimit(key: string, maxRequests: number, windowMs: number): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(key);
+  if (!entry || now > entry.resetTime) {
+    rateLimitMap.set(key, { count: 1, resetTime: now + windowMs });
+    return true;
+  }
+  if (entry.count >= maxRequests) {
+    return false;
+  }
+  entry.count++;
+  return true;
+}
+
 export async function POST(request: Request) {
-  // CSRF: verify Origin/Referer (Next.js middleware should handle CSRF tokens globally)
+  // CSRF: verify Origin/Referer using exact hostname comparison
   const origin = request.headers.get('origin');
   const referer = request.headers.get('referer');
   const host = request.headers.get('host');
-  if (origin && host && !origin.endsWith(host) && !referer?.includes(host)) {
+  let originHost: string | null = null;
+  try { originHost = origin ? new URL(origin).hostname : null; } catch { /* origin 格式异常 */ }
+  if (originHost && host && originHost !== host && !referer?.includes(host)) {
     return NextResponse.json({ error: 'CSRF 校验失败' }, { status: 403 });
+  }
+
+  // Rate limiting: 30 requests per minute per client IP
+  const clientIp = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+    || request.headers.get('x-real-ip')
+    || 'unknown';
+  if (!checkRateLimit(clientIp, 30, 60_000)) {
+    return NextResponse.json({ error: '请求过于频繁，请稍后再试' }, { status: 429 });
   }
 
   try {
