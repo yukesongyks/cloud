@@ -10,6 +10,7 @@ export type AlgorithmResult = {
 
 export type ExportFormat = 'excel' | 'csv';
 
+/** TODO: Reserved for future per-invocation detail records; not yet wired to any API response. */
 export type InvocationStatEntry = {
   id: string;
   algorithm: AlgorithmKind;

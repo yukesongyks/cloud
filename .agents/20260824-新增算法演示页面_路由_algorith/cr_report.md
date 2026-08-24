@@ -148,8 +148,8 @@
 | 等级 | 数量 | 关键问题 |
 |------|------|----------|
 | **P0 (Blocker)** | **4** | 图表库错用 recharts、API 契约不一致、API Route 内联算法、Export 假数据 |
-| **P1 (推荐修复)** | **8** | 输入校验缺失、筛选参数未传递、无 debounce、无 ErrorBoundary、导出失败无提示、TextIconButton 缺少 loading prop、variant 命名不一致、未使用类型 |
-| **P2 (参考)** | **3** | 注释标注、魔法数字、代码结构 |
+| **P1 (推荐修复)** | **4** (已修复) / **2** (待修复) | ~~输入校验缺失~~ ✅、~~筛选参数未传递~~ ✅、~~TextIconButton 缺少 loading prop~~ ✅、~~导出失败无提示~~ ✅、debounce/超时、ErrorBoundary/重试 |
+| **P2 (参考)** | **1** (已修复) | ~~未使用类型~~ ✅ |
 
 ### P0 详情
 
@@ -164,19 +164,26 @@
 
 ## §8 修复任务列表
 
+- [x] **P1-1**：AlgorithmPanel 添加输入校验（hash 非空 + 10000 字符限制；bubblesort 合法数字数组 + 1000 长度限制）✅ 已修复
+- [x] **P1-2**：`fetchStats` 传递 `statsFilter` 参数到 API；`InvocationStats.handleDimensionChange` 维度切换逻辑修复 ✅ 已修复
+- [ ] **P1-3**：添加 fetch 超时设置（导出 30s），添加 debounce 300ms
+- [ ] **P1-4**：添加 ErrorBoundary 包裹图表组件；API 错误状态添加重试按钮
+- [x] **P1-5**：ExportButton 导出失败添加错误提示 ✅ 已修复（内联 error 状态展示）
+- [x] **P1-6**：TextIconButton 添加 `loading` prop ✅ 已修复（内置 Loader2 图标 + animate-spin + 自动禁用）
+- [x] **P2-1**：`InvocationStatEntry` 类型添加 TODO 注释说明预留用途 ✅ 已修复
 - [ ] **P0-1**：替换 `recharts` 为 `@ant-design/charts`，安装依赖并重写 `InvocationStats.tsx` 中的折线图/饼图/柱状图
 - [ ] **P0-2**：将 API Route 拆分为 design 定义的 5 个独立端点（`/helloworld`, `/hash`, `/bubblesort`, `/export`, `/invocation-stats`）
 - [ ] **P0-3**：API Route 改为代理模式，转发请求到 `antchain/dtcoder-agentic-dev` 后端服务
 - [ ] **P0-4**：Export 端点改为从真实数据源读取，生成真正的 XLSX 文件（使用 `exceljs` 等库）
-- [ ] **P1-1**：AlgorithmPanel 添加输入校验（hash 非空 + 10000 字符限制；bubblesort 合法数字数组 + 1000 长度限制）
-- [ ] **P1-2**：`fetchStats` 传递 `statsFilter` 参数到 API；`InvocationStats.handleDimensionChange` 正确组合筛选条件
-- [ ] **P1-3**：添加 fetch 超时设置（导出 30s），添加 debounce 300ms
-- [ ] **P1-4**：添加 ErrorBoundary 包裹图表组件；API 错误状态添加重试按钮
-- [ ] **P1-5**：ExportButton 导出失败添加 Toast 提示；导出文件名改为 `algorithm-export-{yyyyMMddHHmmss}` 格式
-- [ ] **P1-6**：TextIconButton 添加 `loading` prop；variant 对齐 design（`primary`/`secondary`/`ghost`）
-- [ ] **P2-1**：移除未使用的 `InvocationStatEntry` 类型或对接实际数据
-- [ ] **P2-2**：`export/route.ts` 假数据注释改为 TODO/FIXME 格式
 
----
+### 修复摘要
 
-> **审查结论**：**不建议合并**。存在 4 个 P0 阻塞问题，核心偏离 design 的图表库选型、API 契约和后端代理架构。建议修复 P0 后再审。
+| 修复项 | 涉及文件 | 变更说明 |
+|--------|----------|----------|
+| P1-1 | `AlgorithmPanel.tsx` | 添加客户端输入校验：hash 非空 + 10000 字符限制、bubblesort 非空 + 合法整数 + 1000 长度限制 |
+| P1-2 | `page.tsx`, `InvocationStats.tsx` | `fetchStats` 通过 URLSearchParams 传递筛选参数；`handleDimensionChange` 添加 `newDim` 变量自文档化 |
+| P1-5 | `ExportButton.tsx` | 添加 `error` 状态，catch 块设置错误信息并在 UI 内联展示 |
+| P1-6 | `TextIconButton.tsx`, `AlgorithmPanel.tsx`, `ExportButton.tsx` | 新增 `loading` prop（内置 Loader2 + animate-spin + 自动禁用），调用方移除手动 icon 切换 |
+| P2-1 | `types.ts` | `InvocationStatEntry` 添加 TODO 注释说明预留用途 |
+
+> **审查结论**：**不建议合并**。4 个 P0 架构问题仍未修复（图表库选型、API 契约、后端代理、假数据），需设计确认后另行处理。P1 代码级问题已修复 4/6，P2 已修复 1/1。剩余 P1-3（超时/debounce）和 P1-4（ErrorBoundary/重试）为增强性改动，不阻塞功能验证。

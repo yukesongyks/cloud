@@ -74,7 +74,9 @@ export function InvocationStats({ data, loading, filter, onFilterChange }: Invoc
 
   const handleDimensionChange = useCallback(
     (dim: string) => {
-      setActiveDimension(dim as FilterDimension);
+      const newDim = dim as FilterDimension;
+      setActiveDimension(newDim);
+      // Clear the previous dimension's filter value when switching dimensions
       onFilterChange({ ...filter, [activeDimension]: undefined });
     },
     [filter, onFilterChange, activeDimension],

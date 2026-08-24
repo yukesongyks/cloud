@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useCallback } from 'react';
-import { Play, Loader2 } from 'lucide-react';
+import { Play } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { TextIconButton } from './TextIconButton';
 import type { AlgorithmKind, AlgorithmResult } from './types';
@@ -33,6 +33,44 @@ export function AlgorithmPanel({ kind, onResult }: AlgorithmPanelProps) {
   const execute = useCallback(async () => {
     setLoading(true);
     setError(null);
+
+    // Client-side input validation
+    if (kind === 'hash') {
+      const hashInput = input || defaultInputs[kind];
+      if (!hashInput.trim()) {
+        setError('输入不能为空');
+        setLoading(false);
+        return;
+      }
+      if (hashInput.length > 10000) {
+        setError('输入长度不能超过 10000 个字符');
+        setLoading(false);
+        return;
+      }
+    }
+    if (kind === 'bubblesort') {
+      const rawInput = input || defaultInputs[kind];
+      if (!rawInput.trim()) {
+        setError('输入不能为空');
+        setLoading(false);
+        return;
+      }
+      const nums = rawInput
+        .split(',')
+        .map(s => parseInt(s.trim(), 10))
+        .filter(n => !isNaN(n));
+      if (nums.length === 0) {
+        setError('无效的输入: 需要逗号分隔的整数');
+        setLoading(false);
+        return;
+      }
+      if (nums.length > 1000) {
+        setError('数组长度不能超过 1000');
+        setLoading(false);
+        return;
+      }
+    }
+
     try {
       const body: Record<string, unknown> = { kind };
       if (kind !== 'helloworld') {
@@ -85,10 +123,10 @@ export function AlgorithmPanel({ kind, onResult }: AlgorithmPanelProps) {
         )}
 
         <TextIconButton
-          icon={loading ? Loader2 : Play}
-          label={loading ? '执行中...' : '执行算法'}
+          icon={Play}
+          label="执行算法"
           onClick={execute}
-          disabled={loading}
+          loading={loading}
           variant="default"
         />
 

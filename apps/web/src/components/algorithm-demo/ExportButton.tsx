@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useCallback } from 'react';
-import { Download, Loader2 } from 'lucide-react';
+import { Download } from 'lucide-react';
 import { TextIconButton } from './TextIconButton';
 import { OneSegmented } from './OneSegmented';
 import type { ExportFormat } from './types';
@@ -13,9 +13,11 @@ type ExportButtonProps = {
 export function ExportButton({ className }: ExportButtonProps) {
   const [format, setFormat] = useState<ExportFormat>('excel');
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleExport = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
       const res = await fetch('/api/dtcoder/export', {
         method: 'POST',
@@ -38,6 +40,8 @@ export function ExportButton({ className }: ExportButtonProps) {
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
     } catch (e) {
+      const message = e instanceof Error ? e.message : '导出失败';
+      setError(message);
       console.error('Export failed:', e);
     } finally {
       setLoading(false);
@@ -56,12 +60,15 @@ export function ExportButton({ className }: ExportButtonProps) {
           onChange={setFormat}
         />
         <TextIconButton
-          icon={loading ? Loader2 : Download}
-          label={loading ? '导出中...' : '导出结果'}
+          icon={Download}
+          label="导出结果"
           onClick={handleExport}
-          disabled={loading}
+          loading={loading}
           variant="outline"
         />
+        {error && (
+          <span className="text-xs text-red-400">{error}</span>
+        )}
       </div>
     </div>
   );

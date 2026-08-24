@@ -2,6 +2,7 @@
 
 import * as React from 'react';
 import { cn } from '@/lib/utils';
+import { Loader2 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
 export type TextIconButtonProps = {
@@ -11,6 +12,7 @@ export type TextIconButtonProps = {
   variant?: 'default' | 'outline' | 'ghost';
   size?: 'sm' | 'default' | 'lg';
   disabled?: boolean;
+  loading?: boolean;
   className?: string;
   type?: 'button' | 'submit';
 };
@@ -37,14 +39,16 @@ export function TextIconButton({
   variant = 'default',
   size = 'default',
   disabled = false,
+  loading = false,
   className,
   type = 'button',
 }: TextIconButtonProps) {
+  const DisplayIcon = loading ? Loader2 : Icon;
   return (
     <button
       type={type}
       onClick={onClick}
-      disabled={disabled}
+      disabled={disabled || loading}
       className={cn(
         'inline-flex cursor-pointer items-center justify-center rounded-md font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50',
         sizeClasses[size],
@@ -52,8 +56,8 @@ export function TextIconButton({
         className,
       )}
     >
-      <Icon className="h-4 w-4 shrink-0" />
-      <span>{label}</span>
+      <DisplayIcon className={cn('h-4 w-4 shrink-0', loading && 'animate-spin')} />
+      <span>{loading ? '加载中...' : label}</span>
     </button>
   );
 }

@@ -30,7 +30,13 @@ export default function AlgorithmDemoPage() {
   const fetchStats = useCallback(async () => {
     setStatsLoading(true);
     try {
-      const res = await fetch('/api/dtcoder/stats');
+      const params = new URLSearchParams();
+      if (statsFilter.personnelType) params.set('personnelType', statsFilter.personnelType);
+      if (statsFilter.level) params.set('level', statsFilter.level);
+      if (statsFilter.department) params.set('department', statsFilter.department);
+      const queryString = params.toString();
+      const url = queryString ? `/api/dtcoder/stats?${queryString}` : '/api/dtcoder/stats';
+      const res = await fetch(url);
       if (res.ok) {
         const data = (await res.json()) as InvocationStatsSummary;
         setStatsData(data);
@@ -40,7 +46,7 @@ export default function AlgorithmDemoPage() {
     } finally {
       setStatsLoading(false);
     }
-  }, []);
+  }, [statsFilter]);
 
   const handleToggleStats = useCallback(() => {
     const next = !showStats;
